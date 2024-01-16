@@ -1,0 +1,17 @@
+[package]
+name = "orb"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+bitflags = "2.4.2"
+ctrlc = "3.4.2"
+env_logger = "0.10.1"
+io-uring = "0.6.2"
+log = "0.4.20"
+rustix = { version = "0.38.30", features = ["event", "mm", "process"] }
+
+[build-dependencies]
+bindgen = "0.69.2"
