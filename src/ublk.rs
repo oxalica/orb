@@ -472,8 +472,35 @@ impl DeviceBuilder {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Clone, Copy)]
 pub struct DeviceInfo(binding::ublksrv_ctrl_dev_info);
+
+impl fmt::Debug for DeviceInfo {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DeviceInfo")
+            .field("nr_hw_queues", &self.nr_queues())
+            .field("queue_depth", &self.queue_depth())
+            .field("state", &self.state())
+            .field("max_io_buf_bytes", &self.0.max_io_buf_bytes)
+            .field("dev_id", &self.0.dev_id)
+            .field("ublksrv_pid", &self.0.ublksrv_pid)
+            .field("flags", &self.flags())
+            .field("owner_uid", &self.0.owner_uid)
+            .field("owner_gid", &self.0.owner_gid)
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
+#[repr(u8)]
+pub enum DevState {
+    Dead = binding::UBLK_S_DEV_DEAD as _,
+    Live = binding::UBLK_S_DEV_LIVE as _,
+    Quiesced = binding::UBLK_S_DEV_QUIESCED as _,
+    #[doc(hidden)]
+    Unknown(u16),
+}
 
 impl DeviceInfo {
     pub fn dev_id(&self) -> u32 {
@@ -484,12 +511,25 @@ impl DeviceInfo {
         self.0.queue_depth
     }
 
+    pub fn state(&self) -> DevState {
+        match self.0.state as u32 {
+            binding::UBLK_S_DEV_DEAD => DevState::Dead,
+            binding::UBLK_S_DEV_LIVE => DevState::Live,
+            binding::UBLK_S_DEV_QUIESCED => DevState::Quiesced,
+            _ => DevState::Unknown(self.0.state),
+        }
+    }
+
     pub fn nr_queues(&self) -> u16 {
         self.0.nr_hw_queues
     }
 
     pub fn io_buf_size(&self) -> usize {
         self.0.max_io_buf_bytes.try_into().unwrap()
+    }
+
+    pub fn flags(&self) -> FeatureFlags {
+        FeatureFlags::from_bits_truncate(self.0.flags)
     }
 }
 
@@ -684,6 +724,7 @@ impl Service {
             this.ctl
                 .start_device(&mut this.ctl_ring, dev_id, rustix::process::getpid())?;
             stop_guard.active = true;
+            // FIXME: It still reports DEAD here.
             handler.ready(this.dev_info(), Stopper(exit_fd.clone()));
 
             let ret = rustix::io::retry_on_intr(|| {
