@@ -864,25 +864,33 @@ impl Service {
                 let len = unsafe { iod.__bindgen_anon_1.nr_sectors as usize }
                     .wrapping_mul(SECTOR_SIZE as usize);
                 let op = iod.op_flags & 0xFF;
+                // TODO: Catch unwind.
                 let ret = match op {
                     binding::UBLK_IO_OP_READ => {
                         log::trace!("READ offset={off} len={len} flags={flags:?}");
-                        handler.read(off, &mut local_io_buf[..len], flags)?;
-                        Ok(len as _)
+                        handler
+                            .read(off, &mut local_io_buf[..len], flags)
+                            .map(|()| len as _)
                     }
                     binding::UBLK_IO_OP_WRITE => {
                         log::trace!("WRITE offset={off} len={len} flags={flags:?}");
-                        handler.write(off, &local_io_buf[..len], flags)?;
-                        Ok(len as _)
+                        handler
+                            .write(off, &local_io_buf[..len], flags)
+                            .map(|()| len as _)
                     }
                     binding::UBLK_IO_OP_FLUSH => {
                         log::trace!("FLUSH flags={flags:?}");
-                        handler.flush(flags)?;
-                        Ok(0)
+                        handler.flush(flags).map(|()| 0)
                     }
-                    // binding::UBLK_IO_OP_DISCARD |
+                    binding::UBLK_IO_OP_DISCARD => {
+                        log::trace!("DISCARD offset={off} len={len} flags={flags:?}");
+                        handler.discard(off, len, flags).map(|()| 0)
+                    }
+                    binding::UBLK_IO_OP_WRITE_ZEROES => {
+                        log::trace!("WRITE_ZEROES offset={off} len={len} flags={flags:?}");
+                        handler.write_zeroes(off, len, flags).map(|()| 0)
+                    }
                     // binding::UBLK_IO_OP_WRITE_SAME |
-                    // binding::UBLK_IO_OP_WRITE_ZEROES |
                     // binding::UBLK_IO_OP_ZONE_OPEN |
                     // binding::UBLK_IO_OP_ZONE_CLOSE |
                     // binding::UBLK_IO_OP_ZONE_FINISH |
@@ -919,6 +927,7 @@ pub struct DeviceParams {
     io_optimal_size: u32,
     io_min_size: u32,
     io_max_size: u32,
+    discard: Option<DiscardParams>,
 }
 
 impl Default for DeviceParams {
@@ -930,13 +939,14 @@ impl Default for DeviceParams {
 impl DeviceParams {
     pub fn new() -> Self {
         Self {
+            attrs: DeviceAttrs::empty(),
             size: 0,
             logical_block_size: 512,
             physical_block_size: PAGE_SIZE,
             io_optimal_size: PAGE_SIZE,
             io_min_size: PAGE_SIZE,
             io_max_size: DEFAULT_IO_BUF_SIZE,
-            attrs: DeviceAttrs::empty(),
+            discard: None,
         }
     }
 
@@ -956,31 +966,59 @@ impl DeviceParams {
         self.attrs = attrs;
         self
     }
+
+    pub fn discard(&mut self, params: DiscardParams) -> &mut Self {
+        assert_ne!(params.granularity, 0);
+        assert_eq!(params.max_size % SECTOR_SIZE, 0);
+        assert_eq!(params.max_write_zeroes_size % SECTOR_SIZE, 0);
+        self.discard = Some(params);
+        self
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DiscardParams {
+    pub alignment: u32,
+    pub granularity: u32,
+    pub max_size: u32,
+    pub max_write_zeroes_size: u32,
+    pub max_segments: u16,
 }
 
 impl DeviceParams {
     fn build(&self) -> binding::ublk_params {
-        unsafe {
-            binding::ublk_params {
-                len: mem::size_of::<binding::ublk_params>() as _,
-                types: DeviceParamsType::Basic.bits(),
-                basic: binding::ublk_param_basic {
-                    attrs: self.attrs.bits(),
-                    logical_bs_shift: self.logical_block_size.trailing_zeros() as _,
-                    physical_bs_shift: self.physical_block_size.trailing_zeros() as _,
-                    io_opt_shift: self.io_optimal_size.trailing_zeros() as _,
-                    io_min_shift: self.io_min_size.trailing_zeros() as _,
-                    max_sectors: self.io_max_size / SECTOR_SIZE,
-                    dev_sectors: self.size / SECTOR_SIZE as u64,
-                    // TODO: What are these?
-                    chunk_sectors: 0,
-                    virt_boundary_mask: 0,
-                },
-                // TODO
-                discard: mem::zeroed(),
-                devt: mem::zeroed(),
-                zoned: mem::zeroed(),
-            }
+        let mut attrs = DeviceParamsType::Basic;
+        attrs.set(DeviceParamsType::Discard, self.discard.is_some());
+
+        binding::ublk_params {
+            len: mem::size_of::<binding::ublk_params>() as _,
+            types: attrs.bits(),
+            basic: binding::ublk_param_basic {
+                attrs: self.attrs.bits(),
+                logical_bs_shift: self.logical_block_size.trailing_zeros() as _,
+                physical_bs_shift: self.physical_block_size.trailing_zeros() as _,
+                io_opt_shift: self.io_optimal_size.trailing_zeros() as _,
+                io_min_shift: self.io_min_size.trailing_zeros() as _,
+                max_sectors: self.io_max_size / SECTOR_SIZE,
+                dev_sectors: self.size / SECTOR_SIZE as u64,
+                // TODO: What are these?
+                chunk_sectors: 0,
+                virt_boundary_mask: 0,
+            },
+            discard: self
+                .discard
+                .map_or(Default::default(), |p| binding::ublk_param_discard {
+                    discard_alignment: p.alignment,
+                    discard_granularity: p.granularity,
+                    max_discard_sectors: p.max_size / SECTOR_SIZE,
+                    max_write_zeroes_sectors: p.max_write_zeroes_size / SECTOR_SIZE,
+                    // TODO: What's this?
+                    max_discard_segments: p.max_segments,
+                    reserved0: 0,
+                }),
+            zoned: Default::default(),
+            // This is read-only.
+            devt: Default::default(),
         }
     }
 }
@@ -994,5 +1032,13 @@ pub trait BlockDevice {
 
     fn flush(&self, _flags: IoFlags) -> Result<(), Errno> {
         Ok(())
+    }
+
+    fn discard(&self, _off: u64, _len: usize, _flags: IoFlags) -> Result<(), Errno> {
+        Err(Errno::OPNOTSUPP)
+    }
+
+    fn write_zeroes(&self, _off: u64, _len: usize, _flags: IoFlags) -> Result<(), Errno> {
+        Err(Errno::OPNOTSUPP)
     }
 }
