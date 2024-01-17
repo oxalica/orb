@@ -51,7 +51,7 @@ bitflags::bitflags! {
     }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    struct DeviceAttrs: u32 {
+    pub struct DeviceAttrs: u32 {
         const ReadOnly =  binding::UBLK_ATTR_READ_ONLY;
         const Rotational = binding::UBLK_ATTR_ROTATIONAL;
         const VolatileCache = binding::UBLK_ATTR_VOLATILE_CACHE;
@@ -407,7 +407,7 @@ impl DeviceBuilder {
         self
     }
 
-    pub fn set_flags(&mut self, flags: FeatureFlags) -> &mut Self {
+    pub fn flags(&mut self, flags: FeatureFlags) -> &mut Self {
         self.features = flags;
         self
     }
@@ -859,19 +859,18 @@ impl Service {
                 let iod = shm.get(tag);
                 let local_io_buf = unsafe { io_buf_of(tag).as_mut() };
                 let flags = IoFlags::from_bits_truncate(iod.op_flags);
+                // These fields may contain garbage for ops without them.
+                let off = iod.start_sector.wrapping_mul(SECTOR_SIZE as u64);
+                let len = unsafe { iod.__bindgen_anon_1.nr_sectors as usize }
+                    .wrapping_mul(SECTOR_SIZE as usize);
                 let op = iod.op_flags & 0xFF;
-                let off = iod.start_sector * SECTOR_SIZE as u64;
                 let ret = match op {
                     binding::UBLK_IO_OP_READ => {
-                        let len = unsafe { iod.__bindgen_anon_1.nr_sectors } as usize
-                            * SECTOR_SIZE as usize;
                         log::trace!("READ offset={off} len={len} flags={flags:?}");
                         handler.read(off, &mut local_io_buf[..len], flags)?;
                         Ok(len as _)
                     }
                     binding::UBLK_IO_OP_WRITE => {
-                        let len = unsafe { iod.__bindgen_anon_1.nr_sectors } as usize
-                            * SECTOR_SIZE as usize;
                         log::trace!("WRITE offset={off} len={len} flags={flags:?}");
                         handler.write(off, &local_io_buf[..len], flags)?;
                         Ok(len as _)
@@ -950,6 +949,11 @@ impl DeviceParams {
     pub fn io_max_size(&mut self, size: u32) -> &mut Self {
         assert_eq!(size % SECTOR_SIZE, 0);
         self.io_max_size = size;
+        self
+    }
+
+    pub fn attrs(&mut self, attrs: DeviceAttrs) -> &mut Self {
+        self.attrs = attrs;
         self
     }
 }
