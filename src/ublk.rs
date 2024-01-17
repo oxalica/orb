@@ -690,14 +690,14 @@ impl Service {
 
             let handles = (0..this.dev_info().nr_queues())
                 .map(|thread_id| {
+                    let handler = &handler;
+                    let exit_fd = exit_fd.as_fd();
+                    let cdev = this.cdev.as_fd();
+                    let dev_info = &this.dev_info;
                     thread::Builder::new()
                         .name(format!("io-worker-{thread_id}"))
-                        .spawn_scoped(s, {
-                            let handler = &handler;
-                            let exit_fd = exit_fd.as_fd();
-                            let cdev = this.cdev.as_fd();
-                            let dev_info = &this.dev_info;
-                            move || Self::io_thread(thread_id, exit_fd, cdev, dev_info, handler)
+                        .spawn_scoped(s, move || {
+                            io_thread(thread_id, exit_fd, cdev, dev_info, handler)
                         })
                 })
                 .collect::<io::Result<Vec<_>>>()?;
@@ -731,189 +731,189 @@ impl Service {
             Ok(())
         })
     }
+}
 
-    fn io_thread<D: BlockDevice>(
-        thread_id: u16,
-        exit_fd: BorrowedFd<'_>,
-        cdev: BorrowedFd<'_>,
-        dev_info: &DeviceInfo,
-        handler: &D,
-    ) -> io::Result<()> {
-        let exit_guard = SignalExitOnDrop(exit_fd);
+fn io_thread<D: BlockDevice>(
+    thread_id: u16,
+    exit_fd: BorrowedFd<'_>,
+    cdev: BorrowedFd<'_>,
+    dev_info: &DeviceInfo,
+    handler: &D,
+) -> io::Result<()> {
+    let exit_guard = SignalExitOnDrop(exit_fd);
 
-        if let Err(err) = rustix::process::configure_io_flusher_behavior(true) {
-            // TODO: Option to make this a hard error?
-            log::error!("failed to configure as IO_FLUSHER: {err}");
-        }
+    if let Err(err) = rustix::process::configure_io_flusher_behavior(true) {
+        // TODO: Option to make this a hard error?
+        log::error!("failed to configure as IO_FLUSHER: {err}");
+    }
 
-        let shm = IoDescShm::new(cdev, dev_info, thread_id)?;
+    let shm = IoDescShm::new(cdev, dev_info, thread_id)?;
 
-        let queue_depth = dev_info.queue_depth();
-        let buf_size = dev_info
-            .io_buf_size()
-            .checked_next_multiple_of(BUFFER_ALIGN)
-            .unwrap();
-        let total_buf_size = buf_size.checked_mul(queue_depth.into()).unwrap();
-        // Must define the buffer before the io-uring, see below.
-        let io_buf = AlignedArray::<BUFFER_ALIGN>::new(total_buf_size);
-        let io_buf_of = |i: u16| unsafe {
-            NonNull::new_unchecked(ptr::slice_from_raw_parts_mut(
-                io_buf.0.as_ptr().cast::<u8>().add(i as usize * buf_size),
-                buf_size,
-            ))
-        };
+    let queue_depth = dev_info.queue_depth();
+    let buf_size = dev_info
+        .io_buf_size()
+        .checked_next_multiple_of(BUFFER_ALIGN)
+        .unwrap();
+    let total_buf_size = buf_size.checked_mul(queue_depth.into()).unwrap();
+    // Must define the buffer before the io-uring, see below.
+    let io_buf = AlignedArray::<BUFFER_ALIGN>::new(total_buf_size);
+    let io_buf_of = |i: u16| unsafe {
+        NonNull::new_unchecked(ptr::slice_from_raw_parts_mut(
+            io_buf.0.as_ptr().cast::<u8>().add(i as usize * buf_size),
+            buf_size,
+        ))
+    };
 
-        // NB. Ensure all inflight ops are cancelled before dropping the buffer defined above,
-        // otherwise it's a use-after-free.
-        struct AutoCancelRing(IoUring);
-        impl Drop for AutoCancelRing {
-            fn drop(&mut self) {
-                if let Err(err) = self
-                    .0
-                    .submitter()
-                    .register_sync_cancel(None, io_uring::types::CancelBuilder::any())
-                {
-                    if err.kind() != io::ErrorKind::NotFound {
-                        log::error!("failed to cancel inflight ops in io-uring");
-                        std::process::abort();
-                    }
+    // NB. Ensure all inflight ops are cancelled before dropping the buffer defined above,
+    // otherwise it's a use-after-free.
+    struct AutoCancelRing(IoUring);
+    impl Drop for AutoCancelRing {
+        fn drop(&mut self) {
+            if let Err(err) = self
+                .0
+                .submitter()
+                .register_sync_cancel(None, io_uring::types::CancelBuilder::any())
+            {
+                if err.kind() != io::ErrorKind::NotFound {
+                    log::error!("failed to cancel inflight ops in io-uring");
+                    std::process::abort();
                 }
             }
         }
+    }
 
-        // Plus `PollAdd` for notification.
-        let ring_size = (queue_depth as u32 + 1)
-            .checked_next_power_of_two()
-            .unwrap();
-        let mut io_ring = AutoCancelRing(IoUring::new(ring_size)?);
-        let io_ring = &mut io_ring.0;
-        io_ring
-            .submitter()
-            .register_files(&[cdev.as_raw_fd(), exit_fd.as_raw_fd()])?;
-        const CDEV_FIXED_FD: Fixed = Fixed(0);
-        const EXIT_FIXED_FD: Fixed = Fixed(1);
-        const EXIT_USER_DATA: u64 = !0;
+    // Plus `PollAdd` for notification.
+    let ring_size = (queue_depth as u32 + 1)
+        .checked_next_power_of_two()
+        .unwrap();
+    let mut io_ring = AutoCancelRing(IoUring::new(ring_size)?);
+    let io_ring = &mut io_ring.0;
+    io_ring
+        .submitter()
+        .register_files(&[cdev.as_raw_fd(), exit_fd.as_raw_fd()])?;
+    const CDEV_FIXED_FD: Fixed = Fixed(0);
+    const EXIT_FIXED_FD: Fixed = Fixed(1);
+    const EXIT_USER_DATA: u64 = !0;
 
-        let refill_sqe = |sq: &mut SubmissionQueue<'_>, i: u16, result: Option<i32>| {
-            let cmd = binding::ublksrv_io_cmd {
-                q_id: thread_id,
-                tag: i,
-                result: result.unwrap_or(-1),
-                __bindgen_anon_1: binding::ublksrv_io_cmd__bindgen_ty_1 {
-                    addr: io_buf_of(i).as_ptr().cast::<u8>() as _,
-                },
-            };
-            let cmd_op = if result.is_some() {
-                binding::UBLK_IO_COMMIT_AND_FETCH_REQ
-            } else {
-                binding::UBLK_IO_FETCH_REQ
-            };
-            let sqe = opcode::UringCmd16::new(CDEV_FIXED_FD, cmd_op)
-                .cmd(unsafe { mem::transmute(cmd) })
+    let refill_sqe = |sq: &mut SubmissionQueue<'_>, i: u16, result: Option<i32>| {
+        let cmd = binding::ublksrv_io_cmd {
+            q_id: thread_id,
+            tag: i,
+            result: result.unwrap_or(-1),
+            __bindgen_anon_1: binding::ublksrv_io_cmd__bindgen_ty_1 {
+                addr: io_buf_of(i).as_ptr().cast::<u8>() as _,
+            },
+        };
+        let cmd_op = if result.is_some() {
+            binding::UBLK_IO_COMMIT_AND_FETCH_REQ
+        } else {
+            binding::UBLK_IO_FETCH_REQ
+        };
+        let sqe = opcode::UringCmd16::new(CDEV_FIXED_FD, cmd_op)
+            .cmd(unsafe { mem::transmute(cmd) })
+            .build()
+            .user_data(i.into());
+        unsafe {
+            sq.push(&sqe).expect("squeue should be big enough");
+        }
+    };
+
+    {
+        let mut sq = io_ring.submission();
+        unsafe {
+            let sqe = opcode::PollAdd::new(EXIT_FIXED_FD, PollFlags::IN.bits().into())
                 .build()
-                .user_data(i.into());
-            unsafe {
-                sq.push(&sqe).expect("squeue should be big enough");
-            }
-        };
-
-        {
-            let mut sq = io_ring.submission();
-            unsafe {
-                let sqe = opcode::PollAdd::new(EXIT_FIXED_FD, PollFlags::IN.bits().into())
-                    .build()
-                    .user_data(EXIT_USER_DATA);
-                sq.push(&sqe).unwrap();
-            }
-            for i in 0..queue_depth {
-                refill_sqe(&mut sq, i, None);
-            }
+                .user_data(EXIT_USER_DATA);
+            sq.push(&sqe).unwrap();
         }
+        for i in 0..queue_depth {
+            refill_sqe(&mut sq, i, None);
+        }
+    }
 
-        log::debug!("IO thread {thread_id} initialized");
-        loop {
-            io_ring.submit_and_wait(1)?;
-            // NB. We should re-get SQ and CQ every time to update pointers.
-            let (_submit, mut sq, cq) = io_ring.split();
-            for cqe in cq {
-                if cqe.user_data() == EXIT_USER_DATA {
-                    assert!(
-                        PollFlags::from_bits_truncate(cqe.result() as _).contains(PollFlags::IN),
-                        "unexpected poll result: {}",
-                        cqe.result(),
-                    );
-                    log::debug!("IO thread {thread_id} signaled to exit");
-                    // No need to notify more.
-                    mem::forget(exit_guard);
-                    return Ok(());
-                }
-
-                // Here it must be a FETCH request.
-                if cqe.result() < 0 {
-                    let err = io::Error::from_raw_os_error(-cqe.result());
-                    log::debug!("IO thread {thread_id} failed fetch: {err}");
-                    return Err(err);
-                }
-
-                let tag = cqe.user_data() as u16;
-                let iod = shm.get(tag);
-                let local_io_buf = unsafe { io_buf_of(tag).as_mut() };
-                let flags = IoFlags::from_bits_truncate(iod.op_flags);
-                // These fields may contain garbage for ops without them.
-                let off = iod.start_sector.wrapping_mul(SECTOR_SIZE as u64);
-                let len = unsafe { iod.__bindgen_anon_1.nr_sectors as usize }
-                    .wrapping_mul(SECTOR_SIZE as usize);
-                let op = iod.op_flags & 0xFF;
-                // TODO: Catch unwind.
-                let ret = match op {
-                    binding::UBLK_IO_OP_READ => {
-                        log::trace!("READ offset={off} len={len} flags={flags:?}");
-                        handler
-                            .read(off, &mut local_io_buf[..len], flags)
-                            .map(|()| len as _)
-                    }
-                    binding::UBLK_IO_OP_WRITE => {
-                        log::trace!("WRITE offset={off} len={len} flags={flags:?}");
-                        handler
-                            .write(off, &local_io_buf[..len], flags)
-                            .map(|()| len as _)
-                    }
-                    binding::UBLK_IO_OP_FLUSH => {
-                        log::trace!("FLUSH flags={flags:?}");
-                        handler.flush(flags).map(|()| 0)
-                    }
-                    binding::UBLK_IO_OP_DISCARD => {
-                        log::trace!("DISCARD offset={off} len={len} flags={flags:?}");
-                        handler.discard(off, len, flags).map(|()| 0)
-                    }
-                    binding::UBLK_IO_OP_WRITE_ZEROES => {
-                        log::trace!("WRITE_ZEROES offset={off} len={len} flags={flags:?}");
-                        handler.write_zeroes(off, len, flags).map(|()| 0)
-                    }
-                    // binding::UBLK_IO_OP_WRITE_SAME |
-                    // binding::UBLK_IO_OP_ZONE_OPEN |
-                    // binding::UBLK_IO_OP_ZONE_CLOSE |
-                    // binding::UBLK_IO_OP_ZONE_FINISH |
-                    // binding::UBLK_IO_OP_ZONE_APPEND |
-                    // binding::UBLK_IO_OP_ZONE_RESET_ALL |
-                    // binding::UBLK_IO_OP_ZONE_RESET |
-                    // binding::UBLK_IO_OP_REPORT_ZONES  |
-                    _ => {
-                        log::error!("unsupported op: {op}");
-                        Err(Errno::IO)
-                    }
-                };
-
-                let c_ret = match ret {
-                    Ok(len) => {
-                        assert!(len >= 0);
-                        len
-                    }
-                    Err(err) => -err.raw_os_error(),
-                };
-
-                refill_sqe(&mut sq, tag, Some(c_ret));
+    log::debug!("IO thread {thread_id} initialized");
+    loop {
+        io_ring.submit_and_wait(1)?;
+        // NB. We should re-get SQ and CQ every time to update pointers.
+        let (_submit, mut sq, cq) = io_ring.split();
+        for cqe in cq {
+            if cqe.user_data() == EXIT_USER_DATA {
+                assert!(
+                    PollFlags::from_bits_truncate(cqe.result() as _).contains(PollFlags::IN),
+                    "unexpected poll result: {}",
+                    cqe.result(),
+                );
+                log::debug!("IO thread {thread_id} signaled to exit");
+                // No need to notify more.
+                mem::forget(exit_guard);
+                return Ok(());
             }
+
+            // Here it must be a FETCH request.
+            if cqe.result() < 0 {
+                let err = io::Error::from_raw_os_error(-cqe.result());
+                log::debug!("IO thread {thread_id} failed fetch: {err}");
+                return Err(err);
+            }
+
+            let tag = cqe.user_data() as u16;
+            let iod = shm.get(tag);
+            let local_io_buf = unsafe { io_buf_of(tag).as_mut() };
+            let flags = IoFlags::from_bits_truncate(iod.op_flags);
+            // These fields may contain garbage for ops without them.
+            let off = iod.start_sector.wrapping_mul(SECTOR_SIZE as u64);
+            let len = unsafe { iod.__bindgen_anon_1.nr_sectors as usize }
+                .wrapping_mul(SECTOR_SIZE as usize);
+            let op = iod.op_flags & 0xFF;
+            // TODO: Catch unwind.
+            let ret = match op {
+                binding::UBLK_IO_OP_READ => {
+                    log::trace!("READ offset={off} len={len} flags={flags:?}");
+                    handler
+                        .read(off, &mut local_io_buf[..len], flags)
+                        .map(|()| len as _)
+                }
+                binding::UBLK_IO_OP_WRITE => {
+                    log::trace!("WRITE offset={off} len={len} flags={flags:?}");
+                    handler
+                        .write(off, &local_io_buf[..len], flags)
+                        .map(|()| len as _)
+                }
+                binding::UBLK_IO_OP_FLUSH => {
+                    log::trace!("FLUSH flags={flags:?}");
+                    handler.flush(flags).map(|()| 0)
+                }
+                binding::UBLK_IO_OP_DISCARD => {
+                    log::trace!("DISCARD offset={off} len={len} flags={flags:?}");
+                    handler.discard(off, len, flags).map(|()| 0)
+                }
+                binding::UBLK_IO_OP_WRITE_ZEROES => {
+                    log::trace!("WRITE_ZEROES offset={off} len={len} flags={flags:?}");
+                    handler.write_zeroes(off, len, flags).map(|()| 0)
+                }
+                // binding::UBLK_IO_OP_WRITE_SAME |
+                // binding::UBLK_IO_OP_ZONE_OPEN |
+                // binding::UBLK_IO_OP_ZONE_CLOSE |
+                // binding::UBLK_IO_OP_ZONE_FINISH |
+                // binding::UBLK_IO_OP_ZONE_APPEND |
+                // binding::UBLK_IO_OP_ZONE_RESET_ALL |
+                // binding::UBLK_IO_OP_ZONE_RESET |
+                // binding::UBLK_IO_OP_REPORT_ZONES  |
+                _ => {
+                    log::error!("unsupported op: {op}");
+                    Err(Errno::IO)
+                }
+            };
+
+            let c_ret = match ret {
+                Ok(len) => {
+                    assert!(len >= 0);
+                    len
+                }
+                Err(err) => -err.raw_os_error(),
+            };
+
+            refill_sqe(&mut sq, tag, Some(c_ret));
         }
     }
 }
