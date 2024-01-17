@@ -16,6 +16,7 @@ use rustix::io::Errno;
 use rustix::termios::Pid;
 use rustix::{ioctl, mm};
 
+// TODO
 const PAGE_SIZE: u32 = 4 << 10;
 const SECTOR_SIZE: u32 = 512;
 
@@ -433,7 +434,7 @@ impl DeviceBuilder {
             }
         }
 
-        let (cdev, shared_mem) = {
+        let cdev = {
             // Delete the device if anything goes wrong.
             let mut guard = StopOnDrop(Some((&mut uring, &ctrl, dev_info.dev_id())));
 
@@ -454,12 +455,11 @@ impl DeviceBuilder {
                     Err(err) => return Err(err),
                 }
             };
-            let shared_mem = IoDescSharedMem::new(&cdev, &dev_info)?;
 
             // All success, defuse the guard.
             guard.0 = None;
 
-            (cdev, shared_mem)
+            cdev
         };
 
         Ok(Service {
@@ -467,7 +467,6 @@ impl DeviceBuilder {
             ctl_ring: uring,
             ctl: ctrl,
             cdev: ManuallyDrop::new(cdev),
-            shared_mem: ManuallyDrop::new(shared_mem),
         })
     }
 }
@@ -534,36 +533,31 @@ impl DeviceInfo {
 }
 
 #[derive(Debug)]
-struct IoDescSharedMem(NonNull<[u8]>);
+struct IoDescShm(NonNull<[binding::ublksrv_io_desc]>);
 
-unsafe impl Sync for IoDescSharedMem {}
-
-impl Drop for IoDescSharedMem {
+impl Drop for IoDescShm {
     fn drop(&mut self) {
-        unsafe {
-            if let Err(err) = mm::munmap(self.0.as_ptr().cast(), self.0.len()) {
-                log::error!("failed to unmap shared memory: {err}");
-            }
+        if let Err(err) = unsafe { mm::munmap(self.0.as_ptr().cast(), self.0.len()) } {
+            log::error!("failed to unmap shared memory: {err}");
         }
     }
 }
 
-impl IoDescSharedMem {
-    fn new(cdev: &File, dev_info: &DeviceInfo) -> io::Result<Self> {
-        let q_id = 0usize;
+impl IoDescShm {
+    fn new(cdev: BorrowedFd<'_>, dev_info: &DeviceInfo, thread_id: u16) -> io::Result<Self> {
         let off = u64::try_from(mem::size_of::<binding::ublksrv_io_desc>())
             .unwrap()
             .checked_mul(binding::UBLK_MAX_QUEUE_DEPTH.into())
             .unwrap()
-            .checked_mul(q_id.try_into().unwrap())
+            .checked_mul(thread_id.into())
             .unwrap()
             .checked_add(binding::UBLKSRV_CMD_BUF_OFFSET.into())
             .unwrap();
 
+        assert_ne!(dev_info.queue_depth(), 0);
+        // `m{,un}map` will pad the length to the multiple of pages automatically.
         let size = mem::size_of::<binding::ublksrv_io_desc>()
             .checked_mul(dev_info.queue_depth().into())
-            .unwrap()
-            .checked_next_multiple_of(PAGE_SIZE as usize)
             .unwrap();
 
         let ptr = unsafe {
@@ -576,20 +570,15 @@ impl IoDescSharedMem {
                 off,
             )?
         };
-        let ptr = NonNull::new(ptr::slice_from_raw_parts_mut(ptr.cast(), size)).unwrap();
-        Ok(IoDescSharedMem(ptr))
+        let ptr = NonNull::slice_from_raw_parts(
+            NonNull::new(ptr.cast::<binding::ublksrv_io_desc>()).unwrap(),
+            dev_info.queue_depth().into(),
+        );
+        Ok(IoDescShm(ptr))
     }
 
     fn get(&self, tag: u16) -> binding::ublksrv_io_desc {
-        let off = (tag as usize) * mem::size_of::<binding::ublksrv_io_desc>();
-        assert!(off < self.0.len());
-        unsafe {
-            self.0
-                .as_ptr()
-                .cast::<binding::ublksrv_io_desc>()
-                .add(off)
-                .read()
-        }
+        unsafe { self.0.as_ref()[tag as usize] }
     }
 }
 
@@ -600,14 +589,12 @@ pub struct Service {
     ctl: ControlDevice,
     /// `/dev/ublkcX` file.
     cdev: ManuallyDrop<File>,
-    shared_mem: ManuallyDrop<IoDescSharedMem>,
 }
 
 impl Drop for Service {
     fn drop(&mut self) {
         // First, drop all resources derived from the device.
         unsafe {
-            ManuallyDrop::drop(&mut self.shared_mem);
             ManuallyDrop::drop(&mut self.cdev);
         }
         let dev_id = self.dev_info().dev_id();
@@ -710,10 +697,7 @@ impl Service {
                             let exit_fd = exit_fd.as_fd();
                             let cdev = this.cdev.as_fd();
                             let dev_info = &this.dev_info;
-                            let shm = &*this.shared_mem;
-                            move || {
-                                Self::io_thread(thread_id, exit_fd, cdev, dev_info, shm, handler)
-                            }
+                            move || Self::io_thread(thread_id, exit_fd, cdev, dev_info, handler)
                         })
                 })
                 .collect::<io::Result<Vec<_>>>()?;
@@ -753,7 +737,6 @@ impl Service {
         exit_fd: BorrowedFd<'_>,
         cdev: BorrowedFd<'_>,
         dev_info: &DeviceInfo,
-        shm: &IoDescSharedMem,
         handler: &D,
     ) -> io::Result<()> {
         let exit_guard = SignalExitOnDrop(exit_fd);
@@ -762,6 +745,8 @@ impl Service {
             // TODO: Option to make this a hard error?
             log::error!("failed to configure as IO_FLUSHER: {err}");
         }
+
+        let shm = IoDescShm::new(cdev, dev_info, thread_id)?;
 
         let queue_depth = dev_info.queue_depth();
         let buf_size = dev_info
