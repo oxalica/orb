@@ -18,12 +18,15 @@ use rustix::{ioctl, mm};
 
 // TODO
 const PAGE_SIZE: u32 = 4 << 10;
-const SECTOR_SIZE: u32 = 512;
+pub const SECTOR_SIZE: u32 = 512;
 
 const DEFAULT_IO_BUF_SIZE: u32 = 512 << 10;
 const BUFFER_ALIGN: usize = 64;
 
-#[allow(non_camel_case_types, unused)]
+pub const CDEV_PREFIX: &str = "/dev/ublkc";
+pub const BDEV_PREFIX: &str = "/dev/ublkb";
+
+#[allow(non_camel_case_types, non_snake_case, unused)]
 mod binding {
     include!(concat!(env!("OUT_DIR"), "/ublk_cmd.rs"));
 }
@@ -108,7 +111,7 @@ struct CdevPath([u8; Self::MAX_LEN]);
 impl CdevPath {
     // "/dev/ublkc2147483647".len() = 20
     const MAX_LEN: usize = 24;
-    const PREFIX: &'static str = "/dev/ublkc";
+    const PREFIX: &'static str = CDEV_PREFIX;
 
     fn from_id(id: u32) -> Self {
         use std::io::Write;
@@ -490,7 +493,7 @@ impl fmt::Debug for DeviceInfo {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 #[repr(u8)]
 pub enum DevState {
