@@ -2,6 +2,7 @@
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::fs::File;
 use std::mem::ManuallyDrop;
+use std::ops::ControlFlow;
 use std::os::fd::{BorrowedFd, RawFd};
 use std::ptr::NonNull;
 use std::sync::Arc;
@@ -15,6 +16,8 @@ use rustix::fd::{AsFd, AsRawFd, OwnedFd};
 use rustix::io::Errno;
 use rustix::termios::Pid;
 use rustix::{ioctl, mm};
+
+use crate::runtime::{AsyncRuntime, AsyncRuntimeBuilder, AsyncScopeSpawner};
 
 // TODO
 const PAGE_SIZE: u32 = 4 << 10;
@@ -652,11 +655,16 @@ impl Service {
         &self.dev_info
     }
 
-    pub fn run<D: BlockDevice + Sync>(
+    pub fn run<RB, D>(
         &mut self,
+        runtime_builder: RB,
         params: &DeviceParams,
         handler: D,
-    ) -> io::Result<()> {
+    ) -> io::Result<()>
+    where
+        RB: AsyncRuntimeBuilder + Sync,
+        D: BlockDevice + Sync,
+    {
         let dev_id = self.dev_info().dev_id();
         self.ctl
             .set_device_param(&mut self.ctl_ring, dev_id, params)?;
@@ -697,10 +705,11 @@ impl Service {
                     let exit_fd = exit_fd.as_fd();
                     let cdev = this.cdev.as_fd();
                     let dev_info = &this.dev_info;
+                    let runtime_builder = &runtime_builder;
                     thread::Builder::new()
                         .name(format!("io-worker-{thread_id}"))
                         .spawn_scoped(s, move || {
-                            io_thread(thread_id, exit_fd, cdev, dev_info, handler)
+                            io_thread(thread_id, exit_fd, cdev, dev_info, handler, runtime_builder)
                         })
                 })
                 .collect::<io::Result<Vec<_>>>()?;
@@ -736,14 +745,19 @@ impl Service {
     }
 }
 
-fn io_thread<D: BlockDevice>(
+fn io_thread<B, RB>(
     thread_id: u16,
     exit_fd: BorrowedFd<'_>,
     cdev: BorrowedFd<'_>,
     dev_info: &DeviceInfo,
-    handler: &D,
-) -> io::Result<()> {
-    let exit_guard = SignalExitOnDrop(exit_fd);
+    handler: &B,
+    runtime_buidler: &RB,
+) -> io::Result<()>
+where
+    B: BlockDevice,
+    RB: AsyncRuntimeBuilder,
+{
+    let _exit_guard = SignalExitOnDrop(exit_fd);
 
     if let Err(err) = rustix::process::configure_io_flusher_behavior(true) {
         // TODO: Option to make this a hard error?
@@ -790,13 +804,15 @@ fn io_thread<D: BlockDevice>(
         .checked_next_power_of_two()
         .unwrap();
     let mut io_ring = AutoCancelRing(IoUring::new(ring_size)?);
-    let io_ring = &mut io_ring.0;
     io_ring
+        .0
         .submitter()
         .register_files(&[cdev.as_raw_fd(), exit_fd.as_raw_fd()])?;
     const CDEV_FIXED_FD: Fixed = Fixed(0);
     const EXIT_FIXED_FD: Fixed = Fixed(1);
     const EXIT_USER_DATA: u64 = !0;
+
+    let mut runtime = runtime_buidler.build()?;
 
     let refill_sqe = |sq: &mut SubmissionQueue<'_>, i: u16, result: Option<i32>| {
         let cmd = binding::ublksrv_io_cmd {
@@ -822,7 +838,7 @@ fn io_thread<D: BlockDevice>(
     };
 
     {
-        let mut sq = io_ring.submission();
+        let mut sq = io_ring.0.submission();
         unsafe {
             let sqe = opcode::PollAdd::new(EXIT_FIXED_FD, PollFlags::IN.bits().into())
                 .build()
@@ -833,12 +849,14 @@ fn io_thread<D: BlockDevice>(
             refill_sqe(&mut sq, i, None);
         }
     }
+    io_ring.0.submit()?;
 
     log::debug!("IO thread {thread_id} initialized");
-    loop {
-        io_ring.submit_and_wait(1)?;
-        // NB. We should re-get SQ and CQ every time to update pointers.
-        let (_submit, mut sq, cq) = io_ring.split();
+
+    let io_ring = &io_ring.0;
+    runtime.drive_uring(io_ring, |spawner| {
+        // SAFETY: This is the only place to modify the CQ.
+        let cq = unsafe { io_ring.completion_shared() };
         for cqe in cq {
             if cqe.user_data() == EXIT_USER_DATA {
                 assert!(
@@ -847,9 +865,7 @@ fn io_thread<D: BlockDevice>(
                     cqe.result(),
                 );
                 log::debug!("IO thread {thread_id} signaled to exit");
-                // No need to notify more.
-                mem::forget(exit_guard);
-                return Ok(());
+                return Ok(ControlFlow::Break(()));
             }
 
             // Here it must be a FETCH request.
@@ -860,8 +876,18 @@ fn io_thread<D: BlockDevice>(
             }
 
             let tag = cqe.user_data() as u16;
+            let commit_and_fetch = move |ret: i32| {
+                // SAFETY: All futures are executed on the same thread, which is guarantee
+                // by no `Send` bound on parameters of `Runtime::{block_on,spawn_local}`.
+                // So there can only be one future running this block at the same time.
+                unsafe {
+                    let mut sq = io_ring.submission_shared();
+                    refill_sqe(&mut sq, tag, Some(ret));
+                }
+                io_ring.submit().expect("failed to submit");
+            };
+
             let iod = shm.get(tag);
-            let local_io_buf = unsafe { io_buf_of(tag).as_mut() };
             let flags = IoFlags::from_bits_truncate(iod.op_flags);
             // These fields may contain garbage for ops without them.
             let off = iod.start_sector.wrapping_mul(SECTOR_SIZE as u64);
@@ -869,30 +895,36 @@ fn io_thread<D: BlockDevice>(
                 .wrapping_mul(SECTOR_SIZE as usize);
             let op = iod.op_flags & 0xFF;
             // TODO: Catch unwind.
-            let ret = match op {
+            match op {
                 binding::UBLK_IO_OP_READ => {
                     log::trace!("READ offset={off} len={len} flags={flags:?}");
-                    handler
-                        .read(off, &mut local_io_buf[..len], flags)
-                        .map(|()| len as _)
+                    // SAFETY: This buffer is exclusive for task of `tag`.
+                    let buf = unsafe { io_buf_of(tag).as_mut() };
+                    let fut = handler.read(off, &mut buf[..len], flags);
+                    // TODO: This line is repeated over and over due to distinct Future types.
+                    spawner.spawn(async move { commit_and_fetch(fut.await.into_c_result()) });
                 }
                 binding::UBLK_IO_OP_WRITE => {
                     log::trace!("WRITE offset={off} len={len} flags={flags:?}");
-                    handler
-                        .write(off, &local_io_buf[..len], flags)
-                        .map(|()| len as _)
+                    // SAFETY: This buffer is exclusive for task of `tag`.
+                    let buf = unsafe { io_buf_of(tag).as_mut() };
+                    let fut = handler.write(off, &buf[..len], flags);
+                    spawner.spawn(async move { commit_and_fetch(fut.await.into_c_result()) });
                 }
                 binding::UBLK_IO_OP_FLUSH => {
                     log::trace!("FLUSH flags={flags:?}");
-                    handler.flush(flags).map(|()| 0)
+                    let fut = handler.flush(flags);
+                    spawner.spawn(async move { commit_and_fetch(fut.await.into_c_result()) });
                 }
                 binding::UBLK_IO_OP_DISCARD => {
                     log::trace!("DISCARD offset={off} len={len} flags={flags:?}");
-                    handler.discard(off, len, flags).map(|()| 0)
+                    let fut = handler.discard(off, len, flags);
+                    spawner.spawn(async move { commit_and_fetch(fut.await.into_c_result()) });
                 }
                 binding::UBLK_IO_OP_WRITE_ZEROES => {
                     log::trace!("WRITE_ZEROES offset={off} len={len} flags={flags:?}");
-                    handler.write_zeroes(off, len, flags).map(|()| 0)
+                    let fut = handler.write_zeroes(off, len, flags);
+                    spawner.spawn(async move { commit_and_fetch(fut.await.into_c_result()) });
                 }
                 // binding::UBLK_IO_OP_WRITE_SAME |
                 // binding::UBLK_IO_OP_ZONE_OPEN |
@@ -904,21 +936,13 @@ fn io_thread<D: BlockDevice>(
                 // binding::UBLK_IO_OP_REPORT_ZONES  |
                 _ => {
                     log::error!("unsupported op: {op}");
-                    Err(Errno::IO)
+                    commit_and_fetch(-Errno::IO.raw_os_error());
                 }
-            };
-
-            let c_ret = match ret {
-                Ok(len) => {
-                    assert!(len >= 0);
-                    len
-                }
-                Err(err) => -err.raw_os_error(),
-            };
-
-            refill_sqe(&mut sq, tag, Some(c_ret));
+            }
         }
-    }
+
+        Ok(ControlFlow::Continue(()))
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1026,22 +1050,46 @@ impl DeviceParams {
     }
 }
 
+trait IntoCResult {
+    fn into_c_result(self) -> i32;
+}
+
+impl IntoCResult for Result<(), Errno> {
+    fn into_c_result(self) -> i32 {
+        match self {
+            Ok(()) => 0,
+            Err(err) => -err.raw_os_error(),
+        }
+    }
+}
+
+impl IntoCResult for Result<usize, Errno> {
+    fn into_c_result(self) -> i32 {
+        match self {
+            Ok(x) => i32::try_from(x).expect("invalid result size"),
+            Err(err) => -err.raw_os_error(),
+        }
+    }
+}
+
+// We do suppose to enforce non-`Send` `Future`s.
+#[allow(async_fn_in_trait)]
 pub trait BlockDevice {
     fn ready(&self, dev_info: &DeviceInfo, stop: Stopper);
 
-    fn read(&self, off: u64, buf: &mut [u8], flags: IoFlags) -> Result<(), Errno>;
+    async fn read(&self, off: u64, buf: &mut [u8], flags: IoFlags) -> Result<usize, Errno>;
 
-    fn write(&self, off: u64, buf: &[u8], flags: IoFlags) -> Result<(), Errno>;
+    async fn write(&self, off: u64, buf: &[u8], flags: IoFlags) -> Result<usize, Errno>;
 
-    fn flush(&self, _flags: IoFlags) -> Result<(), Errno> {
+    async fn flush(&self, _flags: IoFlags) -> Result<(), Errno> {
         Ok(())
     }
 
-    fn discard(&self, _off: u64, _len: usize, _flags: IoFlags) -> Result<(), Errno> {
+    async fn discard(&self, _off: u64, _len: usize, _flags: IoFlags) -> Result<(), Errno> {
         Err(Errno::OPNOTSUPP)
     }
 
-    fn write_zeroes(&self, _off: u64, _len: usize, _flags: IoFlags) -> Result<(), Errno> {
+    async fn write_zeroes(&self, _off: u64, _len: usize, _flags: IoFlags) -> Result<(), Errno> {
         Err(Errno::OPNOTSUPP)
     }
 }

@@ -4,8 +4,9 @@ use std::os::unix::fs::FileExt;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
+use orb::runtime::{SyncRuntimeBuilder, TokioRuntimeBuilder};
 use orb::ublk::{
     BlockDevice, ControlDevice, DevState, DeviceAttrs, DeviceBuilder, DeviceInfo, DeviceParams,
     FeatureFlags, IoFlags, Stopper, Uring, BDEV_PREFIX, SECTOR_SIZE,
@@ -120,17 +121,18 @@ fn device_attrs() {
             stop.stop();
         }
 
-        fn read(&self, _off: u64, _buf: &mut [u8], _flags: IoFlags) -> Result<(), Errno> {
+        async fn read(&self, _off: u64, _buf: &mut [u8], _flags: IoFlags) -> Result<usize, Errno> {
             Err(Errno::IO)
         }
 
-        fn write(&self, _off: u64, _buf: &[u8], _flags: IoFlags) -> Result<(), Errno> {
+        async fn write(&self, _off: u64, _buf: &[u8], _flags: IoFlags) -> Result<usize, Errno> {
             Err(Errno::IO)
         }
     }
 
     let tested = AtomicBool::new(false);
-    srv.run(&params, Handler { tested: &tested }).unwrap();
+    srv.run(SyncRuntimeBuilder, &params, Handler { tested: &tested })
+        .unwrap();
     assert!(tested.load(Ordering::Relaxed));
 }
 
@@ -200,19 +202,20 @@ fn read_write() {
             stop.stop();
         }
 
-        fn read(&self, off: u64, buf: &mut [u8], _flags: IoFlags) -> Result<(), Errno> {
+        async fn read(&self, off: u64, buf: &mut [u8], _flags: IoFlags) -> Result<usize, Errno> {
             buf.copy_from_slice(&self.data.lock().unwrap()[off as usize..][..buf.len()]);
-            Ok(())
+            Ok(buf.len())
         }
 
-        fn write(&self, off: u64, buf: &[u8], _flags: IoFlags) -> Result<(), Errno> {
+        async fn write(&self, off: u64, buf: &[u8], _flags: IoFlags) -> Result<usize, Errno> {
             self.data.lock().unwrap()[off as usize..][..buf.len()].copy_from_slice(buf);
-            Ok(())
+            Ok(buf.len())
         }
     }
 
     let tested = AtomicBool::new(false);
     srv.run(
+        SyncRuntimeBuilder,
         DeviceParams::new().size(SIZE),
         Handler {
             tested: &tested,
@@ -259,17 +262,85 @@ fn error() {
             stop.stop();
         }
 
-        fn read(&self, _off: u64, _buf: &mut [u8], _flags: IoFlags) -> Result<(), Errno> {
+        async fn read(&self, _off: u64, _buf: &mut [u8], _flags: IoFlags) -> Result<usize, Errno> {
             Err(Errno::IO)
         }
 
-        fn write(&self, _off: u64, _buf: &[u8], _flags: IoFlags) -> Result<(), Errno> {
+        async fn write(&self, _off: u64, _buf: &[u8], _flags: IoFlags) -> Result<usize, Errno> {
             Err(Errno::IO)
         }
     }
 
     let tested = AtomicBool::new(false);
-    srv.run(DeviceParams::new().size(SIZE), Handler { tested: &tested })
+    srv.run(
+        SyncRuntimeBuilder,
+        DeviceParams::new().size(SIZE),
+        Handler { tested: &tested },
+    )
+    .unwrap();
+    assert!(tested.load(Ordering::Relaxed));
+}
+
+#[test]
+fn tokio_null() {
+    let (ctl, uring) = init();
+    let mut srv = DeviceBuilder::new()
+        .name("ublk-test")
+        .unprivileged()
+        .create_service(ctl, uring)
         .unwrap();
+
+    const SIZE: u64 = 4 << 10;
+    const DELAY: Duration = Duration::from_millis(500);
+    const TOLERANCE: Duration = Duration::from_millis(50);
+
+    struct Handler<'a> {
+        tested: &'a AtomicBool,
+    }
+    impl BlockDevice for Handler<'_> {
+        fn ready(&self, dev_info: &DeviceInfo, stop: Stopper) {
+            let dev_path = PathBuf::from(format!("{}{}", BDEV_PREFIX, dev_info.dev_id()));
+
+            let mut file = retry_on_perm(|| {
+                fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(&dev_path)
+            })
+            .unwrap();
+
+            let mut buf = [0u8; SECTOR_SIZE as _];
+            let inst = Instant::now();
+            let read = file.read(&mut buf).unwrap();
+            let elapsed = inst.elapsed();
+            assert_eq!(read, SECTOR_SIZE as _);
+            assert_eq!(buf, [0u8; SECTOR_SIZE as _]);
+            assert!(
+                DELAY - TOLERANCE <= elapsed && elapsed <= DELAY + TOLERANCE,
+                "unexpected delay: {elapsed:?}",
+            );
+
+            self.tested.store(true, Ordering::Relaxed);
+            stop.stop();
+        }
+
+        async fn read(&self, _off: u64, buf: &mut [u8], _flags: IoFlags) -> Result<usize, Errno> {
+            buf.fill(0);
+            tokio::time::sleep(DELAY).await;
+            Ok(buf.len())
+        }
+
+        async fn write(&self, _off: u64, _buf: &[u8], _flags: IoFlags) -> Result<usize, Errno> {
+            Err(Errno::IO)
+        }
+    }
+
+    let tested = AtomicBool::new(false);
+    srv.run(
+        TokioRuntimeBuilder,
+        DeviceParams::new().size(SIZE),
+        Handler { tested: &tested },
+    )
+    .unwrap();
     assert!(tested.load(Ordering::Relaxed));
 }
