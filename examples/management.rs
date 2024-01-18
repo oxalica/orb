@@ -9,6 +9,8 @@ enum Cli {
     GetInfo { dev_id: u32 },
     /// Delete the ublk device at `dev_id`.
     Delete { dev_id: u32 },
+    /// Delete all ublk devices.
+    DeleteAll,
 }
 
 fn main() {
@@ -32,6 +34,28 @@ fn main() {
         Cli::Delete { dev_id } => {
             ctl.delete_device(&mut uring, dev_id)
                 .expect("failed to delete device");
+        }
+        Cli::DeleteAll => {
+            let mut failed = false;
+            for ent in std::fs::read_dir("/dev").expect("failed to read /dev") {
+                if let Some(dev_id) = (|| {
+                    ent.ok()?
+                        .file_name()
+                        .to_str()?
+                        .strip_prefix("ublkc")?
+                        .parse::<u32>()
+                        .ok()
+                })() {
+                    eprintln!("deleting device {dev_id}");
+                    if let Err(err) = ctl.delete_device(&mut uring, dev_id) {
+                        eprintln!("{err}");
+                        failed = true;
+                    }
+                }
+            }
+            if failed {
+                std::process::exit(1);
+            }
         }
     }
 }
