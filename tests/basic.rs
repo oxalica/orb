@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use orb::runtime::{SyncRuntimeBuilder, TokioRuntimeBuilder};
 use orb::ublk::{
     BlockDevice, ControlDevice, DevState, DeviceAttrs, DeviceBuilder, DeviceInfo, DeviceParams,
-    FeatureFlags, IoFlags, Stopper, Uring, BDEV_PREFIX, SECTOR_SIZE,
+    FeatureFlags, IoFlags, ReadBuf, Stopper, Uring, WriteBuf, BDEV_PREFIX, SECTOR_SIZE,
 };
 use rand::rngs::StdRng;
 use rand::{Rng, RngCore, SeedableRng};
@@ -121,11 +121,21 @@ fn device_attrs() {
             stop.stop();
         }
 
-        async fn read(&self, _off: u64, _buf: &mut [u8], _flags: IoFlags) -> Result<usize, Errno> {
+        async fn read(
+            &self,
+            _off: u64,
+            _buf: ReadBuf<'_>,
+            _flags: IoFlags,
+        ) -> Result<usize, Errno> {
             Err(Errno::IO)
         }
 
-        async fn write(&self, _off: u64, _buf: &[u8], _flags: IoFlags) -> Result<usize, Errno> {
+        async fn write(
+            &self,
+            _off: u64,
+            _buf: WriteBuf<'_>,
+            _flags: IoFlags,
+        ) -> Result<usize, Errno> {
             Err(Errno::IO)
         }
     }
@@ -202,14 +212,21 @@ fn read_write() {
             stop.stop();
         }
 
-        async fn read(&self, off: u64, buf: &mut [u8], _flags: IoFlags) -> Result<usize, Errno> {
-            buf.copy_from_slice(&self.data.lock().unwrap()[off as usize..][..buf.len()]);
-            Ok(buf.len())
+        async fn read(&self, off: u64, buf: ReadBuf<'_>, _flags: IoFlags) -> Result<usize, Errno> {
+            let len = buf.len();
+            buf.copy_from(&self.data.lock().unwrap()[off as usize..][..len]);
+            Ok(len)
         }
 
-        async fn write(&self, off: u64, buf: &[u8], _flags: IoFlags) -> Result<usize, Errno> {
-            self.data.lock().unwrap()[off as usize..][..buf.len()].copy_from_slice(buf);
-            Ok(buf.len())
+        async fn write(
+            &self,
+            off: u64,
+            buf: WriteBuf<'_>,
+            _flags: IoFlags,
+        ) -> Result<usize, Errno> {
+            let len = buf.len();
+            buf.copy_to(&mut self.data.lock().unwrap()[off as usize..][..len]);
+            Ok(len)
         }
     }
 
@@ -262,11 +279,21 @@ fn error() {
             stop.stop();
         }
 
-        async fn read(&self, _off: u64, _buf: &mut [u8], _flags: IoFlags) -> Result<usize, Errno> {
+        async fn read(
+            &self,
+            _off: u64,
+            _buf: ReadBuf<'_>,
+            _flags: IoFlags,
+        ) -> Result<usize, Errno> {
             Err(Errno::IO)
         }
 
-        async fn write(&self, _off: u64, _buf: &[u8], _flags: IoFlags) -> Result<usize, Errno> {
+        async fn write(
+            &self,
+            _off: u64,
+            _buf: WriteBuf<'_>,
+            _flags: IoFlags,
+        ) -> Result<usize, Errno> {
             Err(Errno::IO)
         }
     }
@@ -324,13 +351,19 @@ fn tokio_null() {
             stop.stop();
         }
 
-        async fn read(&self, _off: u64, buf: &mut [u8], _flags: IoFlags) -> Result<usize, Errno> {
-            buf.fill(0);
+        async fn read(&self, _off: u64, buf: ReadBuf<'_>, _flags: IoFlags) -> Result<usize, Errno> {
+            let len = buf.len();
             tokio::time::sleep(DELAY).await;
-            Ok(buf.len())
+            buf.fill(0);
+            Ok(len)
         }
 
-        async fn write(&self, _off: u64, _buf: &[u8], _flags: IoFlags) -> Result<usize, Errno> {
+        async fn write(
+            &self,
+            _off: u64,
+            _buf: WriteBuf<'_>,
+            _flags: IoFlags,
+        ) -> Result<usize, Errno> {
             Err(Errno::IO)
         }
     }

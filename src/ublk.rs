@@ -1,6 +1,7 @@
 #![warn(missing_debug_implementations)]
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::fs::File;
+use std::marker::PhantomData;
 use std::mem::ManuallyDrop;
 use std::ops::ControlFlow;
 use std::os::fd::{BorrowedFd, RawFd};
@@ -900,7 +901,8 @@ where
                     log::trace!("READ offset={off} len={len} flags={flags:?}");
                     // SAFETY: This buffer is exclusive for task of `tag`.
                     let buf = unsafe { io_buf_of(tag).as_mut() };
-                    let fut = handler.read(off, &mut buf[..len], flags);
+                    let buf = ReadBuf(&mut buf[..len], PhantomData);
+                    let fut = handler.read(off, buf, flags);
                     // TODO: This line is repeated over and over due to distinct Future types.
                     spawner.spawn(async move { commit_and_fetch(fut.await.into_c_result()) });
                 }
@@ -908,7 +910,8 @@ where
                     log::trace!("WRITE offset={off} len={len} flags={flags:?}");
                     // SAFETY: This buffer is exclusive for task of `tag`.
                     let buf = unsafe { io_buf_of(tag).as_mut() };
-                    let fut = handler.write(off, &buf[..len], flags);
+                    let buf = WriteBuf(&buf[..len], PhantomData);
+                    let fut = handler.write(off, buf, flags);
                     spawner.spawn(async move { commit_and_fetch(fut.await.into_c_result()) });
                 }
                 binding::UBLK_IO_OP_FLUSH => {
@@ -1077,9 +1080,9 @@ impl IntoCResult for Result<usize, Errno> {
 pub trait BlockDevice {
     fn ready(&self, dev_info: &DeviceInfo, stop: Stopper);
 
-    async fn read(&self, off: u64, buf: &mut [u8], flags: IoFlags) -> Result<usize, Errno>;
+    async fn read(&self, off: u64, buf: ReadBuf<'_>, flags: IoFlags) -> Result<usize, Errno>;
 
-    async fn write(&self, off: u64, buf: &[u8], flags: IoFlags) -> Result<usize, Errno>;
+    async fn write(&self, off: u64, buf: WriteBuf<'_>, flags: IoFlags) -> Result<usize, Errno>;
 
     async fn flush(&self, _flags: IoFlags) -> Result<(), Errno> {
         Ok(())
@@ -1091,5 +1094,41 @@ pub trait BlockDevice {
 
     async fn write_zeroes(&self, _off: u64, _len: usize, _flags: IoFlags) -> Result<(), Errno> {
         Err(Errno::OPNOTSUPP)
+    }
+}
+
+/// The return buffer for [`BlockDevice::read`].
+#[derive(Debug)]
+pub struct ReadBuf<'a>(&'a mut [u8], PhantomData<*mut ()>);
+
+impl ReadBuf<'_> {
+    // It must not be empty.
+    #[allow(clippy::len_without_is_empty)]
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub fn copy_from(self, data: &[u8]) {
+        self.0.copy_from_slice(data);
+    }
+
+    pub fn fill(self, byte: u8) {
+        self.0.fill(byte);
+    }
+}
+
+/// The input buffer for [`BlockDevice::write`].
+#[derive(Debug)]
+pub struct WriteBuf<'a>(&'a [u8], PhantomData<*mut ()>);
+
+impl WriteBuf<'_> {
+    // It must not be empty.
+    #[allow(clippy::len_without_is_empty)]
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub fn copy_to(self, out: &mut [u8]) {
+        out.copy_from_slice(self.0);
     }
 }
