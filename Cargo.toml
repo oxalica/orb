@@ -19,6 +19,8 @@ tokio = { version = "1.35.1", features = ["net", "rt"] }
 bindgen = "0.69.2"
 
 [dev-dependencies]
+anyhow = "1"
 clap = { version = "4.4.18", features = ["derive"] }
 rand = "0.8.5"
+rustix = { version = "0.38.30", features = ["fs"] }
 tokio = { version = "1.35.1", features = ["time"] }

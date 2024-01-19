@@ -1115,6 +1115,10 @@ impl ReadBuf<'_> {
     pub fn fill(self, byte: u8) {
         self.0.fill(byte);
     }
+
+    pub fn as_slice(&mut self) -> Option<&'_ mut [u8]> {
+        Some(self.0)
+    }
 }
 
 /// The input buffer for [`BlockDevice::write`].
@@ -1130,5 +1134,9 @@ impl WriteBuf<'_> {
 
     pub fn copy_to(self, out: &mut [u8]) {
         out.copy_from_slice(self.0);
+    }
+
+    pub fn as_slice(&mut self) -> Option<&[u8]> {
+        Some(self.0)
     }
 }
