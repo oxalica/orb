@@ -84,12 +84,7 @@ impl BlockDevice for LoopDev {
         Ok(buf.len())
     }
 
-    async fn write(
-        &self,
-        off: u64,
-        mut buf: WriteBuf<'_>,
-        _flags: IoFlags,
-    ) -> Result<usize, Errno> {
+    async fn write(&self, off: u64, buf: WriteBuf<'_>, _flags: IoFlags) -> Result<usize, Errno> {
         self.file
             .write_all_at(buf.as_slice().unwrap(), off)
             .map_err(convert_err)?;

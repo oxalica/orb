@@ -212,10 +212,14 @@ fn read_write() {
             stop.stop();
         }
 
-        async fn read(&self, off: u64, buf: ReadBuf<'_>, _flags: IoFlags) -> Result<usize, Errno> {
-            let len = buf.len();
-            buf.copy_from(&self.data.lock().unwrap()[off as usize..][..len]);
-            Ok(len)
+        async fn read(
+            &self,
+            off: u64,
+            mut buf: ReadBuf<'_>,
+            _flags: IoFlags,
+        ) -> Result<usize, Errno> {
+            buf.copy_from(&self.data.lock().unwrap()[off as usize..][..buf.len()]);
+            Ok(buf.len())
         }
 
         async fn write(
@@ -351,11 +355,15 @@ fn tokio_null() {
             stop.stop();
         }
 
-        async fn read(&self, _off: u64, buf: ReadBuf<'_>, _flags: IoFlags) -> Result<usize, Errno> {
-            let len = buf.len();
+        async fn read(
+            &self,
+            _off: u64,
+            mut buf: ReadBuf<'_>,
+            _flags: IoFlags,
+        ) -> Result<usize, Errno> {
             tokio::time::sleep(DELAY).await;
             buf.fill(0);
-            Ok(len)
+            Ok(buf.len())
         }
 
         async fn write(

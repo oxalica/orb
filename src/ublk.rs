@@ -954,9 +954,11 @@ pub struct DeviceParams {
     size: u64,
     logical_block_size: u32,
     physical_block_size: u32,
+    chunk_size: u32,
     io_optimal_size: u32,
     io_min_size: u32,
     io_max_size: u32,
+    virt_boundary_mask: u64,
     discard: Option<DiscardParams>,
 }
 
@@ -967,7 +969,8 @@ impl Default for DeviceParams {
 }
 
 impl DeviceParams {
-    pub fn new() -> Self {
+    /// Default parameters.
+    pub const fn new() -> Self {
         Self {
             attrs: DeviceAttrs::empty(),
             size: 0,
@@ -976,19 +979,45 @@ impl DeviceParams {
             io_optimal_size: PAGE_SIZE,
             io_min_size: PAGE_SIZE,
             io_max_size: DEFAULT_IO_BUF_SIZE,
+            chunk_size: 0,
+            virt_boundary_mask: 0,
             discard: None,
         }
     }
 
+    /// Set the total size of the block device.
     pub fn size(&mut self, size: u64) -> &mut Self {
         assert_eq!(size % SECTOR_SIZE as u64, 0);
         self.size = size;
         self
     }
 
+    /// Set minimum request size for the queue.
+    ///
+    /// See:
+    /// <https://www.kernel.org/doc/html/v6.7/core-api/kernel-api.html#c.blk_queue_io_min>
     pub fn io_max_size(&mut self, size: u32) -> &mut Self {
         assert_eq!(size % SECTOR_SIZE, 0);
         self.io_max_size = size;
+        self
+    }
+
+    /// Set size of the chunk for this queue.
+    ///
+    /// See:
+    /// <https://www.kernel.org/doc/html/v6.7/core-api/kernel-api.html#c.blk_queue_chunk_sectors>
+    pub fn chunk_size(&mut self, size: u32) -> &mut Self {
+        assert_eq!(size % SECTOR_SIZE, 0);
+        self.chunk_size = size;
+        self
+    }
+
+    /// Set boundary rules for bio merging.
+    ///
+    /// See:
+    /// <https://www.kernel.org/doc/html/v6.7/core-api/kernel-api.html#c.blk_queue_virt_boundary>
+    pub fn virt_boundary_mask(&mut self, mask: u64) -> &mut Self {
+        self.virt_boundary_mask = mask;
         self
     }
 
@@ -1031,9 +1060,8 @@ impl DeviceParams {
                 io_min_shift: self.io_min_size.trailing_zeros() as _,
                 max_sectors: self.io_max_size / SECTOR_SIZE,
                 dev_sectors: self.size / SECTOR_SIZE as u64,
-                // TODO: What are these?
-                chunk_sectors: 0,
-                virt_boundary_mask: 0,
+                chunk_sectors: self.chunk_size / SECTOR_SIZE,
+                virt_boundary_mask: self.virt_boundary_mask,
             },
             discard: self
                 .discard
@@ -1108,11 +1136,11 @@ impl ReadBuf<'_> {
         self.0.len()
     }
 
-    pub fn copy_from(self, data: &[u8]) {
+    pub fn copy_from(&mut self, data: &[u8]) {
         self.0.copy_from_slice(data);
     }
 
-    pub fn fill(self, byte: u8) {
+    pub fn fill(&mut self, byte: u8) {
         self.0.fill(byte);
     }
 
@@ -1132,11 +1160,11 @@ impl WriteBuf<'_> {
         self.0.len()
     }
 
-    pub fn copy_to(self, out: &mut [u8]) {
+    pub fn copy_to(&self, out: &mut [u8]) {
         out.copy_from_slice(self.0);
     }
 
-    pub fn as_slice(&mut self) -> Option<&[u8]> {
+    pub fn as_slice(&self) -> Option<&[u8]> {
         Some(self.0)
     }
 }
