@@ -1,7 +1,9 @@
+use anyhow::{ensure, Context};
+use clap::Parser;
 use orb::ublk::{ControlDevice, Uring};
 
 /// Ublk device management.
-#[derive(Debug, clap::Parser)]
+#[derive(Debug, Parser)]
 enum Cli {
     /// Print all features supported by the current kernel driver.
     GetFeatures,
@@ -13,31 +15,31 @@ enum Cli {
     DeleteAll,
 }
 
-fn main() {
-    let cli = <Cli as clap::Parser>::parse();
+fn main() -> anyhow::Result<()> {
+    let cli = Cli::parse();
     let ctl = ControlDevice::open()
-        .expect("failed to open control device, kernel module 'ublk_drv' not loaded?");
-    let mut uring = Uring::new().expect("failed to create io-uring");
+        .context("failed to open control device, kernel module 'ublk_drv' not loaded?")?;
+    let mut uring = Uring::new().context("failed to create control io-uring")?;
     match cli {
         Cli::GetFeatures => {
             let feat = ctl
                 .get_features(&mut uring)
-                .expect("failed to get features");
+                .context("failed to get features")?;
             println!("{feat:?}");
         }
         Cli::GetInfo { dev_id } => {
             let info = ctl
                 .get_device_info(&mut uring, dev_id)
-                .expect("failed to get device info");
+                .context("failed to get device info")?;
             println!("{info:?}");
         }
         Cli::Delete { dev_id } => {
             ctl.delete_device(&mut uring, dev_id)
-                .expect("failed to delete device");
+                .context("failed to delete device")?;
         }
         Cli::DeleteAll => {
-            let mut failed = false;
-            for ent in std::fs::read_dir("/dev").expect("failed to read /dev") {
+            let mut success = true;
+            for ent in std::fs::read_dir("/dev").context("failed to read /dev")? {
                 if let Some(dev_id) = (|| {
                     ent.ok()?
                         .file_name()
@@ -49,13 +51,12 @@ fn main() {
                     eprintln!("deleting device {dev_id}");
                     if let Err(err) = ctl.delete_device(&mut uring, dev_id) {
                         eprintln!("{err}");
-                        failed = true;
+                        success = false;
                     }
                 }
             }
-            if failed {
-                std::process::exit(1);
-            }
+            ensure!(success, "some operations failed");
         }
     }
+    Ok(())
 }
