@@ -130,8 +130,9 @@ impl ControlDevice {
         })
     }
 
-    unsafe fn execute_ctrl_cmd_with_cdev<T>(
+    unsafe fn execute_ctrl_cmd_opt_cdev<T>(
         &self,
+        include_cdev: bool,
         direction: ioctl::Direction,
         cmd_op: u32,
         dev_id: u32,
@@ -141,11 +142,15 @@ impl ControlDevice {
         #[repr(C)]
         struct Payload<T>(CdevPath, T);
 
-        let buf = Payload(CdevPath::from_id(dev_id), buf);
         cmd.dev_id = dev_id;
-        cmd.dev_path_len = CdevPath::MAX_LEN as _;
-        let ret = self.execute_ctrl_cmd(direction, cmd_op, buf, cmd)?;
-        Ok(ret.1)
+        if include_cdev {
+            let buf = Payload(CdevPath::from_id(dev_id), buf);
+            cmd.dev_path_len = CdevPath::MAX_LEN as _;
+            let ret = self.execute_ctrl_cmd(direction, cmd_op, buf, cmd)?;
+            Ok(ret.1)
+        } else {
+            self.execute_ctrl_cmd(direction, cmd_op, buf, cmd)
+        }
     }
 
     unsafe fn execute_ctrl_cmd<T>(
@@ -222,7 +227,9 @@ impl ControlDevice {
     pub fn get_device_info(&self, dev_id: u32) -> io::Result<DeviceInfo> {
         // SAFETY: Valid uring_cmd.
         unsafe {
-            self.execute_ctrl_cmd_with_cdev::<binding::ublksrv_ctrl_dev_info>(
+            self.execute_ctrl_cmd_opt_cdev::<binding::ublksrv_ctrl_dev_info>(
+                // Always include cdev_path.
+                true,
                 ioctl::Direction::Read,
                 binding::UBLK_CMD_GET_DEV_INFO2,
                 dev_id,
@@ -270,7 +277,9 @@ impl ControlDevice {
         log::trace!("delete device {dev_id}");
         // SAFETY: Valid uring_cmd.
         unsafe {
-            self.execute_ctrl_cmd_with_cdev(
+            self.execute_ctrl_cmd_opt_cdev(
+                // Carries no data, so just pass cdev_path anyway.
+                true,
                 ioctl::Direction::ReadWrite,
                 binding::UBLK_CMD_DEL_DEV,
                 dev_id,
@@ -288,7 +297,9 @@ impl ControlDevice {
         log::trace!("start device {dev_id} on pid {pid}");
         // SAFETY: Valid uring_cmd.
         unsafe {
-            self.execute_ctrl_cmd_with_cdev(
+            self.execute_ctrl_cmd_opt_cdev(
+                // Carries no data, so just pass cdev_path anyway.
+                true,
                 ioctl::Direction::ReadWrite,
                 binding::UBLK_CMD_START_DEV,
                 dev_id,
@@ -306,7 +317,9 @@ impl ControlDevice {
         log::trace!("stop device {dev_id}");
         // SAFETY: Valid uring_cmd.
         unsafe {
-            self.execute_ctrl_cmd_with_cdev(
+            self.execute_ctrl_cmd_opt_cdev(
+                // Carries no data, so just pass cdev_path anyway.
+                true,
                 ioctl::Direction::ReadWrite,
                 binding::UBLK_CMD_STOP_DEV,
                 dev_id,
@@ -317,11 +330,17 @@ impl ControlDevice {
         Ok(())
     }
 
-    pub fn set_device_param(&self, dev_id: u32, params: &DeviceParams) -> io::Result<()> {
+    fn set_device_param(
+        &self,
+        dev_id: u32,
+        params: &DeviceParams,
+        unprivileged: bool,
+    ) -> io::Result<()> {
         log::trace!("set parameters of device {dev_id} to {params:?}");
         // SAFETY: Valid uring_cmd.
         unsafe {
-            self.execute_ctrl_cmd_with_cdev::<binding::ublk_params>(
+            self.execute_ctrl_cmd_opt_cdev::<binding::ublk_params>(
+                unprivileged,
                 ioctl::Direction::ReadWrite,
                 binding::UBLK_CMD_SET_PARAMS,
                 dev_id,
@@ -648,9 +667,13 @@ impl Service<'_> {
         D: BlockDevice + Sync,
     {
         let dev_id = self.dev_info().dev_id();
-        let nr_queues = self.dev_info.nr_queues();
+        let nr_queues = self.dev_info().nr_queues();
+        let unprivileged = self
+            .dev_info()
+            .flags()
+            .contains(FeatureFlags::UnprivilegedDev);
         assert_ne!(nr_queues, 0);
-        self.ctl.set_device_param(dev_id, params)?;
+        self.ctl.set_device_param(dev_id, params, unprivileged)?;
 
         // The guard to stop the device once it's started.
         // This must be outside the thread scope so all resources are released on stopping.
