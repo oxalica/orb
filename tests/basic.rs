@@ -56,7 +56,7 @@ fn create_info_delete() {
         .io_buf_size(12 << 10)
         .unprivileged();
     let info = ctl.create_device(&builder).unwrap();
-    let ctl = scopeguard::guard(ctl, |ctl| {
+    scopeguard::defer_on_unwind! {
         if let Err(err) = retry_on_perm(|| ctl.delete_device(info.dev_id())) {
             if std::thread::panicking() {
                 eprintln!("failed to delete device: {err}");
@@ -64,7 +64,7 @@ fn create_info_delete() {
                 panic!("failed to delete device: {err}");
             }
         }
-    });
+    }
 
     assert!(info.dev_id() < i32::MAX as u32);
     assert_eq!(info.nr_queues(), 3);
@@ -80,7 +80,6 @@ fn create_info_delete() {
     assert_eq!(info.state(), info2.state());
 
     ctl.delete_device(info.dev_id()).unwrap();
-    scopeguard::ScopeGuard::into_inner(ctl);
 }
 
 #[test]

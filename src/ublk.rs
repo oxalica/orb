@@ -443,18 +443,19 @@ impl DeviceBuilder {
 
     pub fn create_service<'ctl>(&self, ctl: &'ctl ControlDevice) -> io::Result<Service<'ctl>> {
         let dev_info = ctl.create_device(self)?;
+        let dev_id = dev_info.dev_id();
 
         // Delete the device if anything goes wrong.
-        let delete_device_guard = scopeguard::guard((ctl, dev_info.dev_id()), |(ctl, dev_id)| {
+        scopeguard::defer_on_unwind! {
             if let Err(err) = ctl.stop_device(dev_id) {
                 // Ignore errors if already deleted.
                 if err.kind() != io::ErrorKind::NotFound {
                     log::error!("failed to stop device {dev_id}: {err}");
                 }
             }
-        });
+        }
 
-        let path = format!("{}{}", CdevPath::PREFIX, dev_info.dev_id());
+        let path = format!("{}{}", CdevPath::PREFIX, dev_id);
         let mut retries_left = self.max_retries;
         let cdev = loop {
             match File::options().read(true).write(true).open(&path) {
@@ -467,9 +468,6 @@ impl DeviceBuilder {
                 Err(err) => return Err(err),
             }
         };
-
-        // Success. Defuse the guard.
-        scopeguard::ScopeGuard::into_inner(delete_device_guard);
 
         Ok(Service {
             dev_info,
@@ -688,19 +686,17 @@ impl Service<'_> {
 
         // The guard to stop the device once it's started.
         // This must be outside the thread scope so all resources are released on stopping.
-        let mut stop_device_guard = scopeguard::guard((self, false), |(this, active)| {
+        let mut stop_device_guard = scopeguard::guard(false, |active| {
             if !active {
                 return;
             }
-            let dev_id = this.dev_info().dev_id();
-            if let Err(err) = this.ctl.stop_device(dev_id) {
+            if let Err(err) = self.ctl.stop_device(dev_id) {
                 // Ignore errors if already deleted.
                 if err.kind() != io::ErrorKind::NotFound {
                     log::error!("failed to stop device {dev_id}: {err}");
                 }
             }
         });
-        let (this, stop_device_guard_active) = &mut *stop_device_guard;
 
         // No one is actually `read` it, so no need to be a semaphore.
         let exit_fd = Arc::new(rustix::event::eventfd(0, EventfdFlags::CLOEXEC)?);
@@ -717,8 +713,8 @@ impl Service<'_> {
                     let worker = IoWorker {
                         thread_id,
                         ready_tx: Some(ready_tx.clone().clone()),
-                        cdev: this.cdev.as_fd(),
-                        dev_info: &this.dev_info,
+                        cdev: self.cdev.as_fd(),
+                        dev_info: &self.dev_info,
                         handler: &handler,
                         runtime_builder: &runtime_builder,
                         stop_guard: thread_stop_guard.clone(),
@@ -735,12 +731,12 @@ impl Service<'_> {
             // will be collected by the join loop below.
             drop(ready_tx);
             if let Ok(()) = (0..nr_queues).try_for_each(|_| ready_rx.recv()) {
-                this.ctl.start_device(dev_id, rustix::process::getpid())?;
+                self.ctl.start_device(dev_id, rustix::process::getpid())?;
 
                 // Now device is started, and `/dev/ublkbX` appears.
                 // FIXME: The device status still reports DEAD here.
-                *stop_device_guard_active = true;
-                handler.ready(this.dev_info(), Stopper(Arc::clone(&exit_fd)));
+                *stop_device_guard = true;
+                handler.ready(self.dev_info(), Stopper(Arc::clone(&exit_fd)));
 
                 let ret = rustix::io::retry_on_intr(|| {
                     rustix::event::poll(
@@ -813,7 +809,8 @@ impl<B: BlockDevice, RB: AsyncRuntimeBuilder> IoWorker<'_, B, RB> {
         // otherwise it's a use-after-free.
         let mut io_ring = scopeguard::guard(IoUring::new(ring_size)?, |io_ring| {
             // All ops must be canceled before return, otherwise it's a UB.
-            let _guard = scopeguard::guard_on_unwind((), |()| std::process::abort());
+            scopeguard::defer_on_unwind!(std::process::abort());
+
             if let Err(err) = io_ring
                 .submitter()
                 .register_sync_cancel(None, io_uring::types::CancelBuilder::any())
