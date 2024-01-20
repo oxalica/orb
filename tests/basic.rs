@@ -138,7 +138,7 @@ fn device_attrs() {
     }
 
     let tested = AtomicBool::new(false);
-    srv.run(SyncRuntimeBuilder, &params, Handler { tested: &tested })
+    srv.serve(SyncRuntimeBuilder, &params, Handler { tested: &tested })
         .unwrap();
     assert!(tested.load(Ordering::Relaxed));
 }
@@ -232,7 +232,7 @@ fn read_write() {
     }
 
     let tested = AtomicBool::new(false);
-    srv.run(
+    srv.serve(
         SyncRuntimeBuilder,
         DeviceParams::new().size(SIZE),
         Handler {
@@ -300,7 +300,7 @@ fn error() {
     }
 
     let tested = AtomicBool::new(false);
-    srv.run(
+    srv.serve(
         SyncRuntimeBuilder,
         DeviceParams::new().size(SIZE),
         Handler { tested: &tested },
@@ -374,7 +374,7 @@ fn tokio_null() {
     }
 
     let tested = AtomicBool::new(false);
-    srv.run(
+    srv.serve(
         TokioRuntimeBuilder,
         DeviceParams::new().size(SIZE),
         Handler { tested: &tested },

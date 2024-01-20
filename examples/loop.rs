@@ -60,7 +60,7 @@ fn main() -> anyhow::Result<()> {
         });
     }
     let handler = LoopDev { file };
-    srv.run(TokioRuntimeBuilder, &params, handler)
+    srv.serve(TokioRuntimeBuilder, &params, handler)
         .context("service error")?;
     Ok(())
 }

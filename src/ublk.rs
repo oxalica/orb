@@ -652,11 +652,15 @@ impl<const ALIGN: usize> Drop for AlignedArray<ALIGN> {
 }
 
 impl Service<'_> {
+    const SUPPORTED_FLAGS: FeatureFlags = FeatureFlags::UringCmdCompInTask
+        .union(FeatureFlags::UnprivilegedDev)
+        .union(FeatureFlags::CmdIoctlEncode);
+
     pub fn dev_info(&self) -> &DeviceInfo {
         &self.dev_info
     }
 
-    pub fn run<RB, D>(
+    pub fn serve<RB, D>(
         &mut self,
         runtime_builder: RB,
         params: &DeviceParams,
@@ -666,13 +670,20 @@ impl Service<'_> {
         RB: AsyncRuntimeBuilder + Sync,
         D: BlockDevice + Sync,
     {
+        // Sanity check.
         let dev_id = self.dev_info().dev_id();
         let nr_queues = self.dev_info().nr_queues();
+        assert_ne!(nr_queues, 0);
+        let unsupported_flags = self.dev_info().flags() - Self::SUPPORTED_FLAGS;
+        assert!(
+            unsupported_flags.is_empty(),
+            "flags not supported: {unsupported_flags:?}",
+        );
+
         let unprivileged = self
             .dev_info()
             .flags()
             .contains(FeatureFlags::UnprivilegedDev);
-        assert_ne!(nr_queues, 0);
         self.ctl.set_device_param(dev_id, params, unprivileged)?;
 
         // The guard to stop the device once it's started.
