@@ -1,6 +1,5 @@
 use std::fs;
-use std::io::{self, ErrorKind, Read, Seek, Write};
-use std::os::unix::fs::FileExt;
+use std::io::{self, ErrorKind, Read, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
@@ -14,6 +13,7 @@ use orb::ublk::{
 use rand::rngs::StdRng;
 use rand::{Rng, RngCore, SeedableRng};
 use rustix::io::Errno;
+use xshell::{cmd, Shell};
 
 fn init() -> ControlDevice {
     ControlDevice::open()
@@ -176,42 +176,43 @@ fn read_write(flags: FeatureFlags) {
     }
     impl BlockDevice for Handler<'_> {
         fn ready(&self, dev_info: &DeviceInfo, stop: Stopper) {
-            let dev_path = PathBuf::from(format!("{}{}", BDEV_PREFIX, dev_info.dev_id()));
+            let dev_path = format!("{}{}", BDEV_PREFIX, dev_info.dev_id());
             let mut rng = self.rng.clone();
 
-            let mut file = retry_on_perm(|| {
-                fs::OpenOptions::new()
-                    .read(true)
-                    .write(true)
-                    .open(&dev_path)
+            retry_on_perm(|| {
+                rustix::fs::access(&dev_path, rustix::fs::Access::WRITE_OK).map_err(|e| e.into())
             })
             .unwrap();
 
+            // NB. Perform I/O in another process to avoid deadlocks.
+            let sh = Shell::new().unwrap();
+            let mut state = cmd!(sh, "cat {dev_path}").output().unwrap().stdout;
             // The initial data should match.
-            let mut state = Vec::new();
-            let len = file.read_to_end(&mut state).unwrap();
-            assert_eq!(len, SIZE as usize);
+            assert_eq!(state.len(), SIZE as usize);
             assert_eq!(state, *self.data.lock().unwrap());
 
             let mut buf = [0u8; SECTOR_SIZE as usize];
             for _ in 0..TEST_WRITE_ROUNDS {
                 // Write a random block at random sector.
-                let offset = rng.gen_range(0..(SIZE / SECTOR_SIZE as u64)) * SECTOR_SIZE as u64;
+                let sector_offset = rng.gen_range(0..(SIZE / SECTOR_SIZE as u64));
                 rng.fill_bytes(&mut buf);
-                let written = file.write_at(&buf, offset).unwrap();
-                assert_eq!(written, SECTOR_SIZE as _);
+                let sector_offset_s = sector_offset.to_string();
+                cmd!(
+                    sh,
+                    "dd if=/dev/stdin of={dev_path} bs=512 count=1 oseek={sector_offset_s}"
+                )
+                .ignore_stderr()
+                .stdin(buf)
+                .run()
+                .unwrap();
+                let offset = sector_offset * SECTOR_SIZE as u64;
                 state[offset as usize..][..SECTOR_SIZE as usize].copy_from_slice(&buf);
 
                 // Retrieve all data, and they should match.
-                let mut got = Vec::new();
-                file.rewind().unwrap();
-                let read = file.read_to_end(&mut got).unwrap();
-                assert_eq!(read, SIZE as _);
+                let got = cmd!(sh, "cat {dev_path}").output().unwrap().stdout;
                 assert_eq!(got, state);
             }
 
-            // Sync the device, so all kernel buffers should be flushed.
-            file.sync_all().unwrap();
             assert_eq!(*self.data.lock().unwrap(), state);
 
             self.tested.store(true, Ordering::Relaxed);
@@ -255,6 +256,7 @@ fn read_write(flags: FeatureFlags) {
 }
 
 #[test]
+#[ignore = "spam dmesg"]
 fn error() {
     let ctl = init();
     let mut srv = DeviceBuilder::new()
@@ -346,22 +348,22 @@ fn tokio_null(flags: FeatureFlags) {
     }
     impl BlockDevice for Handler<'_> {
         fn ready(&self, dev_info: &DeviceInfo, stop: Stopper) {
-            let dev_path = PathBuf::from(format!("{}{}", BDEV_PREFIX, dev_info.dev_id()));
-
-            let mut file = retry_on_perm(|| {
-                fs::OpenOptions::new()
-                    .read(true)
-                    .write(true)
-                    .open(&dev_path)
+            let dev_path = format!("{}{}", BDEV_PREFIX, dev_info.dev_id());
+            retry_on_perm(|| {
+                rustix::fs::access(&dev_path, rustix::fs::Access::WRITE_OK).map_err(|e| e.into())
             })
             .unwrap();
 
-            let mut buf = [0u8; SECTOR_SIZE as _];
+            // NB. Perform I/O in another process to avoid deadlocks.
+            let sh = Shell::new().unwrap();
             let inst = Instant::now();
-            let read = file.read(&mut buf).unwrap();
+            let out = cmd!(sh, "dd if={dev_path} of=/dev/stdout bs=512 count=1")
+                .ignore_stderr()
+                .output()
+                .unwrap()
+                .stdout;
             let elapsed = inst.elapsed();
-            assert_eq!(read, SECTOR_SIZE as _);
-            assert_eq!(buf, [0u8; SECTOR_SIZE as _]);
+            assert_eq!(out, [0u8; SECTOR_SIZE as _]);
             assert!(
                 DELAY - TOLERANCE <= elapsed && elapsed <= DELAY + TOLERANCE,
                 "unexpected delay: {elapsed:?}",
