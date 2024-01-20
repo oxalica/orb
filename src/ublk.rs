@@ -5,6 +5,7 @@ use std::marker::PhantomData;
 use std::mem::ManuallyDrop;
 use std::ops::ControlFlow;
 use std::os::fd::{BorrowedFd, RawFd};
+use std::os::unix::fs::FileExt;
 use std::ptr::NonNull;
 use std::sync::Arc;
 use std::time::Duration;
@@ -13,7 +14,7 @@ use std::{fmt, io, mem, ptr, thread};
 use io_uring::types::{Fd, Fixed};
 use io_uring::{cqueue, opcode, squeue, IoUring, SubmissionQueue};
 use rustix::event::{EventfdFlags, PollFd, PollFlags};
-use rustix::fd::{AsFd, AsRawFd, OwnedFd};
+use rustix::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
 use rustix::io::Errno;
 use rustix::process::Pid;
 use rustix::{ioctl, mm};
@@ -25,7 +26,6 @@ const PAGE_SIZE: u32 = 4 << 10;
 pub const SECTOR_SIZE: u32 = 512;
 
 const DEFAULT_IO_BUF_SIZE: u32 = 512 << 10;
-const BUFFER_ALIGN: usize = 64;
 
 pub const CDEV_PREFIX: &str = "/dev/ublkc";
 pub const BDEV_PREFIX: &str = "/dev/ublkb";
@@ -431,8 +431,24 @@ impl DeviceBuilder {
         self
     }
 
+    pub fn user_copy(&mut self) -> &mut Self {
+        self.features |= FeatureFlags::UserCopy;
+        self
+    }
+
+    /// Set feature flags.
+    ///
+    /// This will replace previous flags set by, eg. [`DeviceBuilder::unprivileged`].
     pub fn flags(&mut self, flags: FeatureFlags) -> &mut Self {
         self.features = flags;
+        self
+    }
+
+    /// Add feature flags.
+    ///
+    /// `flags` will be "or"ed to previously set value.
+    pub fn add_flags(&mut self, flags: FeatureFlags) -> &mut Self {
+        self.features |= flags;
         self
     }
 
@@ -628,31 +644,11 @@ impl Stopper {
     }
 }
 
-struct AlignedArray<const ALIGN: usize>(NonNull<[u8]>);
-
-impl<const ALIGN: usize> AlignedArray<ALIGN> {
-    pub fn new(size: usize) -> Self {
-        let layout = Layout::from_size_align(size, ALIGN).unwrap();
-        match NonNull::new(unsafe { System.alloc(layout) }) {
-            None => std::alloc::handle_alloc_error(layout),
-            Some(ptr) => Self(NonNull::slice_from_raw_parts(ptr, size)),
-        }
-    }
-}
-
-impl<const ALIGN: usize> Drop for AlignedArray<ALIGN> {
-    fn drop(&mut self) {
-        unsafe {
-            let layout = Layout::from_size_align_unchecked(self.0.len(), ALIGN);
-            System.dealloc(self.0.as_ptr().cast(), layout);
-        }
-    }
-}
-
 impl Service<'_> {
     const SUPPORTED_FLAGS: FeatureFlags = FeatureFlags::UringCmdCompInTask
         .union(FeatureFlags::UnprivilegedDev)
-        .union(FeatureFlags::CmdIoctlEncode);
+        .union(FeatureFlags::CmdIoctlEncode)
+        .union(FeatureFlags::UserCopy);
 
     pub fn dev_info(&self) -> &DeviceInfo {
         &self.dev_info
@@ -764,6 +760,54 @@ impl Service<'_> {
     }
 }
 
+/// The aligned buffer to pass data from and to the kernel driver.
+/// Each concurrenty task with a distinct tag owns a proportion of it.
+struct IoBuffers {
+    ptr: NonNull<u8>,
+    bufs: usize,
+    buf_size: usize,
+}
+
+impl IoBuffers {
+    const ALIGN: usize = 64;
+
+    fn new(bufs: usize, buf_size: usize) -> Self {
+        assert!(bufs != 0 && buf_size != 0);
+        let buf_size = buf_size.next_multiple_of(Self::ALIGN);
+        let size = bufs.checked_mul(buf_size).unwrap();
+        let layout = Layout::from_size_align(size, Self::ALIGN).unwrap();
+        match NonNull::new(unsafe { System.alloc(layout) }) {
+            None => std::alloc::handle_alloc_error(layout),
+            Some(ptr) => Self {
+                ptr,
+                bufs,
+                buf_size,
+            },
+        }
+    }
+
+    fn get(&self, idx: usize) -> NonNull<[u8]> {
+        assert!(idx < self.bufs);
+        // SAFETY: `ptr` is valid and `idx` is checked above.
+        unsafe {
+            NonNull::new_unchecked(ptr::slice_from_raw_parts_mut(
+                self.ptr.as_ptr().add(idx * self.buf_size),
+                self.buf_size,
+            ))
+        }
+    }
+}
+
+impl Drop for IoBuffers {
+    fn drop(&mut self) {
+        // SAFETY: Allocated by us.
+        unsafe {
+            let layout = Layout::from_size_align_unchecked(self.bufs * self.buf_size, Self::ALIGN);
+            System.dealloc(self.ptr.as_ptr().cast(), layout);
+        }
+    }
+}
+
 struct IoWorker<'a, B, RB> {
     thread_id: u16,
     ready_tx: Option<std::sync::mpsc::SyncSender<()>>,
@@ -785,24 +829,17 @@ impl<B: BlockDevice, RB: AsyncRuntimeBuilder> IoWorker<'_, B, RB> {
 
         let shm = IoDescShm::new(self.cdev, self.dev_info, self.thread_id)?;
 
-        let queue_depth = self.dev_info.queue_depth();
-        let buf_size = self
-            .dev_info
-            .io_buf_size()
-            .checked_next_multiple_of(BUFFER_ALIGN)
-            .unwrap();
-        let total_buf_size = buf_size.checked_mul(queue_depth.into()).unwrap();
-        // Must define the buffer before the io-uring, see below.
-        let io_buf = AlignedArray::<BUFFER_ALIGN>::new(total_buf_size);
-        let io_buf_of = |i: u16| unsafe {
-            NonNull::new_unchecked(ptr::slice_from_raw_parts_mut(
-                io_buf.0.as_ptr().cast::<u8>().add(i as usize * buf_size),
-                buf_size,
-            ))
-        };
+        let user_copy = self.dev_info.flags().contains(FeatureFlags::UserCopy);
+        // Must define the buffer before the io-uring, see below in `io_uring`.
+        let io_bufs = (!user_copy).then(|| {
+            IoBuffers::new(
+                self.dev_info.queue_depth().into(),
+                self.dev_info.io_buf_size(),
+            )
+        });
 
         // Plus `PollAdd` for notification.
-        let ring_size = (queue_depth as u32 + 1)
+        let ring_size = (self.dev_info.queue_depth() as u32 + 1)
             .checked_next_power_of_two()
             .unwrap();
         // NB. Ensure all inflight ops are cancelled before dropping the buffer defined above,
@@ -835,8 +872,11 @@ impl<B: BlockDevice, RB: AsyncRuntimeBuilder> IoWorker<'_, B, RB> {
                 q_id: self.thread_id,
                 tag: i,
                 result: result.unwrap_or(-1),
-                __bindgen_anon_1: binding::ublksrv_io_cmd__bindgen_ty_1 {
-                    addr: io_buf_of(i).as_ptr().cast::<u8>() as _,
+                __bindgen_anon_1: match &io_bufs {
+                    Some(bufs) => binding::ublksrv_io_cmd__bindgen_ty_1 {
+                        addr: bufs.get(i.into()).as_ptr().cast::<u8>() as _,
+                    },
+                    None => binding::ublksrv_io_cmd__bindgen_ty_1 { addr: 0 },
                 },
             };
             let cmd_op = if result.is_some() {
@@ -861,7 +901,7 @@ impl<B: BlockDevice, RB: AsyncRuntimeBuilder> IoWorker<'_, B, RB> {
                     .user_data(EXIT_USER_DATA);
                 sq.push(&sqe).unwrap();
             }
-            for i in 0..queue_depth {
+            for i in 0..self.dev_info.queue_depth() {
                 refill_sqe(&mut sq, i, None);
             }
         }
@@ -913,23 +953,34 @@ impl<B: BlockDevice, RB: AsyncRuntimeBuilder> IoWorker<'_, B, RB> {
                 let off = iod.start_sector.wrapping_mul(SECTOR_SIZE as u64);
                 let len = unsafe { iod.__bindgen_anon_1.nr_sectors as usize }
                     .wrapping_mul(SECTOR_SIZE as usize);
-                let op = iod.op_flags & 0xFF;
+                let get_buf = || {
+                    match &io_bufs {
+                        // SAFETY: This buffer is exclusive for task of `tag`.
+                        Some(bufs) => unsafe {
+                            RawBuf::PreCopied(&mut bufs.get(tag.into()).as_mut()[..len])
+                        },
+                        None => RawBuf::UserCopy {
+                            cdev: self.cdev,
+                            off: binding::UBLKSRV_IO_BUF_OFFSET as u64
+                                + ((self.thread_id as u64) << binding::UBLK_QID_OFF)
+                                + ((tag as u64) << binding::UBLK_TAG_OFF),
+                            len: len as _,
+                        },
+                    }
+                };
+
                 // TODO: Catch unwind.
-                match op {
+                match iod.op_flags & 0xFF {
                     binding::UBLK_IO_OP_READ => {
                         log::trace!("READ offset={off} len={len} flags={flags:?}");
-                        // SAFETY: This buffer is exclusive for task of `tag`.
-                        let buf = unsafe { io_buf_of(tag).as_mut() };
-                        let buf = ReadBuf(&mut buf[..len], PhantomData);
+                        let buf = ReadBuf(get_buf(), PhantomData);
                         let fut = self.handler.read(off, buf, flags);
                         // TODO: This line is repeated over and over due to distinct Future types.
                         spawner.spawn(async move { commit_and_fetch(fut.await.into_c_result()) });
                     }
                     binding::UBLK_IO_OP_WRITE => {
                         log::trace!("WRITE offset={off} len={len} flags={flags:?}");
-                        // SAFETY: This buffer is exclusive for task of `tag`.
-                        let buf = unsafe { io_buf_of(tag).as_mut() };
-                        let buf = WriteBuf(&buf[..len], PhantomData);
+                        let buf = WriteBuf(get_buf(), PhantomData);
                         let fut = self.handler.write(off, buf, flags);
                         spawner.spawn(async move { commit_and_fetch(fut.await.into_c_result()) });
                     }
@@ -956,7 +1007,7 @@ impl<B: BlockDevice, RB: AsyncRuntimeBuilder> IoWorker<'_, B, RB> {
                     // binding::UBLK_IO_OP_ZONE_RESET_ALL |
                     // binding::UBLK_IO_OP_ZONE_RESET |
                     // binding::UBLK_IO_OP_REPORT_ZONES  |
-                    _ => {
+                    op => {
                         log::error!("unsupported op: {op}");
                         commit_and_fetch(-Errno::IO.raw_os_error());
                     }
@@ -1145,9 +1196,28 @@ pub trait BlockDevice {
     }
 }
 
+#[derive(Debug)]
+enum RawBuf<'a> {
+    PreCopied(&'a mut [u8]),
+    UserCopy {
+        cdev: BorrowedFd<'a>,
+        off: u64,
+        len: u32,
+    },
+}
+
+impl RawBuf<'_> {
+    fn len(&self) -> usize {
+        match self {
+            RawBuf::PreCopied(b) => b.len(),
+            RawBuf::UserCopy { len, .. } => *len as _,
+        }
+    }
+}
+
 /// The return buffer for [`BlockDevice::read`].
 #[derive(Debug)]
-pub struct ReadBuf<'a>(&'a mut [u8], PhantomData<*mut ()>);
+pub struct ReadBuf<'a>(RawBuf<'a>, PhantomData<*mut ()>);
 
 impl ReadBuf<'_> {
     // It must not be empty.
@@ -1156,22 +1226,45 @@ impl ReadBuf<'_> {
         self.0.len()
     }
 
-    pub fn copy_from(&mut self, data: &[u8]) {
-        self.0.copy_from_slice(data);
+    pub fn copy_from(&mut self, data: &[u8]) -> Result<(), Errno> {
+        assert_eq!(data.len(), self.len());
+        match &mut self.0 {
+            RawBuf::PreCopied(b) => b.copy_from_slice(data),
+            RawBuf::UserCopy { cdev, off, .. } => {
+                // cov_mark::hit!(user_copy);
+                // SAFETY: The fd is valid and `ManuallyDrop` prevents its close.
+                let cdev = unsafe { ManuallyDrop::new(File::from_raw_fd(cdev.as_raw_fd())) };
+                cdev.write_all_at(data, *off)
+                    .map_err(|e| Errno::from_io_error(&e).unwrap())?;
+            }
+        }
+        Ok(())
     }
 
-    pub fn fill(&mut self, byte: u8) {
-        self.0.fill(byte);
+    pub fn fill(&mut self, byte: u8) -> Result<(), Errno> {
+        match &mut self.0 {
+            RawBuf::PreCopied(b) => {
+                b.fill(byte);
+                Ok(())
+            }
+            RawBuf::UserCopy { .. } => {
+                // TODO: Avoid allocation.
+                self.copy_from(&vec![byte; self.len()])
+            }
+        }
     }
 
     pub fn as_slice(&mut self) -> Option<&'_ mut [u8]> {
-        Some(self.0)
+        match &mut self.0 {
+            RawBuf::PreCopied(b) => Some(b),
+            RawBuf::UserCopy { .. } => None,
+        }
     }
 }
 
 /// The input buffer for [`BlockDevice::write`].
 #[derive(Debug)]
-pub struct WriteBuf<'a>(&'a [u8], PhantomData<*mut ()>);
+pub struct WriteBuf<'a>(RawBuf<'a>, PhantomData<*mut ()>);
 
 impl WriteBuf<'_> {
     // It must not be empty.
@@ -1180,11 +1273,24 @@ impl WriteBuf<'_> {
         self.0.len()
     }
 
-    pub fn copy_to(&self, out: &mut [u8]) {
-        out.copy_from_slice(self.0);
+    pub fn copy_to(&self, out: &mut [u8]) -> Result<(), Errno> {
+        assert_eq!(out.len(), self.len());
+        match &self.0 {
+            RawBuf::PreCopied(b) => out.copy_from_slice(b),
+            RawBuf::UserCopy { cdev, off, .. } => {
+                // SAFETY: The fd is valid and `ManuallyDrop` prevents its close.
+                let cdev = unsafe { ManuallyDrop::new(File::from_raw_fd(cdev.as_raw_fd())) };
+                cdev.read_exact_at(out, *off)
+                    .map_err(|e| Errno::from_io_error(&e).unwrap())?;
+            }
+        }
+        Ok(())
     }
 
     pub fn as_slice(&self) -> Option<&[u8]> {
-        Some(self.0)
+        match &self.0 {
+            RawBuf::PreCopied(b) => Some(b),
+            RawBuf::UserCopy { .. } => None,
+        }
     }
 }

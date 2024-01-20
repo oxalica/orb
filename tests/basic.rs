@@ -143,11 +143,21 @@ fn device_attrs() {
 }
 
 #[test]
-fn read_write() {
+fn read_write_kernel_copy() {
+    read_write(FeatureFlags::empty())
+}
+
+#[test]
+fn read_write_user_copy() {
+    read_write(FeatureFlags::UserCopy)
+}
+
+fn read_write(flags: FeatureFlags) {
     let ctl = init();
     let mut srv = DeviceBuilder::new()
         .name("ublk-test")
         .unprivileged()
+        .add_flags(flags)
         .create_service(&ctl)
         .unwrap();
 
@@ -214,7 +224,7 @@ fn read_write() {
             mut buf: ReadBuf<'_>,
             _flags: IoFlags,
         ) -> Result<usize, Errno> {
-            buf.copy_from(&self.data.lock().unwrap()[off as usize..][..buf.len()]);
+            buf.copy_from(&self.data.lock().unwrap()[off as usize..][..buf.len()])?;
             Ok(buf.len())
         }
 
@@ -225,7 +235,7 @@ fn read_write() {
             _flags: IoFlags,
         ) -> Result<usize, Errno> {
             let len = buf.len();
-            buf.copy_to(&mut self.data.lock().unwrap()[off as usize..][..len]);
+            buf.copy_to(&mut self.data.lock().unwrap()[off as usize..][..len])?;
             Ok(len)
         }
     }
@@ -309,11 +319,21 @@ fn error() {
 }
 
 #[test]
-fn tokio_null() {
+fn tokio_null_kernel_copy() {
+    tokio_null(FeatureFlags::empty())
+}
+
+#[test]
+fn tokio_null_user_copy() {
+    tokio_null(FeatureFlags::UserCopy)
+}
+
+fn tokio_null(flags: FeatureFlags) {
     let ctl = init();
     let mut srv = DeviceBuilder::new()
         .name("ublk-test")
         .unprivileged()
+        .add_flags(flags)
         .create_service(&ctl)
         .unwrap();
 
@@ -358,7 +378,7 @@ fn tokio_null() {
             _flags: IoFlags,
         ) -> Result<usize, Errno> {
             tokio::time::sleep(DELAY).await;
-            buf.fill(0);
+            buf.fill(0)?;
             Ok(buf.len())
         }
 
