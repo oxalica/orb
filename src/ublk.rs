@@ -15,7 +15,7 @@ use io_uring::{cqueue, opcode, squeue, IoUring, SubmissionQueue};
 use rustix::event::{EventfdFlags, PollFd, PollFlags};
 use rustix::fd::{AsFd, AsRawFd, OwnedFd};
 use rustix::io::Errno;
-use rustix::termios::Pid;
+use rustix::process::Pid;
 use rustix::{ioctl, mm};
 
 use crate::runtime::{AsyncRuntime, AsyncRuntimeBuilder, AsyncScopeSpawner};

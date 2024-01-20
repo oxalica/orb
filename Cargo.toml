@@ -8,7 +8,7 @@ edition = "2021"
 [dependencies]
 bitflags = "2.4.2"
 ctrlc = "3.4.2"
-env_logger = "0.10.1"
+env_logger = "0.11"
 io-uring = "0.6.2"
 log = "0.4.20"
 rustix = { version = "0.38.30", features = ["event", "mm", "process"] }
