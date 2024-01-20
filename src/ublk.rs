@@ -427,47 +427,35 @@ impl DeviceBuilder {
     pub fn create_service(&self, ctrl: ControlDevice, mut uring: Uring) -> io::Result<Service> {
         let dev_info = ctrl.create_device(&mut uring, self)?;
 
-        struct StopOnDrop<'a, 'b>(Option<(&'a mut Uring, &'b ControlDevice, u32)>);
-        impl Drop for StopOnDrop<'_, '_> {
-            fn drop(&mut self) {
-                if let Some((uring, ctrl, dev_id)) = &mut self.0 {
-                    if let Err(err) = ctrl.stop_device(uring, *dev_id) {
-                        // Ignore errors if already deleted.
-                        if err.kind() != io::ErrorKind::NotFound {
-                            log::error!("failed to stop device {dev_id}: {err}");
-                        }
+        // Delete the device if anything goes wrong.
+        let delete_device_guard = scopeguard::guard(
+            (&mut uring, &ctrl, dev_info.dev_id()),
+            |(uring, ctrl, dev_id)| {
+                if let Err(err) = ctrl.stop_device(uring, dev_id) {
+                    // Ignore errors if already deleted.
+                    if err.kind() != io::ErrorKind::NotFound {
+                        log::error!("failed to stop device {dev_id}: {err}");
                     }
                 }
+            },
+        );
+
+        let path = format!("{}{}", CdevPath::PREFIX, dev_info.dev_id());
+        let mut retries_left = self.max_retries;
+        let cdev = loop {
+            match File::options().read(true).write(true).open(&path) {
+                Ok(f) => break f,
+                Err(err) if err.kind() == io::ErrorKind::PermissionDenied && retries_left > 0 => {
+                    log::warn!("failed to open {path}, retries left: {retries_left}");
+                    retries_left -= 1;
+                    thread::sleep(self.retry_delay);
+                }
+                Err(err) => return Err(err),
             }
-        }
-
-        let cdev = {
-            // Delete the device if anything goes wrong.
-            let mut guard = StopOnDrop(Some((&mut uring, &ctrl, dev_info.dev_id())));
-
-            let path = format!("{}{}", CdevPath::PREFIX, dev_info.dev_id());
-            let mut retries_left = self.max_retries;
-            // NB. `cdev` and `shared_mem` should live here rather than the outer block, so they
-            // can be released before `guard`. Otherwise the device may fail to be deleted.
-            let cdev = loop {
-                match File::options().read(true).write(true).open(&path) {
-                    Ok(f) => break f,
-                    Err(err)
-                        if err.kind() == io::ErrorKind::PermissionDenied && retries_left > 0 =>
-                    {
-                        log::warn!("failed to open {path}, retries left: {retries_left}");
-                        retries_left -= 1;
-                        thread::sleep(self.retry_delay);
-                    }
-                    Err(err) => return Err(err),
-                }
-            };
-
-            // All success, defuse the guard.
-            guard.0 = None;
-
-            cdev
         };
+
+        // Success. Defuse the guard.
+        scopeguard::ScopeGuard::into_inner(delete_device_guard);
 
         Ok(Service {
             dev_info,
@@ -601,9 +589,8 @@ pub struct Service {
 impl Drop for Service {
     fn drop(&mut self) {
         // First, drop all resources derived from the device.
-        unsafe {
-            ManuallyDrop::drop(&mut self.cdev);
-        }
+        // SAFETY: This is only called once here, and will not be used later.
+        unsafe { ManuallyDrop::drop(&mut self.cdev) }
         let dev_id = self.dev_info().dev_id();
         if let Err(err) = self.ctl.delete_device(&mut self.ctl_ring, dev_id) {
             if err.kind() != io::ErrorKind::NotFound {
@@ -627,7 +614,7 @@ pub struct Stopper(Arc<OwnedFd>);
 
 impl Stopper {
     pub fn stop(&self) {
-        rustix::io::write(&self.0, &1u64.to_ne_bytes()).unwrap();
+        let _: Result<_, _> = rustix::io::write(&self.0, &1u64.to_ne_bytes());
     }
 }
 
@@ -793,33 +780,26 @@ impl<B: BlockDevice, RB: AsyncRuntimeBuilder> IoWorker<'_, B, RB> {
             ))
         };
 
-        // NB. Ensure all inflight ops are cancelled before dropping the buffer defined above,
-        // otherwise it's a use-after-free.
-        struct AutoCancelRing(IoUring);
-        impl Drop for AutoCancelRing {
-            fn drop(&mut self) {
-                // All ops must be canceled before return, otherwise it's a UB.
-                let _guard = scopeguard::guard_on_unwind((), |()| std::process::abort());
-                if let Err(err) = self
-                    .0
-                    .submitter()
-                    .register_sync_cancel(None, io_uring::types::CancelBuilder::any())
-                {
-                    if err.kind() != io::ErrorKind::NotFound {
-                        log::error!("failed to cancel inflight ops in io-uring: {}", err);
-                        std::process::abort();
-                    }
-                }
-            }
-        }
-
         // Plus `PollAdd` for notification.
         let ring_size = (queue_depth as u32 + 1)
             .checked_next_power_of_two()
             .unwrap();
-        let mut io_ring = AutoCancelRing(IoUring::new(ring_size)?);
+        // NB. Ensure all inflight ops are cancelled before dropping the buffer defined above,
+        // otherwise it's a use-after-free.
+        let mut io_ring = scopeguard::guard(IoUring::new(ring_size)?, |io_ring| {
+            // All ops must be canceled before return, otherwise it's a UB.
+            let _guard = scopeguard::guard_on_unwind((), |()| std::process::abort());
+            if let Err(err) = io_ring
+                .submitter()
+                .register_sync_cancel(None, io_uring::types::CancelBuilder::any())
+            {
+                if err.kind() != io::ErrorKind::NotFound {
+                    log::error!("failed to cancel inflight ops in io-uring: {}", err);
+                    std::process::abort();
+                }
+            }
+        });
         io_ring
-            .0
             .submitter()
             .register_files(&[self.cdev.as_raw_fd(), self.stop_guard.0.as_raw_fd()])?;
         const CDEV_FIXED_FD: Fixed = Fixed(0);
@@ -852,7 +832,7 @@ impl<B: BlockDevice, RB: AsyncRuntimeBuilder> IoWorker<'_, B, RB> {
         };
 
         {
-            let mut sq = io_ring.0.submission();
+            let mut sq = io_ring.submission();
             unsafe {
                 let sqe = opcode::PollAdd::new(EXIT_FIXED_FD, PollFlags::IN.bits().into())
                     .build()
@@ -863,7 +843,7 @@ impl<B: BlockDevice, RB: AsyncRuntimeBuilder> IoWorker<'_, B, RB> {
                 refill_sqe(&mut sq, i, None);
             }
         }
-        io_ring.0.submit()?;
+        io_ring.submit()?;
 
         log::debug!("IO worker {} initialized", self.thread_id);
         if self.ready_tx.take().unwrap().send(()).is_err() {
@@ -871,8 +851,7 @@ impl<B: BlockDevice, RB: AsyncRuntimeBuilder> IoWorker<'_, B, RB> {
             return Ok(());
         }
 
-        let io_ring = &io_ring.0;
-        runtime.drive_uring(io_ring, |spawner| {
+        runtime.drive_uring(&io_ring, |spawner| {
             // SAFETY: This is the only place to modify the CQ.
             let cq = unsafe { io_ring.completion_shared() };
             for cqe in cq {
@@ -894,6 +873,7 @@ impl<B: BlockDevice, RB: AsyncRuntimeBuilder> IoWorker<'_, B, RB> {
                 }
 
                 let tag = cqe.user_data() as u16;
+                let io_ring = &*io_ring;
                 let commit_and_fetch = move |ret: i32| {
                     // SAFETY: All futures are executed on the same thread, which is guarantee
                     // by no `Send` bound on parameters of `Runtime::{block_on,spawn_local}`.
