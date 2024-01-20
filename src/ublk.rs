@@ -77,37 +77,6 @@ bitflags::bitflags! {
     }
 }
 
-// FIXME: This struct should not exist.
-pub struct Uring {
-    uring: IoUring<squeue::Entry128, cqueue::Entry>,
-}
-
-impl fmt::Debug for Uring {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Uring").finish_non_exhaustive()
-    }
-}
-
-impl Uring {
-    pub fn new() -> io::Result<Self> {
-        const URING_ENTRIES: u32 = 16;
-
-        let uring = IoUring::builder().build(URING_ENTRIES)?;
-        Ok(Self { uring })
-    }
-
-    unsafe fn execute_single(&mut self, op: &squeue::Entry128) -> io::Result<i32> {
-        self.uring.submission().push(op).expect("squeue full");
-        self.uring.submit_and_wait(1)?;
-        let ret = self.uring.completion().next().unwrap().result();
-        if ret >= 0 {
-            Ok(ret)
-        } else {
-            Err(io::Error::from_raw_os_error(-ret))
-        }
-    }
-}
-
 #[derive(Debug)]
 #[repr(transparent)]
 struct CdevPath([u8; Self::MAX_LEN]);
@@ -127,27 +96,42 @@ impl CdevPath {
 }
 
 /// The global control device for ublk-driver `/dev/ublk-control`.
-#[derive(Debug)]
-pub struct ControlDevice(File);
+///
+/// Since all control commands are sent through a special SQE128 io-uring, a private io-uring is
+/// created and held inside.
+pub struct ControlDevice {
+    fd: File,
+    uring: IoUring<squeue::Entry128, cqueue::Entry>,
+    _not_send: PhantomData<*mut ()>,
+}
+
+impl fmt::Debug for ControlDevice {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ControlDevice")
+            .field("fd", &self.fd)
+            .finish_non_exhaustive()
+    }
+}
 
 impl ControlDevice {
     pub const PATH: &'static str = "/dev/ublk-control";
+    const URING_ENTRIES: u32 = 4;
 
     pub fn open() -> io::Result<Self> {
-        File::options()
-            .read(true)
-            .write(true)
-            .open(Self::PATH)
-            .map(Self)
-    }
-
-    pub fn try_clone(&self) -> io::Result<Self> {
-        self.0.try_clone().map(Self)
+        let fd = File::options().read(true).write(true).open(Self::PATH)?;
+        let uring = IoUring::builder()
+            .dontfork()
+            .setup_single_issuer()
+            .build(Self::URING_ENTRIES)?;
+        Ok(Self {
+            fd,
+            uring,
+            _not_send: PhantomData,
+        })
     }
 
     unsafe fn execute_ctrl_cmd_with_cdev<T>(
         &self,
-        uring: &mut Uring,
         direction: ioctl::Direction,
         cmd_op: u32,
         dev_id: u32,
@@ -160,13 +144,12 @@ impl ControlDevice {
         let buf = Payload(CdevPath::from_id(dev_id), buf);
         cmd.dev_id = dev_id;
         cmd.dev_path_len = CdevPath::MAX_LEN as _;
-        let ret = self.execute_ctrl_cmd(uring, direction, cmd_op, buf, cmd)?;
+        let ret = self.execute_ctrl_cmd(direction, cmd_op, buf, cmd)?;
         Ok(ret.1)
     }
 
     unsafe fn execute_ctrl_cmd<T>(
         &self,
-        uring: &mut Uring,
         direction: ioctl::Direction,
         cmd_op: u32,
         mut buf: T,
@@ -190,18 +173,42 @@ impl ControlDevice {
             cmd_op as u8,
             mem::size_of::<binding::ublksrv_ctrl_cmd>(),
         );
-        let sqe = opcode::UringCmd80::new(Fd(self.0.as_raw_fd()), opcode.raw())
+        let sqe = opcode::UringCmd80::new(Fd(self.fd.as_raw_fd()), opcode.raw())
             .cmd(cmd_buf.cmd)
             .build();
-        uring.execute_single(&sqe)?;
-
-        Ok(buf)
+        // SAFETY: `ControlDevice` is not `Send`, so we are the only thread running this block.
+        // And all references in this SQE are valid.
+        unsafe {
+            self.uring
+                .submission_shared()
+                .push(&sqe)
+                .expect("squeue full");
+        }
+        rustix::io::retry_on_intr(|| {
+            self.uring
+                .submit_and_wait(1)
+                .map_err(|err| Errno::from_io_error(&err).expect("invalid errno"))
+        })
+        .expect("failed to submit uring_cmd");
+        // SAFETY: Single-threaded. See above.
+        let ret = unsafe {
+            self.uring
+                .completion_shared()
+                .next()
+                .expect("must be completed")
+                .result()
+        };
+        if ret >= 0 {
+            Ok(buf)
+        } else {
+            Err(io::Error::from_raw_os_error(-ret))
+        }
     }
 
-    pub fn get_features(&self, uring: &mut Uring) -> io::Result<FeatureFlags> {
+    pub fn get_features(&self) -> io::Result<FeatureFlags> {
+        // SAFETY: Valid uring_cmd.
         unsafe {
             self.execute_ctrl_cmd(
-                uring,
                 ioctl::Direction::Read,
                 // FIXME: Not exported by bindgen.
                 0x13,
@@ -212,10 +219,10 @@ impl ControlDevice {
         }
     }
 
-    pub fn get_device_info(&self, uring: &mut Uring, dev_id: u32) -> io::Result<DeviceInfo> {
+    pub fn get_device_info(&self, dev_id: u32) -> io::Result<DeviceInfo> {
+        // SAFETY: Valid uring_cmd.
         unsafe {
             self.execute_ctrl_cmd_with_cdev::<binding::ublksrv_ctrl_dev_info>(
-                uring,
                 ioctl::Direction::Read,
                 binding::UBLK_CMD_GET_DEV_INFO2,
                 dev_id,
@@ -226,17 +233,13 @@ impl ControlDevice {
         }
     }
 
-    pub fn create_device(
-        &self,
-        uring: &mut Uring,
-        builder: &DeviceBuilder,
-    ) -> io::Result<DeviceInfo> {
+    pub fn create_device(&self, builder: &DeviceBuilder) -> io::Result<DeviceInfo> {
         // `-1` for auto-allocation.
         let dev_id = builder.id.unwrap_or(!0);
         let pid = rustix::process::getpid();
+        // SAFETY: Valid uring_cmd.
         unsafe {
             self.execute_ctrl_cmd(
-                uring,
                 ioctl::Direction::ReadWrite,
                 binding::UBLK_CMD_ADD_DEV,
                 binding::ublksrv_ctrl_dev_info {
@@ -263,11 +266,11 @@ impl ControlDevice {
         }
     }
 
-    pub fn delete_device(&self, uring: &mut Uring, dev_id: u32) -> io::Result<()> {
+    pub fn delete_device(&self, dev_id: u32) -> io::Result<()> {
         log::trace!("delete device {dev_id}");
+        // SAFETY: Valid uring_cmd.
         unsafe {
             self.execute_ctrl_cmd_with_cdev(
-                uring,
                 ioctl::Direction::ReadWrite,
                 binding::UBLK_CMD_DEL_DEV,
                 dev_id,
@@ -280,12 +283,12 @@ impl ControlDevice {
 
     // This cannot be start alone. IO handlers must be started before it,
     // or this would block indefinitely.
-    fn start_device(&self, uring: &mut Uring, dev_id: u32, pid: Pid) -> io::Result<()> {
+    fn start_device(&self, dev_id: u32, pid: Pid) -> io::Result<()> {
         let pid = pid.as_raw_nonzero().get().try_into().unwrap();
         log::trace!("start device {dev_id} on pid {pid}");
+        // SAFETY: Valid uring_cmd.
         unsafe {
             self.execute_ctrl_cmd_with_cdev(
-                uring,
                 ioctl::Direction::ReadWrite,
                 binding::UBLK_CMD_START_DEV,
                 dev_id,
@@ -299,11 +302,11 @@ impl ControlDevice {
         Ok(())
     }
 
-    pub fn stop_device(&self, uring: &mut Uring, dev_id: u32) -> io::Result<()> {
+    pub fn stop_device(&self, dev_id: u32) -> io::Result<()> {
         log::trace!("stop device {dev_id}");
+        // SAFETY: Valid uring_cmd.
         unsafe {
             self.execute_ctrl_cmd_with_cdev(
-                uring,
                 ioctl::Direction::ReadWrite,
                 binding::UBLK_CMD_STOP_DEV,
                 dev_id,
@@ -314,16 +317,11 @@ impl ControlDevice {
         Ok(())
     }
 
-    pub fn set_device_param(
-        &self,
-        uring: &mut Uring,
-        dev_id: u32,
-        params: &DeviceParams,
-    ) -> io::Result<()> {
+    pub fn set_device_param(&self, dev_id: u32, params: &DeviceParams) -> io::Result<()> {
         log::trace!("set parameters of device {dev_id} to {params:?}");
+        // SAFETY: Valid uring_cmd.
         unsafe {
             self.execute_ctrl_cmd_with_cdev::<binding::ublk_params>(
-                uring,
                 ioctl::Direction::ReadWrite,
                 binding::UBLK_CMD_SET_PARAMS,
                 dev_id,
@@ -337,13 +335,13 @@ impl ControlDevice {
 
 impl AsRawFd for ControlDevice {
     fn as_raw_fd(&self) -> RawFd {
-        self.0.as_raw_fd()
+        self.fd.as_raw_fd()
     }
 }
 
 impl AsFd for ControlDevice {
     fn as_fd(&self) -> BorrowedFd<'_> {
-        self.0.as_fd()
+        self.fd.as_fd()
     }
 }
 
@@ -424,21 +422,18 @@ impl DeviceBuilder {
         self
     }
 
-    pub fn create_service(&self, ctrl: ControlDevice, mut uring: Uring) -> io::Result<Service> {
-        let dev_info = ctrl.create_device(&mut uring, self)?;
+    pub fn create_service<'ctl>(&self, ctl: &'ctl ControlDevice) -> io::Result<Service<'ctl>> {
+        let dev_info = ctl.create_device(self)?;
 
         // Delete the device if anything goes wrong.
-        let delete_device_guard = scopeguard::guard(
-            (&mut uring, &ctrl, dev_info.dev_id()),
-            |(uring, ctrl, dev_id)| {
-                if let Err(err) = ctrl.stop_device(uring, dev_id) {
-                    // Ignore errors if already deleted.
-                    if err.kind() != io::ErrorKind::NotFound {
-                        log::error!("failed to stop device {dev_id}: {err}");
-                    }
+        let delete_device_guard = scopeguard::guard((ctl, dev_info.dev_id()), |(ctl, dev_id)| {
+            if let Err(err) = ctl.stop_device(dev_id) {
+                // Ignore errors if already deleted.
+                if err.kind() != io::ErrorKind::NotFound {
+                    log::error!("failed to stop device {dev_id}: {err}");
                 }
-            },
-        );
+            }
+        });
 
         let path = format!("{}{}", CdevPath::PREFIX, dev_info.dev_id());
         let mut retries_left = self.max_retries;
@@ -459,8 +454,7 @@ impl DeviceBuilder {
 
         Ok(Service {
             dev_info,
-            ctl_ring: uring,
-            ctl: ctrl,
+            ctl,
             cdev: ManuallyDrop::new(cdev),
         })
     }
@@ -578,21 +572,20 @@ impl IoDescShm {
 }
 
 #[derive(Debug)]
-pub struct Service {
+pub struct Service<'ctl> {
     dev_info: DeviceInfo,
-    ctl_ring: Uring,
-    ctl: ControlDevice,
+    ctl: &'ctl ControlDevice,
     /// `/dev/ublkcX` file.
     cdev: ManuallyDrop<File>,
 }
 
-impl Drop for Service {
+impl Drop for Service<'_> {
     fn drop(&mut self) {
         // First, drop all resources derived from the device.
         // SAFETY: This is only called once here, and will not be used later.
         unsafe { ManuallyDrop::drop(&mut self.cdev) }
         let dev_id = self.dev_info().dev_id();
-        if let Err(err) = self.ctl.delete_device(&mut self.ctl_ring, dev_id) {
+        if let Err(err) = self.ctl.delete_device(dev_id) {
             if err.kind() != io::ErrorKind::NotFound {
                 log::error!("failed to delete device {dev_id}: {err}");
             }
@@ -639,7 +632,7 @@ impl<const ALIGN: usize> Drop for AlignedArray<ALIGN> {
     }
 }
 
-impl Service {
+impl Service<'_> {
     pub fn dev_info(&self) -> &DeviceInfo {
         &self.dev_info
     }
@@ -657,8 +650,7 @@ impl Service {
         let dev_id = self.dev_info().dev_id();
         let nr_queues = self.dev_info.nr_queues();
         assert_ne!(nr_queues, 0);
-        self.ctl
-            .set_device_param(&mut self.ctl_ring, dev_id, params)?;
+        self.ctl.set_device_param(dev_id, params)?;
 
         // The guard to stop the device once it's started.
         // This must be outside the thread scope so all resources are released on stopping.
@@ -667,7 +659,7 @@ impl Service {
                 return;
             }
             let dev_id = this.dev_info().dev_id();
-            if let Err(err) = this.ctl.stop_device(&mut this.ctl_ring, dev_id) {
+            if let Err(err) = this.ctl.stop_device(dev_id) {
                 // Ignore errors if already deleted.
                 if err.kind() != io::ErrorKind::NotFound {
                     log::error!("failed to stop device {dev_id}: {err}");
@@ -709,8 +701,7 @@ impl Service {
             // will be collected by the join loop below.
             drop(ready_tx);
             if let Ok(()) = (0..nr_queues).try_for_each(|_| ready_rx.recv()) {
-                this.ctl
-                    .start_device(&mut this.ctl_ring, dev_id, rustix::process::getpid())?;
+                this.ctl.start_device(dev_id, rustix::process::getpid())?;
 
                 // Now device is started, and `/dev/ublkbX` appears.
                 // FIXME: The device status still reports DEAD here.

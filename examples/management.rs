@@ -1,6 +1,6 @@
 use anyhow::{ensure, Context};
 use clap::Parser;
-use orb::ublk::{ControlDevice, Uring};
+use orb::ublk::ControlDevice;
 
 /// Ublk device management.
 #[derive(Debug, Parser)]
@@ -19,22 +19,19 @@ fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     let ctl = ControlDevice::open()
         .context("failed to open control device, kernel module 'ublk_drv' not loaded?")?;
-    let mut uring = Uring::new().context("failed to create control io-uring")?;
     match cli {
         Cli::GetFeatures => {
-            let feat = ctl
-                .get_features(&mut uring)
-                .context("failed to get features")?;
+            let feat = ctl.get_features().context("failed to get features")?;
             println!("{feat:?}");
         }
         Cli::GetInfo { dev_id } => {
             let info = ctl
-                .get_device_info(&mut uring, dev_id)
+                .get_device_info(dev_id)
                 .context("failed to get device info")?;
             println!("{info:?}");
         }
         Cli::Delete { dev_id } => {
-            ctl.delete_device(&mut uring, dev_id)
+            ctl.delete_device(dev_id)
                 .context("failed to delete device")?;
         }
         Cli::DeleteAll => {
@@ -49,7 +46,7 @@ fn main() -> anyhow::Result<()> {
                         .ok()
                 })() {
                     eprintln!("deleting device {dev_id}");
-                    if let Err(err) = ctl.delete_device(&mut uring, dev_id) {
+                    if let Err(err) = ctl.delete_device(dev_id) {
                         eprintln!("{err}");
                         success = false;
                     }

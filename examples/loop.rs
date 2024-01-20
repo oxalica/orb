@@ -8,7 +8,7 @@ use clap::Parser;
 use orb::runtime::TokioRuntimeBuilder;
 use orb::ublk::{
     BlockDevice, ControlDevice, DeviceAttrs, DeviceBuilder, DeviceInfo, DeviceParams,
-    DiscardParams, IoFlags, ReadBuf, Stopper, Uring, WriteBuf, SECTOR_SIZE,
+    DiscardParams, IoFlags, ReadBuf, Stopper, WriteBuf, SECTOR_SIZE,
 };
 use rustix::fs::{fallocate, FallocateFlags};
 use rustix::io::Errno;
@@ -42,11 +42,10 @@ fn main() -> anyhow::Result<()> {
 
     let ctl = ControlDevice::open()
         .context("failed to open control device, kernel module 'ublk_drv' not loaded?")?;
-    let uring = Uring::new().context("failed to create control io-uring")?;
     let mut srv = DeviceBuilder::new()
         .name("ublk-loop")
         .unprivileged()
-        .create_service(ctl, uring)
+        .create_service(&ctl)
         .context("failed to create ublk device")?;
     let mut params = *DeviceParams::new()
         .size(size)

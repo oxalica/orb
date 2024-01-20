@@ -9,17 +9,15 @@ use std::time::{Duration, Instant};
 use orb::runtime::{SyncRuntimeBuilder, TokioRuntimeBuilder};
 use orb::ublk::{
     BlockDevice, ControlDevice, DevState, DeviceAttrs, DeviceBuilder, DeviceInfo, DeviceParams,
-    FeatureFlags, IoFlags, ReadBuf, Stopper, Uring, WriteBuf, BDEV_PREFIX, SECTOR_SIZE,
+    FeatureFlags, IoFlags, ReadBuf, Stopper, WriteBuf, BDEV_PREFIX, SECTOR_SIZE,
 };
 use rand::rngs::StdRng;
 use rand::{Rng, RngCore, SeedableRng};
 use rustix::io::Errno;
 
-fn init() -> (ControlDevice, Uring) {
-    let ctl = ControlDevice::open()
-        .expect("failed to open control device, kernel module 'ublk_drv' not loaded?");
-    let uring = Uring::new().expect("failed to create io-uring");
-    (ctl, uring)
+fn init() -> ControlDevice {
+    ControlDevice::open()
+        .expect("failed to open control device, kernel module 'ublk_drv' not loaded?")
 }
 
 fn retry_on_perm<T>(mut f: impl FnMut() -> io::Result<T>) -> io::Result<T> {
@@ -39,8 +37,8 @@ fn retry_on_perm<T>(mut f: impl FnMut() -> io::Result<T>) -> io::Result<T> {
 
 #[test]
 fn get_features() {
-    let (ctl, mut uring) = init();
-    let feat = ctl.get_features(&mut uring).unwrap();
+    let ctl = init();
+    let feat = ctl.get_features().unwrap();
     println!("{feat:?}");
     assert!(feat.contains(FeatureFlags::UnprivilegedDev));
     // Zero-copy is not supported by upstream yet.
@@ -49,7 +47,7 @@ fn get_features() {
 
 #[test]
 fn create_info_delete() {
-    let (ctl, mut uring) = init();
+    let ctl = init();
     let mut builder = DeviceBuilder::new();
     builder
         .name("ublk-test")
@@ -57,9 +55,9 @@ fn create_info_delete() {
         .queue_depth(6)
         .io_buf_size(12 << 10)
         .unprivileged();
-    let info = ctl.create_device(&mut uring, &builder).unwrap();
-    let mut guard = scopeguard::guard((ctl, uring), |(ctl, mut uring)| {
-        if let Err(err) = retry_on_perm(|| ctl.delete_device(&mut uring, info.dev_id())) {
+    let info = ctl.create_device(&builder).unwrap();
+    let ctl = scopeguard::guard(ctl, |ctl| {
+        if let Err(err) = retry_on_perm(|| ctl.delete_device(info.dev_id())) {
             if std::thread::panicking() {
                 eprintln!("failed to delete device: {err}");
             } else {
@@ -67,7 +65,6 @@ fn create_info_delete() {
             }
         }
     });
-    let (ctl, uring) = &mut *guard;
 
     assert!(info.dev_id() < i32::MAX as u32);
     assert_eq!(info.nr_queues(), 3);
@@ -75,24 +72,24 @@ fn create_info_delete() {
     assert_eq!(info.io_buf_size(), 12 << 10);
     assert_eq!(info.state(), DevState::Dead);
 
-    let info2 = retry_on_perm(|| ctl.get_device_info(uring, info.dev_id())).unwrap();
+    let info2 = retry_on_perm(|| ctl.get_device_info(info.dev_id())).unwrap();
     assert_eq!(info.dev_id(), info2.dev_id());
     assert_eq!(info.nr_queues(), info2.nr_queues());
     assert_eq!(info.queue_depth(), info2.queue_depth());
     assert_eq!(info.io_buf_size(), info2.io_buf_size());
     assert_eq!(info.state(), info2.state());
 
-    ctl.delete_device(uring, info.dev_id()).unwrap();
-    scopeguard::ScopeGuard::into_inner(guard);
+    ctl.delete_device(info.dev_id()).unwrap();
+    scopeguard::ScopeGuard::into_inner(ctl);
 }
 
 #[test]
 fn device_attrs() {
-    let (ctl, uring) = init();
+    let ctl = init();
     let mut srv = DeviceBuilder::new()
         .name("ublk-test")
         .unprivileged()
-        .create_service(ctl, uring)
+        .create_service(&ctl)
         .unwrap();
 
     const SIZE: u64 = 42 << 10;
@@ -148,11 +145,11 @@ fn device_attrs() {
 
 #[test]
 fn read_write() {
-    let (ctl, uring) = init();
+    let ctl = init();
     let mut srv = DeviceBuilder::new()
         .name("ublk-test")
         .unprivileged()
-        .create_service(ctl, uring)
+        .create_service(&ctl)
         .unwrap();
 
     const SIZE: u64 = 32 << 10;
@@ -250,11 +247,11 @@ fn read_write() {
 
 #[test]
 fn error() {
-    let (ctl, uring) = init();
+    let ctl = init();
     let mut srv = DeviceBuilder::new()
         .name("ublk-test")
         .unprivileged()
-        .create_service(ctl, uring)
+        .create_service(&ctl)
         .unwrap();
 
     const SIZE: u64 = 4 << 10;
@@ -314,11 +311,11 @@ fn error() {
 
 #[test]
 fn tokio_null() {
-    let (ctl, uring) = init();
+    let ctl = init();
     let mut srv = DeviceBuilder::new()
         .name("ublk-test")
         .unprivileged()
-        .create_service(ctl, uring)
+        .create_service(&ctl)
         .unwrap();
 
     const SIZE: u64 = 4 << 10;
