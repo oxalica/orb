@@ -107,7 +107,6 @@ mod tokio_support {
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()?;
-            let _guard = runtime.enter();
             Ok(Runtime(runtime))
         }
     }

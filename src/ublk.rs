@@ -614,8 +614,9 @@ impl Drop for Service {
 }
 
 /// Signal all threads when something goes wrong somewhere.
-struct SignalExitOnDrop<'a>(BorrowedFd<'a>);
-impl Drop for SignalExitOnDrop<'_> {
+#[derive(Clone)]
+struct SignalStopOnDrop<'a>(BorrowedFd<'a>);
+impl Drop for SignalStopOnDrop<'_> {
     fn drop(&mut self) {
         rustix::io::write(self.0, &1u64.to_ne_bytes()).unwrap();
     }
@@ -667,67 +668,76 @@ impl Service {
         D: BlockDevice + Sync,
     {
         let dev_id = self.dev_info().dev_id();
+        let nr_queues = self.dev_info.nr_queues();
+        assert_ne!(nr_queues, 0);
         self.ctl
             .set_device_param(&mut self.ctl_ring, dev_id, params)?;
 
         // The guard to stop the device once it's started.
         // This must be outside the thread scope so all resources are released on stopping.
-        struct StopOnDrop<'a> {
-            this: &'a mut Service,
-            active: bool,
-        }
-        impl Drop for StopOnDrop<'_> {
-            fn drop(&mut self) {
-                if self.active {
-                    let dev_id = self.this.dev_info().dev_id();
-                    if let Err(err) = self.this.ctl.stop_device(&mut self.this.ctl_ring, dev_id) {
-                        // Ignore errors if already deleted.
-                        if err.kind() != io::ErrorKind::NotFound {
-                            log::error!("failed to stop device {dev_id}: {err}");
-                        }
-                    }
+        let mut stop_device_guard = scopeguard::guard((self, false), |(this, active)| {
+            if !active {
+                return;
+            }
+            let dev_id = this.dev_info().dev_id();
+            if let Err(err) = this.ctl.stop_device(&mut this.ctl_ring, dev_id) {
+                // Ignore errors if already deleted.
+                if err.kind() != io::ErrorKind::NotFound {
+                    log::error!("failed to stop device {dev_id}: {err}");
                 }
             }
-        }
-        let mut stop_guard = StopOnDrop {
-            this: self,
-            active: false,
-        };
-        let this = &mut *stop_guard.this;
+        });
+        let (this, stop_device_guard_active) = &mut *stop_device_guard;
 
         // No one is actually `read` it, so no need to be a semaphore.
         let exit_fd = Arc::new(rustix::event::eventfd(0, EventfdFlags::CLOEXEC)?);
         thread::scope(|s| {
-            let _exit_guard = SignalExitOnDrop(exit_fd.as_fd());
+            // One element gets produced once a thread is initialized and ready for events.
+            let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel::<()>(nr_queues.into());
 
-            let handles = (0..this.dev_info().nr_queues())
+            // This will be dropped inside the scope, so all threads are signaled to exit
+            // during force join.
+            let thread_stop_guard = SignalStopOnDrop(exit_fd.as_fd());
+
+            let handles = (0..nr_queues)
                 .map(|thread_id| {
-                    let handler = &handler;
-                    let exit_fd = exit_fd.as_fd();
-                    let cdev = this.cdev.as_fd();
-                    let dev_info = &this.dev_info;
-                    let runtime_builder = &runtime_builder;
+                    let worker = IoWorker {
+                        thread_id,
+                        ready_tx: Some(ready_tx.clone().clone()),
+                        cdev: this.cdev.as_fd(),
+                        dev_info: &this.dev_info,
+                        handler: &handler,
+                        runtime_builder: &runtime_builder,
+                        stop_guard: thread_stop_guard.clone(),
+                    };
                     thread::Builder::new()
                         .name(format!("io-worker-{thread_id}"))
-                        .spawn_scoped(s, move || {
-                            io_thread(thread_id, exit_fd, cdev, dev_info, handler, runtime_builder)
-                        })
+                        .spawn_scoped(s, move || worker.run())
                 })
                 .collect::<io::Result<Vec<_>>>()?;
 
-            // NB. Start the device after all handler threads are running,
-            // or this will block indefinitely.
-            // FIXME: This may still stuck if any thread fail to initialize.
-            this.ctl
-                .start_device(&mut this.ctl_ring, dev_id, rustix::process::getpid())?;
-            stop_guard.active = true;
-            // FIXME: It still reports DEAD here.
-            handler.ready(this.dev_info(), Stopper(exit_fd.clone()));
+            // NB. Wait for all handler threads to be initialized and ready, or `start_device` will
+            // block indefinitely.
+            // If the channel gets closed early, there must be some thread failed. Error messages
+            // will be collected by the join loop below.
+            drop(ready_tx);
+            if let Ok(()) = (0..nr_queues).try_for_each(|_| ready_rx.recv()) {
+                this.ctl
+                    .start_device(&mut this.ctl_ring, dev_id, rustix::process::getpid())?;
 
-            let ret = rustix::io::retry_on_intr(|| {
-                rustix::event::poll(&mut [PollFd::new(&exit_fd, PollFlags::IN)], -1)
-            })?;
-            assert_eq!(ret, 1);
+                // Now device is started, and `/dev/ublkbX` appears.
+                // FIXME: The device status still reports DEAD here.
+                *stop_device_guard_active = true;
+                handler.ready(this.dev_info(), Stopper(Arc::clone(&exit_fd)));
+
+                let ret = rustix::io::retry_on_intr(|| {
+                    rustix::event::poll(
+                        &mut [PollFd::new(&exit_fd, PollFlags::IN)],
+                        -1, // INFINITE
+                    )
+                })?;
+                assert_eq!(ret, 1);
+            }
 
             // Collect panics and errors.
             for (thread_id, h) in handles.into_iter().enumerate() {
@@ -737,7 +747,7 @@ impl Service {
                     Ok(Err(err)) if err.raw_os_error() == Some(Errno::NODEV.raw_os_error()) => {}
                     Ok(Err(err)) => return Err(err),
                     Err(_) => {
-                        return Err(io::Error::other(format!("IO thread {thread_id} panicked")));
+                        return Err(io::Error::other(format!("IO worker {thread_id} panicked")));
                     }
                 }
             }
@@ -746,206 +756,214 @@ impl Service {
     }
 }
 
-fn io_thread<B, RB>(
+struct IoWorker<'a, B, RB> {
     thread_id: u16,
-    exit_fd: BorrowedFd<'_>,
-    cdev: BorrowedFd<'_>,
-    dev_info: &DeviceInfo,
-    handler: &B,
-    runtime_buidler: &RB,
-) -> io::Result<()>
-where
-    B: BlockDevice,
-    RB: AsyncRuntimeBuilder,
-{
-    let _exit_guard = SignalExitOnDrop(exit_fd);
+    ready_tx: Option<std::sync::mpsc::SyncSender<()>>,
+    cdev: BorrowedFd<'a>,
+    dev_info: &'a DeviceInfo,
+    handler: &'a B,
+    runtime_builder: &'a RB,
 
-    if let Err(err) = rustix::process::configure_io_flusher_behavior(true) {
-        // TODO: Option to make this a hard error?
-        log::error!("failed to configure as IO_FLUSHER: {err}");
-    }
+    // This is dropped last.
+    stop_guard: SignalStopOnDrop<'a>,
+}
 
-    let shm = IoDescShm::new(cdev, dev_info, thread_id)?;
+impl<B: BlockDevice, RB: AsyncRuntimeBuilder> IoWorker<'_, B, RB> {
+    fn run(mut self) -> io::Result<()> {
+        if let Err(err) = rustix::process::configure_io_flusher_behavior(true) {
+            // TODO: Option to make this a hard error?
+            log::error!("failed to configure as IO_FLUSHER: {err}");
+        }
 
-    let queue_depth = dev_info.queue_depth();
-    let buf_size = dev_info
-        .io_buf_size()
-        .checked_next_multiple_of(BUFFER_ALIGN)
-        .unwrap();
-    let total_buf_size = buf_size.checked_mul(queue_depth.into()).unwrap();
-    // Must define the buffer before the io-uring, see below.
-    let io_buf = AlignedArray::<BUFFER_ALIGN>::new(total_buf_size);
-    let io_buf_of = |i: u16| unsafe {
-        NonNull::new_unchecked(ptr::slice_from_raw_parts_mut(
-            io_buf.0.as_ptr().cast::<u8>().add(i as usize * buf_size),
-            buf_size,
-        ))
-    };
+        let shm = IoDescShm::new(self.cdev, self.dev_info, self.thread_id)?;
 
-    // NB. Ensure all inflight ops are cancelled before dropping the buffer defined above,
-    // otherwise it's a use-after-free.
-    struct AutoCancelRing(IoUring);
-    impl Drop for AutoCancelRing {
-        fn drop(&mut self) {
-            if let Err(err) = self
-                .0
-                .submitter()
-                .register_sync_cancel(None, io_uring::types::CancelBuilder::any())
-            {
-                if err.kind() != io::ErrorKind::NotFound {
-                    log::error!("failed to cancel inflight ops in io-uring");
-                    std::process::abort();
+        let queue_depth = self.dev_info.queue_depth();
+        let buf_size = self
+            .dev_info
+            .io_buf_size()
+            .checked_next_multiple_of(BUFFER_ALIGN)
+            .unwrap();
+        let total_buf_size = buf_size.checked_mul(queue_depth.into()).unwrap();
+        // Must define the buffer before the io-uring, see below.
+        let io_buf = AlignedArray::<BUFFER_ALIGN>::new(total_buf_size);
+        let io_buf_of = |i: u16| unsafe {
+            NonNull::new_unchecked(ptr::slice_from_raw_parts_mut(
+                io_buf.0.as_ptr().cast::<u8>().add(i as usize * buf_size),
+                buf_size,
+            ))
+        };
+
+        // NB. Ensure all inflight ops are cancelled before dropping the buffer defined above,
+        // otherwise it's a use-after-free.
+        struct AutoCancelRing(IoUring);
+        impl Drop for AutoCancelRing {
+            fn drop(&mut self) {
+                // All ops must be canceled before return, otherwise it's a UB.
+                let _guard = scopeguard::guard_on_unwind((), |()| std::process::abort());
+                if let Err(err) = self
+                    .0
+                    .submitter()
+                    .register_sync_cancel(None, io_uring::types::CancelBuilder::any())
+                {
+                    if err.kind() != io::ErrorKind::NotFound {
+                        log::error!("failed to cancel inflight ops in io-uring: {}", err);
+                        std::process::abort();
+                    }
                 }
             }
         }
-    }
 
-    // Plus `PollAdd` for notification.
-    let ring_size = (queue_depth as u32 + 1)
-        .checked_next_power_of_two()
-        .unwrap();
-    let mut io_ring = AutoCancelRing(IoUring::new(ring_size)?);
-    io_ring
-        .0
-        .submitter()
-        .register_files(&[cdev.as_raw_fd(), exit_fd.as_raw_fd()])?;
-    const CDEV_FIXED_FD: Fixed = Fixed(0);
-    const EXIT_FIXED_FD: Fixed = Fixed(1);
-    const EXIT_USER_DATA: u64 = !0;
+        // Plus `PollAdd` for notification.
+        let ring_size = (queue_depth as u32 + 1)
+            .checked_next_power_of_two()
+            .unwrap();
+        let mut io_ring = AutoCancelRing(IoUring::new(ring_size)?);
+        io_ring
+            .0
+            .submitter()
+            .register_files(&[self.cdev.as_raw_fd(), self.stop_guard.0.as_raw_fd()])?;
+        const CDEV_FIXED_FD: Fixed = Fixed(0);
+        const EXIT_FIXED_FD: Fixed = Fixed(1);
+        const EXIT_USER_DATA: u64 = !0;
 
-    let mut runtime = runtime_buidler.build()?;
+        let mut runtime = self.runtime_builder.build()?;
 
-    let refill_sqe = |sq: &mut SubmissionQueue<'_>, i: u16, result: Option<i32>| {
-        let cmd = binding::ublksrv_io_cmd {
-            q_id: thread_id,
-            tag: i,
-            result: result.unwrap_or(-1),
-            __bindgen_anon_1: binding::ublksrv_io_cmd__bindgen_ty_1 {
-                addr: io_buf_of(i).as_ptr().cast::<u8>() as _,
-            },
-        };
-        let cmd_op = if result.is_some() {
-            binding::UBLK_IO_COMMIT_AND_FETCH_REQ
-        } else {
-            binding::UBLK_IO_FETCH_REQ
-        };
-        let sqe = opcode::UringCmd16::new(CDEV_FIXED_FD, cmd_op)
-            .cmd(unsafe { mem::transmute(cmd) })
-            .build()
-            .user_data(i.into());
-        unsafe {
-            sq.push(&sqe).expect("squeue should be big enough");
-        }
-    };
-
-    {
-        let mut sq = io_ring.0.submission();
-        unsafe {
-            let sqe = opcode::PollAdd::new(EXIT_FIXED_FD, PollFlags::IN.bits().into())
-                .build()
-                .user_data(EXIT_USER_DATA);
-            sq.push(&sqe).unwrap();
-        }
-        for i in 0..queue_depth {
-            refill_sqe(&mut sq, i, None);
-        }
-    }
-    io_ring.0.submit()?;
-
-    log::debug!("IO thread {thread_id} initialized");
-
-    let io_ring = &io_ring.0;
-    runtime.drive_uring(io_ring, |spawner| {
-        // SAFETY: This is the only place to modify the CQ.
-        let cq = unsafe { io_ring.completion_shared() };
-        for cqe in cq {
-            if cqe.user_data() == EXIT_USER_DATA {
-                assert!(
-                    PollFlags::from_bits_truncate(cqe.result() as _).contains(PollFlags::IN),
-                    "unexpected poll result: {}",
-                    cqe.result(),
-                );
-                log::debug!("IO thread {thread_id} signaled to exit");
-                return Ok(ControlFlow::Break(()));
-            }
-
-            // Here it must be a FETCH request.
-            if cqe.result() < 0 {
-                let err = io::Error::from_raw_os_error(-cqe.result());
-                log::debug!("IO thread {thread_id} failed fetch: {err}");
-                return Err(err);
-            }
-
-            let tag = cqe.user_data() as u16;
-            let commit_and_fetch = move |ret: i32| {
-                // SAFETY: All futures are executed on the same thread, which is guarantee
-                // by no `Send` bound on parameters of `Runtime::{block_on,spawn_local}`.
-                // So there can only be one future running this block at the same time.
-                unsafe {
-                    let mut sq = io_ring.submission_shared();
-                    refill_sqe(&mut sq, tag, Some(ret));
-                }
-                io_ring.submit().expect("failed to submit");
+        let refill_sqe = |sq: &mut SubmissionQueue<'_>, i: u16, result: Option<i32>| {
+            let cmd = binding::ublksrv_io_cmd {
+                q_id: self.thread_id,
+                tag: i,
+                result: result.unwrap_or(-1),
+                __bindgen_anon_1: binding::ublksrv_io_cmd__bindgen_ty_1 {
+                    addr: io_buf_of(i).as_ptr().cast::<u8>() as _,
+                },
             };
+            let cmd_op = if result.is_some() {
+                binding::UBLK_IO_COMMIT_AND_FETCH_REQ
+            } else {
+                binding::UBLK_IO_FETCH_REQ
+            };
+            let sqe = opcode::UringCmd16::new(CDEV_FIXED_FD, cmd_op)
+                .cmd(unsafe { mem::transmute(cmd) })
+                .build()
+                .user_data(i.into());
+            unsafe {
+                sq.push(&sqe).expect("squeue should be big enough");
+            }
+        };
 
-            let iod = shm.get(tag);
-            let flags = IoFlags::from_bits_truncate(iod.op_flags);
-            // These fields may contain garbage for ops without them.
-            let off = iod.start_sector.wrapping_mul(SECTOR_SIZE as u64);
-            let len = unsafe { iod.__bindgen_anon_1.nr_sectors as usize }
-                .wrapping_mul(SECTOR_SIZE as usize);
-            let op = iod.op_flags & 0xFF;
-            // TODO: Catch unwind.
-            match op {
-                binding::UBLK_IO_OP_READ => {
-                    log::trace!("READ offset={off} len={len} flags={flags:?}");
-                    // SAFETY: This buffer is exclusive for task of `tag`.
-                    let buf = unsafe { io_buf_of(tag).as_mut() };
-                    let buf = ReadBuf(&mut buf[..len], PhantomData);
-                    let fut = handler.read(off, buf, flags);
-                    // TODO: This line is repeated over and over due to distinct Future types.
-                    spawner.spawn(async move { commit_and_fetch(fut.await.into_c_result()) });
-                }
-                binding::UBLK_IO_OP_WRITE => {
-                    log::trace!("WRITE offset={off} len={len} flags={flags:?}");
-                    // SAFETY: This buffer is exclusive for task of `tag`.
-                    let buf = unsafe { io_buf_of(tag).as_mut() };
-                    let buf = WriteBuf(&buf[..len], PhantomData);
-                    let fut = handler.write(off, buf, flags);
-                    spawner.spawn(async move { commit_and_fetch(fut.await.into_c_result()) });
-                }
-                binding::UBLK_IO_OP_FLUSH => {
-                    log::trace!("FLUSH flags={flags:?}");
-                    let fut = handler.flush(flags);
-                    spawner.spawn(async move { commit_and_fetch(fut.await.into_c_result()) });
-                }
-                binding::UBLK_IO_OP_DISCARD => {
-                    log::trace!("DISCARD offset={off} len={len} flags={flags:?}");
-                    let fut = handler.discard(off, len, flags);
-                    spawner.spawn(async move { commit_and_fetch(fut.await.into_c_result()) });
-                }
-                binding::UBLK_IO_OP_WRITE_ZEROES => {
-                    log::trace!("WRITE_ZEROES offset={off} len={len} flags={flags:?}");
-                    let fut = handler.write_zeroes(off, len, flags);
-                    spawner.spawn(async move { commit_and_fetch(fut.await.into_c_result()) });
-                }
-                // binding::UBLK_IO_OP_WRITE_SAME |
-                // binding::UBLK_IO_OP_ZONE_OPEN |
-                // binding::UBLK_IO_OP_ZONE_CLOSE |
-                // binding::UBLK_IO_OP_ZONE_FINISH |
-                // binding::UBLK_IO_OP_ZONE_APPEND |
-                // binding::UBLK_IO_OP_ZONE_RESET_ALL |
-                // binding::UBLK_IO_OP_ZONE_RESET |
-                // binding::UBLK_IO_OP_REPORT_ZONES  |
-                _ => {
-                    log::error!("unsupported op: {op}");
-                    commit_and_fetch(-Errno::IO.raw_os_error());
-                }
+        {
+            let mut sq = io_ring.0.submission();
+            unsafe {
+                let sqe = opcode::PollAdd::new(EXIT_FIXED_FD, PollFlags::IN.bits().into())
+                    .build()
+                    .user_data(EXIT_USER_DATA);
+                sq.push(&sqe).unwrap();
+            }
+            for i in 0..queue_depth {
+                refill_sqe(&mut sq, i, None);
             }
         }
+        io_ring.0.submit()?;
 
-        Ok(ControlFlow::Continue(()))
-    })
+        log::debug!("IO worker {} initialized", self.thread_id);
+        if self.ready_tx.take().unwrap().send(()).is_err() {
+            // Stopping.
+            return Ok(());
+        }
+
+        let io_ring = &io_ring.0;
+        runtime.drive_uring(io_ring, |spawner| {
+            // SAFETY: This is the only place to modify the CQ.
+            let cq = unsafe { io_ring.completion_shared() };
+            for cqe in cq {
+                if cqe.user_data() == EXIT_USER_DATA {
+                    assert!(
+                        PollFlags::from_bits_truncate(cqe.result() as _).contains(PollFlags::IN),
+                        "unexpected poll result: {}",
+                        cqe.result(),
+                    );
+                    log::debug!("IO worker signaled to exit");
+                    return Ok(ControlFlow::Break(()));
+                }
+
+                // Here it must be a FETCH request.
+                if cqe.result() < 0 {
+                    let err = io::Error::from_raw_os_error(-cqe.result());
+                    log::debug!("failed to fetch ublk events: {err}");
+                    return Err(err);
+                }
+
+                let tag = cqe.user_data() as u16;
+                let commit_and_fetch = move |ret: i32| {
+                    // SAFETY: All futures are executed on the same thread, which is guarantee
+                    // by no `Send` bound on parameters of `Runtime::{block_on,spawn_local}`.
+                    // So there can only be one future running this block at the same time.
+                    unsafe {
+                        let mut sq = io_ring.submission_shared();
+                        refill_sqe(&mut sq, tag, Some(ret));
+                    }
+                    io_ring.submit().expect("failed to submit");
+                };
+
+                let iod = shm.get(tag);
+                let flags = IoFlags::from_bits_truncate(iod.op_flags);
+                // These fields may contain garbage for ops without them.
+                let off = iod.start_sector.wrapping_mul(SECTOR_SIZE as u64);
+                let len = unsafe { iod.__bindgen_anon_1.nr_sectors as usize }
+                    .wrapping_mul(SECTOR_SIZE as usize);
+                let op = iod.op_flags & 0xFF;
+                // TODO: Catch unwind.
+                match op {
+                    binding::UBLK_IO_OP_READ => {
+                        log::trace!("READ offset={off} len={len} flags={flags:?}");
+                        // SAFETY: This buffer is exclusive for task of `tag`.
+                        let buf = unsafe { io_buf_of(tag).as_mut() };
+                        let buf = ReadBuf(&mut buf[..len], PhantomData);
+                        let fut = self.handler.read(off, buf, flags);
+                        // TODO: This line is repeated over and over due to distinct Future types.
+                        spawner.spawn(async move { commit_and_fetch(fut.await.into_c_result()) });
+                    }
+                    binding::UBLK_IO_OP_WRITE => {
+                        log::trace!("WRITE offset={off} len={len} flags={flags:?}");
+                        // SAFETY: This buffer is exclusive for task of `tag`.
+                        let buf = unsafe { io_buf_of(tag).as_mut() };
+                        let buf = WriteBuf(&buf[..len], PhantomData);
+                        let fut = self.handler.write(off, buf, flags);
+                        spawner.spawn(async move { commit_and_fetch(fut.await.into_c_result()) });
+                    }
+                    binding::UBLK_IO_OP_FLUSH => {
+                        log::trace!("FLUSH flags={flags:?}");
+                        let fut = self.handler.flush(flags);
+                        spawner.spawn(async move { commit_and_fetch(fut.await.into_c_result()) });
+                    }
+                    binding::UBLK_IO_OP_DISCARD => {
+                        log::trace!("DISCARD offset={off} len={len} flags={flags:?}");
+                        let fut = self.handler.discard(off, len, flags);
+                        spawner.spawn(async move { commit_and_fetch(fut.await.into_c_result()) });
+                    }
+                    binding::UBLK_IO_OP_WRITE_ZEROES => {
+                        log::trace!("WRITE_ZEROES offset={off} len={len} flags={flags:?}");
+                        let fut = self.handler.write_zeroes(off, len, flags);
+                        spawner.spawn(async move { commit_and_fetch(fut.await.into_c_result()) });
+                    }
+                    // binding::UBLK_IO_OP_WRITE_SAME |
+                    // binding::UBLK_IO_OP_ZONE_OPEN |
+                    // binding::UBLK_IO_OP_ZONE_CLOSE |
+                    // binding::UBLK_IO_OP_ZONE_FINISH |
+                    // binding::UBLK_IO_OP_ZONE_APPEND |
+                    // binding::UBLK_IO_OP_ZONE_RESET_ALL |
+                    // binding::UBLK_IO_OP_ZONE_RESET |
+                    // binding::UBLK_IO_OP_REPORT_ZONES  |
+                    _ => {
+                        log::error!("unsupported op: {op}");
+                        commit_and_fetch(-Errno::IO.raw_os_error());
+                    }
+                }
+            }
+
+            Ok(ControlFlow::Continue(()))
+        })
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
