@@ -16,6 +16,8 @@ use rstest::{fixture, rstest};
 use rustix::io::Errno;
 use xshell::{cmd, Shell};
 
+const QUEUE_DEPTH: u16 = 2;
+
 #[fixture]
 fn ctl() -> ControlDevice {
     ControlDevice::open()
@@ -50,6 +52,7 @@ fn test_service<B: BlockDevice + Sync>(
         .unprivileged()
         .add_flags(flags)
         .queues(queues)
+        .queue_depth(QUEUE_DEPTH)
         .create_service(ctl)
         .unwrap();
     let tested = Arc::new(AtomicBool::new(false));
@@ -326,6 +329,85 @@ fn error(ctl: ControlDevice) {
             _flags: IoFlags,
         ) -> Result<usize, Errno> {
             Err(Errno::IO)
+        }
+
+        async fn write(
+            &self,
+            _off: u64,
+            _buf: WriteBuf<'_>,
+            _flags: IoFlags,
+        ) -> Result<usize, Errno> {
+            Err(Errno::IO)
+        }
+    }
+}
+
+#[rstest]
+#[ignore = "spam dmesg"]
+#[case::local(1)]
+#[ignore = "spam dmesg"]
+#[case::threaded(1)]
+fn handler_panic(ctl: ControlDevice, #[case] queues: u16) {
+    const SIZE: u64 = SECTOR_SIZE as _;
+    const TEST_ROUNDS: u16 = QUEUE_DEPTH * 2;
+
+    test_service(
+        &ctl,
+        FeatureFlags::empty(),
+        queues,
+        DeviceParams::new().size(SIZE),
+        TokioRuntimeBuilder,
+        |tested| Handler {
+            should_ok: Default::default(),
+            tested,
+        },
+    );
+
+    #[derive(Clone)]
+    struct Handler {
+        should_ok: Arc<AtomicBool>,
+        tested: Arc<AtomicBool>,
+    }
+    impl BlockDevice for Handler {
+        fn ready(&self, dev_info: &DeviceInfo, stop: Stopper) {
+            let dev_info = *dev_info;
+            let Handler { should_ok, tested } = self.clone();
+            std::thread::spawn(move || {
+                scopeguard::defer!(stop.stop());
+
+                let dev_path = wait_blockdev_ready(&dev_info).unwrap();
+                let sh = Shell::new().unwrap();
+
+                for _ in 0..TEST_ROUNDS {
+                    cmd!(sh, "cat {dev_path}")
+                        .ignore_stderr()
+                        .run()
+                        .unwrap_err();
+                }
+
+                // Should still work after recovered.
+                should_ok.store(true, Ordering::Relaxed);
+                for _ in 0..TEST_ROUNDS {
+                    let ret = cmd!(sh, "cat {dev_path}").ignore_stderr().read().unwrap();
+                    assert_eq!(ret.as_bytes(), [0u8; SECTOR_SIZE as _]);
+                }
+
+                tested.store(true, Ordering::Relaxed);
+            });
+        }
+
+        async fn read(
+            &self,
+            _off: u64,
+            mut buf: ReadBuf<'_>,
+            _flags: IoFlags,
+        ) -> Result<usize, Errno> {
+            if self.should_ok.load(Ordering::Relaxed) {
+                buf.fill(0)?;
+                Ok(buf.len())
+            } else {
+                panic!("nooo");
+            }
         }
 
         async fn write(

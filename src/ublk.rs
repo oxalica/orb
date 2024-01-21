@@ -933,16 +933,21 @@ impl Drop for IoBuffers {
 
 fn sync_cancel_all<S: squeue::EntryMarker, C: cqueue::EntryMarker>(uring: &IoUring<S, C>) {
     // All ops must be canceled before return, otherwise it's a UB.
-    scopeguard::defer_on_unwind!(std::process::abort());
+    // NB. We must not use `defer_on_unwind` here, otherwise this will abort unconditionally when
+    // this is called from `Drop` during unwinding.
+    let guard = scopeguard::guard((), |()| std::process::abort());
     if let Err(err) = uring
         .submitter()
         .register_sync_cancel(None, io_uring::types::CancelBuilder::any())
     {
         if err.kind() != io::ErrorKind::NotFound {
             log::error!("failed to cancel inflight ops in io-uring: {}", err);
-            std::process::abort();
+            // Trigger bomb.
+            return;
         }
     }
+    // Defuse.
+    scopeguard::ScopeGuard::into_inner(guard);
 }
 
 struct IoWorker<'a, B, RB> {
@@ -1131,36 +1136,50 @@ impl<B: BlockDevice, RB: AsyncRuntimeBuilder> IoWorker<'_, B, RB> {
                     }
                 };
 
-                // TODO: Catch unwind.
+                // Make `async move` only move the reference to the handler.
+                let h = self.handler;
+                // FIXME: Is there a better way to handle panicking here?
+                macro_rules! op {
+                    ($tt:tt; $(let $pat:pat_param = $rhs:expr;)* $handle_expr:expr) => {{
+                        log::trace!($tt);
+                        $(let $pat = $rhs;)*
+                        spawner.spawn(async move {
+                            // Always commit.
+                            let mut guard = scopeguard::guard(-Errno::IO.raw_os_error(), |ret| {
+                                if std::thread::panicking() {
+                                    log::warn!("handler panicked, returning EIO");
+                                }
+                                commit_and_fetch(ret)
+                            });
+                            let ret = $handle_expr.await.into_c_result();
+                            *guard = ret;
+                        });
+                    }};
+                }
+
                 match iod.op_flags & 0xFF {
-                    binding::UBLK_IO_OP_READ => {
-                        log::trace!("READ offset={off} len={len} flags={flags:?}");
+                    binding::UBLK_IO_OP_READ => op! {
+                        "READ offset={off} len={len} flags={flags:?}";
                         let buf = ReadBuf(get_buf(), PhantomData);
-                        let fut = self.handler.read(off, buf, flags);
-                        // TODO: This line is repeated over and over due to distinct Future types.
-                        spawner.spawn(async move { commit_and_fetch(fut.await.into_c_result()) });
-                    }
-                    binding::UBLK_IO_OP_WRITE => {
-                        log::trace!("WRITE offset={off} len={len} flags={flags:?}");
+                        h.read(off, buf, flags)
+                    },
+                    binding::UBLK_IO_OP_WRITE => op! {
+                        "WRITE offset={off} len={len} flags={flags:?}";
                         let buf = WriteBuf(get_buf(), PhantomData);
-                        let fut = self.handler.write(off, buf, flags);
-                        spawner.spawn(async move { commit_and_fetch(fut.await.into_c_result()) });
-                    }
-                    binding::UBLK_IO_OP_FLUSH => {
-                        log::trace!("FLUSH flags={flags:?}");
-                        let fut = self.handler.flush(flags);
-                        spawner.spawn(async move { commit_and_fetch(fut.await.into_c_result()) });
-                    }
-                    binding::UBLK_IO_OP_DISCARD => {
-                        log::trace!("DISCARD offset={off} len={len} flags={flags:?}");
-                        let fut = self.handler.discard(off, len, flags);
-                        spawner.spawn(async move { commit_and_fetch(fut.await.into_c_result()) });
-                    }
-                    binding::UBLK_IO_OP_WRITE_ZEROES => {
-                        log::trace!("WRITE_ZEROES offset={off} len={len} flags={flags:?}");
-                        let fut = self.handler.write_zeroes(off, len, flags);
-                        spawner.spawn(async move { commit_and_fetch(fut.await.into_c_result()) });
-                    }
+                        h.write(off, buf, flags)
+                    },
+                    binding::UBLK_IO_OP_FLUSH => op! {
+                        "FLUSH flags={flags:?}";
+                        h.flush(flags)
+                    },
+                    binding::UBLK_IO_OP_DISCARD => op! {
+                        "DISCARD offset={off} len={len} flags={flags:?}";
+                        h.discard(off, len, flags)
+                    },
+                    binding::UBLK_IO_OP_WRITE_ZEROES => op! {
+                        "WRITE_ZEROES offset={off} len={len} flags={flags:?}";
+                        h.write_zeroes(off, len, flags)
+                    },
                     // binding::UBLK_IO_OP_WRITE_SAME |
                     // binding::UBLK_IO_OP_ZONE_OPEN |
                     // binding::UBLK_IO_OP_ZONE_CLOSE |
