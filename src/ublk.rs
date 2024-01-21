@@ -2,7 +2,7 @@
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::fs::File;
 use std::marker::PhantomData;
-use std::mem::ManuallyDrop;
+use std::mem::{ManuallyDrop, MaybeUninit};
 use std::ops::ControlFlow;
 use std::os::fd::{BorrowedFd, RawFd};
 use std::os::unix::fs::FileExt;
@@ -113,6 +113,12 @@ impl fmt::Debug for ControlDevice {
     }
 }
 
+#[repr(C)]
+union CtrlCmdBuf {
+    cmd: [u8; 80],
+    data: binding::ublksrv_ctrl_cmd,
+}
+
 impl ControlDevice {
     pub const PATH: &'static str = "/dev/ublk-control";
     const URING_ENTRIES: u32 = 4;
@@ -162,12 +168,6 @@ impl ControlDevice {
     ) -> io::Result<T> {
         cmd.addr = &mut buf as *mut T as _;
         cmd.len = mem::size_of::<T>() as _;
-
-        #[repr(C)]
-        union CtrlCmdBuf {
-            cmd: [u8; 80],
-            data: binding::ublksrv_ctrl_cmd,
-        }
 
         let mut cmd_buf = CtrlCmdBuf { cmd: [0; 80] };
         cmd_buf.data = cmd;
@@ -310,6 +310,46 @@ impl ControlDevice {
                 },
             )?;
         }
+        Ok(())
+    }
+
+    /// Submit a start-device command without blocking.
+    /// It must be completed or cancelled later, or it will leave `Self` inconsistent.
+    ///
+    /// # Safety
+    ///
+    /// The command must be completed or canceled within the lifetime of `buf`.
+    unsafe fn submit_start_device(
+        &self,
+        dev_id: u32,
+        pid: Pid,
+        buf: &mut MaybeUninit<CdevPath>,
+    ) -> io::Result<()> {
+        let pid = pid.as_raw_nonzero().get().try_into().unwrap();
+        let mut cmd_buf = CtrlCmdBuf { cmd: [0; 80] };
+        // This ioctl carries no data, thus the layout the same for {un,}privileged devices.
+        cmd_buf.data = binding::ublksrv_ctrl_cmd {
+            dev_id,
+            len: CdevPath::MAX_LEN as _,
+            dev_path_len: CdevPath::MAX_LEN as _,
+            addr: buf.write(CdevPath::from_id(dev_id)) as *mut _ as u64,
+            data: [pid],
+            ..Default::default()
+        };
+        log::trace!("start device {dev_id} on pid {pid}");
+
+        let opcode = ioctl::Opcode::from_components(
+            ioctl::Direction::ReadWrite,
+            b'u',
+            binding::UBLK_CMD_START_DEV as _,
+            mem::size_of::<binding::ublksrv_ctrl_cmd>(),
+        );
+        let sqe = opcode::UringCmd80::new(Fd(self.fd.as_raw_fd()), opcode.raw())
+            .cmd(cmd_buf.cmd)
+            .build();
+        // SAFETY: Single-threaded and it is a valid uring_cmd.
+        unsafe { self.uring.submission_shared().push(&sqe).unwrap() };
+        self.uring.submit()?;
         Ok(())
     }
 
@@ -654,6 +694,15 @@ impl Service<'_> {
         &self.dev_info
     }
 
+    /// Start and run the service.
+    ///
+    /// This will block the current thread and spawn [`queues`](DeviceBuilder::queues) many worker
+    /// threads, each handling [`queue_depth`](DeviceBuilder::queue_depth) many concurrent
+    /// requests using the per-thread IO-uring, driven by per-thread asynchronous runtime built by
+    /// given [`AsyncRuntimeBuilder`].
+    ///
+    /// The main thread will call [`BlockDevice::ready`] once all worker are initialized and the
+    /// block device `/dev/ublkbX` is created.
     pub fn serve<RB, D>(
         &mut self,
         runtime_builder: RB,
@@ -706,13 +755,14 @@ impl Service<'_> {
 
             let handles = (0..nr_queues)
                 .map(|thread_id| {
-                    let worker = IoWorker {
+                    let mut worker = IoWorker {
                         thread_id,
                         ready_tx: Some(ready_tx.clone().clone()),
                         cdev: self.cdev.as_fd(),
                         dev_info: &self.dev_info,
                         handler: &handler,
                         runtime_builder: &runtime_builder,
+                        wait_device_start: None,
                         stop_guard: thread_stop_guard.clone(),
                     };
                     thread::Builder::new()
@@ -757,6 +807,79 @@ impl Service<'_> {
             }
             Ok(())
         })
+    }
+
+    /// Start and run the service on current thread.
+    ///
+    /// Similar to [`Service::run`] but the asynchronous runtime, IO-uring and request handlers are
+    /// all running on the current thread, thus they do not need to be [`Sync`].
+    ///
+    /// Be aware that [`BlockDevice::ready`] is also called from the current thread. Inside it,
+    /// doing any I/O actions to the target block device `/dev/ublkbX` would cause a dead-lock.
+    ///
+    /// # Panics
+    ///
+    /// Panic if the number of [`queues`](DeviceBuilder::queues) of this device is not one.
+    pub fn serve_local<RB, D>(
+        &mut self,
+        runtime_builder: RB,
+        params: &DeviceParams,
+        handler: &D,
+    ) -> io::Result<()>
+    where
+        RB: AsyncRuntimeBuilder,
+        D: BlockDevice,
+    {
+        let nr_queues = self.dev_info().nr_queues();
+        assert_eq!(nr_queues, 1, "`serve_local` requires a single queue");
+
+        let dev_id = self.dev_info().dev_id();
+        let unprivileged = self
+            .dev_info()
+            .flags()
+            .contains(FeatureFlags::UnprivilegedDev);
+        self.ctl.set_device_param(dev_id, params, unprivileged)?;
+
+        // No one is actually `read` it, so no need to be a semaphore.
+        // Note that this fd is kept alive during the service lifespan, so dropping `stopper` will
+        // not cause a service stop.
+        let exit_fd = Arc::new(rustix::event::eventfd(0, EventfdFlags::CLOEXEC)?);
+        let stopper = Stopper(Arc::clone(&exit_fd));
+
+        let worker = IoWorker {
+            thread_id: 0,
+            ready_tx: None,
+            cdev: self.cdev.as_fd(),
+            dev_info: &self.dev_info,
+            handler,
+            runtime_builder: &runtime_builder,
+            wait_device_start: Some((&self.ctl.uring, stopper)),
+            stop_guard: SignalStopOnDrop(exit_fd.as_fd()),
+        };
+        let mut worker = scopeguard::guard(worker, |worker| {
+            if worker.wait_device_start.is_some() {
+                // If the service fails before getting ready, no cleanup is needed.
+                return;
+            }
+
+            // Cancel the device starting request, and reset it to empty.
+            sync_cancel_all(&self.ctl.uring);
+            // SAFETY: `ctl` is held only by the current thread, thus it's exclusively to us here.
+            unsafe {
+                self.ctl.uring.completion_shared().for_each(|_| {});
+            }
+
+            if let Err(err) = self.ctl.stop_device(self.dev_info.dev_id()) {
+                log::error!("failed to stop device {} {}", self.dev_info.dev_id(), err);
+            }
+        });
+        let pid = rustix::process::getpid();
+        let mut buf = MaybeUninit::uninit();
+        // SAFETY: The `Drop` of `worker` ensures the command get completed or cancelled before
+        // return.
+        unsafe { self.ctl.submit_start_device(dev_id, pid, &mut buf).unwrap() }
+        worker.run()?;
+        Ok(())
     }
 }
 
@@ -808,20 +931,40 @@ impl Drop for IoBuffers {
     }
 }
 
+fn sync_cancel_all<S: squeue::EntryMarker, C: cqueue::EntryMarker>(uring: &IoUring<S, C>) {
+    // All ops must be canceled before return, otherwise it's a UB.
+    scopeguard::defer_on_unwind!(std::process::abort());
+    if let Err(err) = uring
+        .submitter()
+        .register_sync_cancel(None, io_uring::types::CancelBuilder::any())
+    {
+        if err.kind() != io::ErrorKind::NotFound {
+            log::error!("failed to cancel inflight ops in io-uring: {}", err);
+            std::process::abort();
+        }
+    }
+}
+
 struct IoWorker<'a, B, RB> {
     thread_id: u16,
+    // Signal the main thread for service readiness. `None` for `serve_local`.
     ready_tx: Option<std::sync::mpsc::SyncSender<()>>,
     cdev: BorrowedFd<'a>,
     dev_info: &'a DeviceInfo,
     handler: &'a B,
     runtime_builder: &'a RB,
 
+    // If the worker is running in-place by `Service::serve_local`, we need to wait for the
+    // device start command in the control io-uring to finish before sending a `BlockDevice::ready`
+    // notification.
+    wait_device_start: Option<(&'a IoUring<squeue::Entry128, cqueue::Entry>, Stopper)>,
+
     // This is dropped last.
     stop_guard: SignalStopOnDrop<'a>,
 }
 
 impl<B: BlockDevice, RB: AsyncRuntimeBuilder> IoWorker<'_, B, RB> {
-    fn run(mut self) -> io::Result<()> {
+    fn run(&mut self) -> io::Result<()> {
         if let Err(err) = rustix::process::configure_io_flusher_behavior(true) {
             // TODO: Option to make this a hard error?
             log::error!("failed to configure as IO_FLUSHER: {err}");
@@ -838,32 +981,20 @@ impl<B: BlockDevice, RB: AsyncRuntimeBuilder> IoWorker<'_, B, RB> {
             )
         });
 
-        // Plus `PollAdd` for notification.
+        // Plus `PollAdd` for stop guard xor ready hook.
         let ring_size = (self.dev_info.queue_depth() as u32 + 1)
             .checked_next_power_of_two()
             .unwrap();
         // NB. Ensure all inflight ops are cancelled before dropping the buffer defined above,
         // otherwise it's a use-after-free.
         let mut io_ring = scopeguard::guard(IoUring::new(ring_size)?, |io_ring| {
-            // All ops must be canceled before return, otherwise it's a UB.
-            scopeguard::defer_on_unwind!(std::process::abort());
-
-            if let Err(err) = io_ring
-                .submitter()
-                .register_sync_cancel(None, io_uring::types::CancelBuilder::any())
-            {
-                if err.kind() != io::ErrorKind::NotFound {
-                    log::error!("failed to cancel inflight ops in io-uring: {}", err);
-                    std::process::abort();
-                }
-            }
+            sync_cancel_all(&io_ring);
         });
         io_ring
             .submitter()
-            .register_files(&[self.cdev.as_raw_fd(), self.stop_guard.0.as_raw_fd()])?;
+            .register_files(&[self.cdev.as_raw_fd()])?;
         const CDEV_FIXED_FD: Fixed = Fixed(0);
-        const EXIT_FIXED_FD: Fixed = Fixed(1);
-        const EXIT_USER_DATA: u64 = !0;
+        const NOTIFY_USER_DATA: u64 = !0;
 
         let mut runtime = self.runtime_builder.build()?;
 
@@ -893,14 +1024,24 @@ impl<B: BlockDevice, RB: AsyncRuntimeBuilder> IoWorker<'_, B, RB> {
             }
         };
 
+        // SAFETY: `BorrowedFd` is valid.
+        let enqueue_poll_in = |sq: &mut SubmissionQueue<'_>, fd: BorrowedFd<'_>| unsafe {
+            let sqe = opcode::PollAdd::new(Fd(fd.as_raw_fd()), PollFlags::IN.bits().into())
+                .build()
+                .user_data(NOTIFY_USER_DATA);
+            sq.push(&sqe).unwrap();
+        };
+
         {
             let mut sq = io_ring.submission();
-            unsafe {
-                let sqe = opcode::PollAdd::new(EXIT_FIXED_FD, PollFlags::IN.bits().into())
-                    .build()
-                    .user_data(EXIT_USER_DATA);
-                sq.push(&sqe).unwrap();
-            }
+            let fd = if let Some((ctl_uring, _)) = &self.wait_device_start {
+                // Workaround: https://github.com/tokio-rs/io-uring/pull/254
+                // SAFETY: `ctl_uring` is valid.
+                unsafe { BorrowedFd::borrow_raw(ctl_uring.as_raw_fd()) }
+            } else {
+                self.stop_guard.0
+            };
+            enqueue_poll_in(&mut sq, fd);
             for i in 0..self.dev_info.queue_depth() {
                 refill_sqe(&mut sq, i, None);
             }
@@ -908,23 +1049,44 @@ impl<B: BlockDevice, RB: AsyncRuntimeBuilder> IoWorker<'_, B, RB> {
         io_ring.submit()?;
 
         log::debug!("IO worker {} initialized", self.thread_id);
-        if self.ready_tx.take().unwrap().send(()).is_err() {
-            // Stopping.
-            return Ok(());
+        if let Some(ready_tx) = self.ready_tx.take() {
+            if ready_tx.send(()).is_err() {
+                // Stopping.
+                return Ok(());
+            }
         }
 
         runtime.drive_uring(&io_ring, |spawner| {
             // SAFETY: This is the only place to modify the CQ.
             let cq = unsafe { io_ring.completion_shared() };
             for cqe in cq {
-                if cqe.user_data() == EXIT_USER_DATA {
+                if cqe.user_data() == NOTIFY_USER_DATA {
                     assert!(
                         PollFlags::from_bits_truncate(cqe.result() as _).contains(PollFlags::IN),
                         "unexpected poll result: {}",
                         cqe.result(),
                     );
-                    log::debug!("IO worker signaled to exit");
-                    return Ok(ControlFlow::Break(()));
+                    // `wait_device_start` is reset to `None` to mark readiness.
+                    // See cleanup in `Service::serve_local`.
+                    if let Some((ctl_uring, stopper)) = self.wait_device_start.take() {
+                        // Single-threaded worker. Start-device-request completed.
+                        let cqe = unsafe { ctl_uring.completion_shared().next().unwrap() };
+                        if cqe.result() < 0 {
+                            return Err(io::Error::from_raw_os_error(-cqe.result()));
+                        }
+                        self.handler.ready(self.dev_info, stopper);
+                        // SAFETY: All SQ writing is done on the same current thread.
+                        // See below in `commit_and_fetch`.
+                        unsafe {
+                            enqueue_poll_in(&mut io_ring.submission_shared(), self.stop_guard.0);
+                        }
+                        io_ring.submit()?;
+                        continue;
+                    } else {
+                        // Multi-threaded worker.
+                        log::debug!("IO worker signaled to exit");
+                        return Ok(ControlFlow::Break(()));
+                    }
                 }
 
                 // Here it must be a FETCH request.

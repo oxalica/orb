@@ -2,7 +2,7 @@ use std::fs;
 use std::io::{self, ErrorKind, Read, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use orb::runtime::{SyncRuntimeBuilder, TokioRuntimeBuilder};
@@ -169,54 +169,62 @@ fn read_write(flags: FeatureFlags) {
     let mut data = vec![0u8; SIZE as usize];
     rng.fill_bytes(&mut data);
 
-    struct Handler<'a> {
-        tested: &'a AtomicBool,
-        data: Mutex<Vec<u8>>,
+    #[derive(Clone)]
+    struct Handler {
+        tested: Arc<AtomicBool>,
+        data: Arc<Mutex<Vec<u8>>>,
         rng: StdRng,
     }
-    impl BlockDevice for Handler<'_> {
+    impl BlockDevice for Handler {
         fn ready(&self, dev_info: &DeviceInfo, stop: Stopper) {
             let dev_path = format!("{}{}", BDEV_PREFIX, dev_info.dev_id());
-            let mut rng = self.rng.clone();
+            let Handler {
+                tested,
+                data,
+                mut rng,
+            } = self.clone();
+            std::thread::spawn(move || {
+                scopeguard::defer!(stop.stop());
 
-            retry_on_perm(|| {
-                rustix::fs::access(&dev_path, rustix::fs::Access::WRITE_OK).map_err(|e| e.into())
-            })
-            .unwrap();
-
-            // NB. Perform I/O in another process to avoid deadlocks.
-            let sh = Shell::new().unwrap();
-            let mut state = cmd!(sh, "cat {dev_path}").output().unwrap().stdout;
-            // The initial data should match.
-            assert_eq!(state.len(), SIZE as usize);
-            assert_eq!(state, *self.data.lock().unwrap());
-
-            let mut buf = [0u8; SECTOR_SIZE as usize];
-            for _ in 0..TEST_WRITE_ROUNDS {
-                // Write a random block at random sector.
-                let sector_offset = rng.gen_range(0..(SIZE / SECTOR_SIZE as u64));
-                rng.fill_bytes(&mut buf);
-                let sector_offset_s = sector_offset.to_string();
-                cmd!(
-                    sh,
-                    "dd if=/dev/stdin of={dev_path} bs=512 count=1 oseek={sector_offset_s}"
-                )
-                .ignore_stderr()
-                .stdin(buf)
-                .run()
+                retry_on_perm(|| {
+                    rustix::fs::access(&dev_path, rustix::fs::Access::WRITE_OK)
+                        .map_err(|e| e.into())
+                })
                 .unwrap();
-                let offset = sector_offset * SECTOR_SIZE as u64;
-                state[offset as usize..][..SECTOR_SIZE as usize].copy_from_slice(&buf);
 
-                // Retrieve all data, and they should match.
-                let got = cmd!(sh, "cat {dev_path}").output().unwrap().stdout;
-                assert_eq!(got, state);
-            }
+                // NB. Perform I/O in another process to avoid deadlocks.
+                let sh = Shell::new().unwrap();
+                let mut state = cmd!(sh, "cat {dev_path}").output().unwrap().stdout;
+                // The initial data should match.
+                assert_eq!(state.len(), SIZE as usize);
+                assert_eq!(state, *data.lock().unwrap());
 
-            assert_eq!(*self.data.lock().unwrap(), state);
+                let mut buf = [0u8; SECTOR_SIZE as usize];
+                for _ in 0..TEST_WRITE_ROUNDS {
+                    // Write a random block at random sector.
+                    let sector_offset = rng.gen_range(0..(SIZE / SECTOR_SIZE as u64));
+                    rng.fill_bytes(&mut buf);
+                    let sector_offset_s = sector_offset.to_string();
+                    cmd!(
+                        sh,
+                        "dd if=/dev/stdin of={dev_path} bs=512 count=1 oseek={sector_offset_s}"
+                    )
+                    .ignore_stderr()
+                    .stdin(buf)
+                    .run()
+                    .unwrap();
+                    let offset = sector_offset * SECTOR_SIZE as u64;
+                    state[offset as usize..][..SECTOR_SIZE as usize].copy_from_slice(&buf);
 
-            self.tested.store(true, Ordering::Relaxed);
-            stop.stop();
+                    // Retrieve all data, and they should match.
+                    let got = cmd!(sh, "cat {dev_path}").output().unwrap().stdout;
+                    assert_eq!(got, state);
+                }
+
+                assert_eq!(*data.lock().unwrap(), state);
+
+                tested.store(true, Ordering::Relaxed);
+            });
         }
 
         async fn read(
@@ -241,13 +249,13 @@ fn read_write(flags: FeatureFlags) {
         }
     }
 
-    let tested = AtomicBool::new(false);
-    srv.serve(
+    let tested = Arc::new(AtomicBool::new(false));
+    srv.serve_local(
         SyncRuntimeBuilder,
         DeviceParams::new().size(SIZE),
-        Handler {
-            tested: &tested,
-            data: Mutex::new(data),
+        &Handler {
+            tested: tested.clone(),
+            data: Arc::new(Mutex::new(data)),
             rng,
         },
     )
