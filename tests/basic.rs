@@ -5,17 +5,19 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use orb::runtime::{SyncRuntimeBuilder, TokioRuntimeBuilder};
+use orb::runtime::{AsyncRuntimeBuilder, SyncRuntimeBuilder, TokioRuntimeBuilder};
 use orb::ublk::{
     BlockDevice, ControlDevice, DevState, DeviceAttrs, DeviceBuilder, DeviceInfo, DeviceParams,
     FeatureFlags, IoFlags, ReadBuf, Stopper, WriteBuf, BDEV_PREFIX, SECTOR_SIZE,
 };
 use rand::rngs::StdRng;
 use rand::{Rng, RngCore, SeedableRng};
+use rstest::{fixture, rstest};
 use rustix::io::Errno;
 use xshell::{cmd, Shell};
 
-fn init() -> ControlDevice {
+#[fixture]
+fn ctl() -> ControlDevice {
     ControlDevice::open()
         .expect("failed to open control device, kernel module 'ublk_drv' not loaded?")
 }
@@ -35,9 +37,34 @@ fn retry_on_perm<T>(mut f: impl FnMut() -> io::Result<T>) -> io::Result<T> {
     }
 }
 
-#[test]
-fn get_features() {
-    let ctl = init();
+fn test_service<B: BlockDevice + Sync>(
+    ctl: &ControlDevice,
+    flags: FeatureFlags,
+    queues: u16,
+    params: &DeviceParams,
+    rt_builder: impl AsyncRuntimeBuilder + Sync,
+    handler: impl FnOnce(Arc<AtomicBool>) -> B,
+) {
+    let mut srv = DeviceBuilder::new()
+        .name("ublk-test")
+        .unprivileged()
+        .add_flags(flags)
+        .queues(queues)
+        .create_service(ctl)
+        .unwrap();
+    let tested = Arc::new(AtomicBool::new(false));
+    if queues == 1 {
+        srv.serve_local(rt_builder, params, &handler(tested.clone()))
+            .unwrap();
+    } else {
+        srv.serve(rt_builder, params, handler(tested.clone()))
+            .unwrap();
+    }
+    assert!(tested.load(Ordering::Relaxed));
+}
+
+#[rstest]
+fn get_features(ctl: ControlDevice) {
     let feat = ctl.get_features().unwrap();
     println!("{feat:?}");
     assert!(feat.contains(FeatureFlags::UnprivilegedDev));
@@ -45,9 +72,8 @@ fn get_features() {
     assert!(!feat.contains(FeatureFlags::SupportZeroCopy));
 }
 
-#[test]
-fn create_info_delete() {
-    let ctl = init();
+#[rstest]
+fn create_info_delete(ctl: ControlDevice) {
     let mut builder = DeviceBuilder::new();
     builder
         .name("ublk-test")
@@ -82,25 +108,31 @@ fn create_info_delete() {
     ctl.delete_device(info.dev_id()).unwrap();
 }
 
-#[test]
-fn device_attrs() {
-    let ctl = init();
-    let mut srv = DeviceBuilder::new()
-        .name("ublk-test")
-        .unprivileged()
-        .create_service(&ctl)
-        .unwrap();
-
+#[rstest]
+#[case::local(1)]
+#[case::threaded(1)]
+fn device_attrs(ctl: ControlDevice, #[case] queues: u16) {
     const SIZE: u64 = 42 << 10;
     let params = *DeviceParams::new()
         .size(SIZE)
         .attrs(DeviceAttrs::Rotational);
 
-    struct Handler<'a> {
-        tested: &'a AtomicBool,
+    test_service(
+        &ctl,
+        FeatureFlags::empty(),
+        queues,
+        &params,
+        SyncRuntimeBuilder,
+        |tested| Handler { tested },
+    );
+
+    struct Handler {
+        tested: Arc<AtomicBool>,
     }
-    impl BlockDevice for Handler<'_> {
+    impl BlockDevice for Handler {
         fn ready(&self, dev_info: &DeviceInfo, stop: Stopper) {
+            scopeguard::defer!(stop.stop());
+
             let dev_sys_path = PathBuf::from(format!("/sys/block/ublkb{}", dev_info.dev_id()));
             let size = fs::read_to_string(dev_sys_path.join("size"))
                 .unwrap()
@@ -114,7 +146,6 @@ fn device_attrs() {
             assert_eq!(ro.trim(), "0");
 
             self.tested.store(true, Ordering::Relaxed);
-            stop.stop();
         }
 
         async fn read(
@@ -135,32 +166,14 @@ fn device_attrs() {
             Err(Errno::IO)
         }
     }
-
-    let tested = AtomicBool::new(false);
-    srv.serve(SyncRuntimeBuilder, &params, Handler { tested: &tested })
-        .unwrap();
-    assert!(tested.load(Ordering::Relaxed));
 }
 
-#[test]
-fn read_write_kernel_copy() {
-    read_write(FeatureFlags::empty())
-}
-
-#[test]
-fn read_write_user_copy() {
-    read_write(FeatureFlags::UserCopy)
-}
-
-fn read_write(flags: FeatureFlags) {
-    let ctl = init();
-    let mut srv = DeviceBuilder::new()
-        .name("ublk-test")
-        .unprivileged()
-        .add_flags(flags)
-        .create_service(&ctl)
-        .unwrap();
-
+#[rstest]
+#[case::default_local(FeatureFlags::empty(), 1)]
+#[case::default_threaded(FeatureFlags::empty(), 2)]
+#[case::user_copy_local(FeatureFlags::UserCopy, 1)]
+#[case::user_copy_threaded(FeatureFlags::UserCopy, 2)]
+fn read_write(ctl: ControlDevice, #[case] flags: FeatureFlags, #[case] queues: u16) {
     const SIZE: u64 = 32 << 10;
     const TEST_WRITE_ROUNDS: usize = 32;
     const SEED: u64 = 0xDEAD_BEEF_DEAD_BEEF;
@@ -168,6 +181,16 @@ fn read_write(flags: FeatureFlags) {
     let mut rng = StdRng::seed_from_u64(SEED);
     let mut data = vec![0u8; SIZE as usize];
     rng.fill_bytes(&mut data);
+    let data = Arc::new(Mutex::new(data));
+
+    test_service(
+        &ctl,
+        flags,
+        queues,
+        DeviceParams::new().size(SIZE),
+        SyncRuntimeBuilder,
+        |tested| Handler { tested, data, rng },
+    );
 
     #[derive(Clone)]
     struct Handler {
@@ -248,55 +271,48 @@ fn read_write(flags: FeatureFlags) {
             Ok(len)
         }
     }
-
-    let tested = Arc::new(AtomicBool::new(false));
-    srv.serve_local(
-        SyncRuntimeBuilder,
-        DeviceParams::new().size(SIZE),
-        &Handler {
-            tested: tested.clone(),
-            data: Arc::new(Mutex::new(data)),
-            rng,
-        },
-    )
-    .unwrap();
-    assert!(tested.load(Ordering::Relaxed));
 }
 
-#[test]
+#[rstest]
 #[ignore = "spam dmesg"]
-fn error() {
-    let ctl = init();
-    let mut srv = DeviceBuilder::new()
-        .name("ublk-test")
-        .unprivileged()
-        .create_service(&ctl)
-        .unwrap();
-
+fn error(ctl: ControlDevice) {
     const SIZE: u64 = 4 << 10;
 
-    struct Handler<'a> {
-        tested: &'a AtomicBool,
+    test_service(
+        &ctl,
+        FeatureFlags::empty(),
+        1,
+        DeviceParams::new().size(SIZE),
+        SyncRuntimeBuilder,
+        |tested| Handler { tested },
+    );
+
+    struct Handler {
+        tested: Arc<AtomicBool>,
     }
-    impl BlockDevice for Handler<'_> {
+    impl BlockDevice for Handler {
         fn ready(&self, dev_info: &DeviceInfo, stop: Stopper) {
             let dev_path = PathBuf::from(format!("{}{}", BDEV_PREFIX, dev_info.dev_id()));
-            let mut file = retry_on_perm(|| {
-                fs::OpenOptions::new()
-                    .read(true)
-                    .write(true)
-                    .open(&dev_path)
-            })
-            .unwrap();
+            let tested = self.tested.clone();
+            std::thread::spawn(move || {
+                scopeguard::defer!(stop.stop());
 
-            let err = file.read(&mut [0u8; 64]).unwrap_err();
-            assert_eq!(err.raw_os_error(), Some(Errno::IO.raw_os_error()));
+                let mut file = retry_on_perm(|| {
+                    fs::OpenOptions::new()
+                        .read(true)
+                        .write(true)
+                        .open(&dev_path)
+                })
+                .unwrap();
 
-            let err = file.write(&[0u8; 64]).unwrap_err();
-            assert_eq!(err.raw_os_error(), Some(Errno::IO.raw_os_error()));
+                let err = file.read(&mut [0u8; 64]).unwrap_err();
+                assert_eq!(err.raw_os_error(), Some(Errno::IO.raw_os_error()));
 
-            self.tested.store(true, Ordering::Relaxed);
-            stop.stop();
+                let err = file.write(&[0u8; 64]).unwrap_err();
+                assert_eq!(err.raw_os_error(), Some(Errno::IO.raw_os_error()));
+
+                tested.store(true, Ordering::Relaxed);
+            });
         }
 
         async fn read(
@@ -317,68 +333,60 @@ fn error() {
             Err(Errno::IO)
         }
     }
-
-    let tested = AtomicBool::new(false);
-    srv.serve(
-        SyncRuntimeBuilder,
-        DeviceParams::new().size(SIZE),
-        Handler { tested: &tested },
-    )
-    .unwrap();
-    assert!(tested.load(Ordering::Relaxed));
 }
 
-#[test]
-fn tokio_null_kernel_copy() {
-    tokio_null(FeatureFlags::empty())
-}
-
-#[test]
-fn tokio_null_user_copy() {
-    tokio_null(FeatureFlags::UserCopy)
-}
-
-fn tokio_null(flags: FeatureFlags) {
-    let ctl = init();
-    let mut srv = DeviceBuilder::new()
-        .name("ublk-test")
-        .unprivileged()
-        .add_flags(flags)
-        .create_service(&ctl)
-        .unwrap();
-
+#[rstest]
+#[case::default_local(FeatureFlags::empty(), 1)]
+#[case::default_threaded(FeatureFlags::empty(), 2)]
+#[case::user_copy_local(FeatureFlags::UserCopy, 1)]
+#[case::user_copy_threaded(FeatureFlags::UserCopy, 2)]
+fn tokio_null(ctl: ControlDevice, #[case] flags: FeatureFlags, #[case] queues: u16) {
     const SIZE: u64 = 4 << 10;
     const DELAY: Duration = Duration::from_millis(500);
     const TOLERANCE: Duration = Duration::from_millis(50);
 
-    struct Handler<'a> {
-        tested: &'a AtomicBool,
+    test_service(
+        &ctl,
+        flags,
+        queues,
+        DeviceParams::new().size(SIZE),
+        TokioRuntimeBuilder,
+        |tested| Handler { tested },
+    );
+
+    struct Handler {
+        tested: Arc<AtomicBool>,
     }
-    impl BlockDevice for Handler<'_> {
+    impl BlockDevice for Handler {
         fn ready(&self, dev_info: &DeviceInfo, stop: Stopper) {
             let dev_path = format!("{}{}", BDEV_PREFIX, dev_info.dev_id());
-            retry_on_perm(|| {
-                rustix::fs::access(&dev_path, rustix::fs::Access::WRITE_OK).map_err(|e| e.into())
-            })
-            .unwrap();
+            let tested = self.tested.clone();
+            std::thread::spawn(move || {
+                scopeguard::defer!(stop.stop());
 
-            // NB. Perform I/O in another process to avoid deadlocks.
-            let sh = Shell::new().unwrap();
-            let inst = Instant::now();
-            let out = cmd!(sh, "dd if={dev_path} of=/dev/stdout bs=512 count=1")
-                .ignore_stderr()
-                .output()
-                .unwrap()
-                .stdout;
-            let elapsed = inst.elapsed();
-            assert_eq!(out, [0u8; SECTOR_SIZE as _]);
-            assert!(
-                DELAY - TOLERANCE <= elapsed && elapsed <= DELAY + TOLERANCE,
-                "unexpected delay: {elapsed:?}",
-            );
+                retry_on_perm(|| {
+                    rustix::fs::access(&dev_path, rustix::fs::Access::WRITE_OK)
+                        .map_err(|e| e.into())
+                })
+                .unwrap();
 
-            self.tested.store(true, Ordering::Relaxed);
-            stop.stop();
+                // NB. Perform I/O in another process to avoid deadlocks.
+                let sh = Shell::new().unwrap();
+                let inst = Instant::now();
+                let out = cmd!(sh, "dd if={dev_path} of=/dev/stdout bs=512 count=1")
+                    .ignore_stderr()
+                    .output()
+                    .unwrap()
+                    .stdout;
+                let elapsed = inst.elapsed();
+                assert_eq!(out, [0u8; SECTOR_SIZE as _]);
+                assert!(
+                    DELAY - TOLERANCE <= elapsed && elapsed <= DELAY + TOLERANCE,
+                    "unexpected delay: {elapsed:?}",
+                );
+
+                tested.store(true, Ordering::Relaxed);
+            });
         }
 
         async fn read(
@@ -401,13 +409,4 @@ fn tokio_null(flags: FeatureFlags) {
             Err(Errno::IO)
         }
     }
-
-    let tested = AtomicBool::new(false);
-    srv.serve(
-        TokioRuntimeBuilder,
-        DeviceParams::new().size(SIZE),
-        Handler { tested: &tested },
-    )
-    .unwrap();
-    assert!(tested.load(Ordering::Relaxed));
 }
