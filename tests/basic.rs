@@ -8,7 +8,8 @@ use std::time::{Duration, Instant};
 use orb::runtime::{AsyncRuntimeBuilder, SyncRuntimeBuilder, TokioRuntimeBuilder};
 use orb::ublk::{
     BlockDevice, ControlDevice, DevState, DeviceAttrs, DeviceBuilder, DeviceInfo, DeviceParams,
-    DiscardParams, FeatureFlags, IoFlags, ReadBuf, Stopper, WriteBuf, BDEV_PREFIX, SECTOR_SIZE,
+    DiscardParams, FeatureFlags, IoFlags, ReadBuf, Stopper, WriteBuf, Zone, ZoneBuf, ZoneCond,
+    ZoneType, ZonedParams, BDEV_PREFIX, SECTOR_SIZE,
 };
 use rand::rngs::StdRng;
 use rand::{Rng, RngCore, SeedableRng};
@@ -576,6 +577,179 @@ fn discard(ctl: ControlDevice) {
 
         async fn write_zeroes(&self, off: u64, len: usize, _flags: IoFlags) -> Result<(), Errno> {
             self.discarded.lock().unwrap().push((true, off, len));
+            Ok(())
+        }
+    }
+}
+
+#[rstest]
+fn zoned(ctl: ControlDevice) {
+    const SIZE: u64 = 4 << 10;
+    const ZONE_SIZE: u32 = 1 << 10;
+    const ZONES: u64 = SIZE / ZONE_SIZE as u64;
+    const MAX_OPEN_ZONES: u32 = ZONES as u32;
+    const MAX_ACTIVE_ZONES: u32 = ZONES as u32;
+    const MAX_ZONE_APPEND_SIZE: u32 = 1 << 10;
+
+    let zones = (0..ZONES)
+        .map(|i| {
+            if i < 2 {
+                Zone::new(
+                    i * ZONE_SIZE as u64,
+                    ZONE_SIZE as u64,
+                    0,
+                    ZoneType::Conventional,
+                    ZoneCond::NotWp,
+                )
+            } else {
+                Zone::new(
+                    i * ZONE_SIZE as u64,
+                    ZONE_SIZE as u64,
+                    i * SECTOR_SIZE as u64,
+                    ZoneType::SeqWriteReq,
+                    ZoneCond::Empty,
+                )
+            }
+        })
+        .collect::<Vec<_>>();
+
+    test_service(
+        &ctl,
+        FeatureFlags::Zoned | FeatureFlags::UserCopy,
+        1,
+        DeviceParams::new()
+            .size(SIZE)
+            .chunk_size(ZONE_SIZE)
+            .zoned(ZonedParams {
+                max_open_zones: MAX_OPEN_ZONES,
+                max_active_zones: MAX_ACTIVE_ZONES,
+                max_zone_append_size: MAX_ZONE_APPEND_SIZE,
+            }),
+        SyncRuntimeBuilder,
+        |tested| Handler {
+            tested,
+            zones: zones.into(),
+            ops: Default::default(),
+        },
+    );
+
+    #[derive(Clone)]
+    struct Handler {
+        tested: Arc<AtomicBool>,
+        zones: Arc<[Zone]>,
+        ops: Arc<Mutex<String>>,
+    }
+    impl BlockDevice for Handler {
+        fn ready(&self, dev_info: &DeviceInfo, stop: Stopper) {
+            let dev_info = *dev_info;
+            let Self { tested, ops, .. } = self.clone();
+            std::thread::spawn(move || {
+                scopeguard::defer!(stop.stop());
+                let dev_path = wait_blockdev_ready(&dev_info).unwrap();
+                let sys_queue_path =
+                    PathBuf::from(format!("/sys/block/ublkb{}/queue", dev_info.dev_id()));
+
+                let opt_str = |subpath: &str| {
+                    fs::read_to_string(sys_queue_path.join(subpath))
+                        .unwrap()
+                        .trim()
+                        .to_owned()
+                };
+                let opt_u32 = |subpath: &str| opt_str(subpath).parse::<u32>().unwrap();
+
+                assert_eq!(opt_str("zoned"), "host-managed");
+                assert_eq!(opt_u32("chunk_sectors"), ZONE_SIZE / SECTOR_SIZE);
+                assert_eq!(opt_u32("nr_zones"), SIZE as u32 / ZONE_SIZE);
+                assert_eq!(opt_u32("zone_append_max_bytes"), MAX_ZONE_APPEND_SIZE);
+                assert_eq!(opt_u32("max_open_zones"), MAX_OPEN_ZONES);
+                assert_eq!(opt_u32("max_active_zones"), MAX_ACTIVE_ZONES);
+
+                let sh = Shell::new().unwrap();
+                let report = cmd!(sh, "blkzone report {dev_path}").read().unwrap();
+                println!("{report}");
+                let expect = "
+  start: 0x000000000, len 0x000002, cap 0x000000, wptr 0x000000 reset:0 non-seq:0, zcond: 0(nw) [type: 1(CONVENTIONAL)]
+  start: 0x000000002, len 0x000002, cap 0x000000, wptr 0x000000 reset:0 non-seq:0, zcond: 0(nw) [type: 1(CONVENTIONAL)]
+  start: 0x000000004, len 0x000002, cap 0x000000, wptr 0x000002 reset:0 non-seq:0, zcond: 1(em) [type: 2(SEQ_WRITE_REQUIRED)]
+  start: 0x000000006, len 0x000002, cap 0x000000, wptr 0x000003 reset:0 non-seq:0, zcond: 1(em) [type: 2(SEQ_WRITE_REQUIRED)]
+                ";
+                assert_eq!(report.trim(), expect.trim());
+
+                // The zone with id 2.
+                cmd!(sh, "blkzone open {dev_path} --offset 4 --length 2")
+                    .run()
+                    .unwrap();
+                cmd!(sh, "blkzone close {dev_path} --offset 4 --length 2")
+                    .run()
+                    .unwrap();
+                cmd!(sh, "blkzone finish {dev_path} --offset 4 --length 2")
+                    .run()
+                    .unwrap();
+                cmd!(sh, "blkzone reset {dev_path} --offset 4 --length 2")
+                    .run()
+                    .unwrap();
+                cmd!(sh, "blkzone reset {dev_path}").run().unwrap();
+                assert_eq!(*ops.lock().unwrap(), "open;close;finish;reset;reset_all;");
+
+                tested.store(true, Ordering::Relaxed);
+            });
+        }
+
+        async fn read(
+            &self,
+            _off: u64,
+            mut buf: ReadBuf<'_>,
+            _flags: IoFlags,
+        ) -> Result<usize, Errno> {
+            buf.fill(0)?;
+            Ok(buf.len())
+        }
+
+        async fn write(
+            &self,
+            _off: u64,
+            _buf: WriteBuf<'_>,
+            _flags: IoFlags,
+        ) -> Result<usize, Errno> {
+            Err(Errno::IO)
+        }
+
+        async fn report_zones(
+            &self,
+            off: u64,
+            mut buf: ZoneBuf<'_>,
+            _flags: IoFlags,
+        ) -> Result<usize, Errno> {
+            let zid = off / ZONE_SIZE as u64;
+            buf.report(&self.zones[zid as usize..][..buf.len()])
+        }
+
+        async fn zone_open(&self, off: u64, _flags: IoFlags) -> Result<(), Errno> {
+            assert_eq!(off, 2 << 10);
+            self.ops.lock().unwrap().push_str("open;");
+            Ok(())
+        }
+
+        async fn zone_close(&self, off: u64, _flags: IoFlags) -> Result<(), Errno> {
+            assert_eq!(off, 2 << 10);
+            self.ops.lock().unwrap().push_str("close;");
+            Ok(())
+        }
+
+        async fn zone_finish(&self, off: u64, _flags: IoFlags) -> Result<(), Errno> {
+            assert_eq!(off, 2 << 10);
+            self.ops.lock().unwrap().push_str("finish;");
+            Ok(())
+        }
+
+        async fn zone_reset(&self, off: u64, _flags: IoFlags) -> Result<(), Errno> {
+            assert_eq!(off, 2 << 10);
+            self.ops.lock().unwrap().push_str("reset;");
+            Ok(())
+        }
+
+        async fn zone_reset_all(&self, _flags: IoFlags) -> Result<(), Errno> {
+            self.ops.lock().unwrap().push_str("reset_all;");
             Ok(())
         }
     }

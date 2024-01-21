@@ -476,6 +476,15 @@ impl DeviceBuilder {
         self
     }
 
+    /// Set this device to be a zoned device.
+    ///
+    /// Zoned devices are only supported by kernel with `CONFIG_BLK_DEV_ZONED` enabled.
+    /// This also automatically set [`FeatureFlags::UserCopy`] which is required by it.
+    pub fn zoned(&mut self) -> &mut Self {
+        self.features |= FeatureFlags::Zoned | FeatureFlags::UserCopy;
+        self
+    }
+
     /// Set feature flags.
     ///
     /// This will replace previous flags set by, eg. [`DeviceBuilder::unprivileged`].
@@ -688,10 +697,31 @@ impl Service<'_> {
     const SUPPORTED_FLAGS: FeatureFlags = FeatureFlags::UringCmdCompInTask
         .union(FeatureFlags::UnprivilegedDev)
         .union(FeatureFlags::CmdIoctlEncode)
-        .union(FeatureFlags::UserCopy);
+        .union(FeatureFlags::UserCopy)
+        .union(FeatureFlags::Zoned);
 
     pub fn dev_info(&self) -> &DeviceInfo {
         &self.dev_info
+    }
+
+    fn check_params(&self, params: &DeviceParams) {
+        let unsupported_flags = self.dev_info().flags() - Self::SUPPORTED_FLAGS;
+        assert!(
+            unsupported_flags.is_empty(),
+            "flags not supported: {unsupported_flags:?}",
+        );
+        let dev_is_zoned = self.dev_info.flags().contains(FeatureFlags::Zoned);
+        let has_zoned_params = params.zoned.is_some();
+        assert_eq!(
+            dev_is_zoned, has_zoned_params,
+            "device feature has zoned={dev_is_zoned} but parameters zoned={has_zoned_params}",
+        );
+        if dev_is_zoned {
+            assert_ne!(
+                params.chunk_size, 0,
+                "`chunk_size` must be set for zoned devices",
+            );
+        }
     }
 
     /// Start and run the service.
@@ -714,14 +744,10 @@ impl Service<'_> {
         D: BlockDevice + Sync,
     {
         // Sanity check.
+        self.check_params(params);
         let dev_id = self.dev_info().dev_id();
         let nr_queues = self.dev_info().nr_queues();
         assert_ne!(nr_queues, 0);
-        let unsupported_flags = self.dev_info().flags() - Self::SUPPORTED_FLAGS;
-        assert!(
-            unsupported_flags.is_empty(),
-            "flags not supported: {unsupported_flags:?}",
-        );
 
         let unprivileged = self
             .dev_info()
@@ -830,6 +856,7 @@ impl Service<'_> {
         RB: AsyncRuntimeBuilder,
         D: BlockDevice,
     {
+        self.check_params(params);
         let nr_queues = self.dev_info().nr_queues();
         assert_eq!(nr_queues, 1, "`serve_local` requires a single queue");
 
@@ -1118,8 +1145,13 @@ impl<B: BlockDevice, RB: AsyncRuntimeBuilder> IoWorker<'_, B, RB> {
                 let flags = IoFlags::from_bits_truncate(iod.op_flags);
                 // These fields may contain garbage for ops without them.
                 let off = iod.start_sector.wrapping_mul(SECTOR_SIZE as u64);
+                // The 2 variants both have type `u32`.
+                let zones = unsafe { iod.__bindgen_anon_1.nr_zones };
                 let len = unsafe { iod.__bindgen_anon_1.nr_sectors as usize }
                     .wrapping_mul(SECTOR_SIZE as usize);
+                let pwrite_off = binding::UBLKSRV_IO_BUF_OFFSET as u64
+                    + ((self.thread_id as u64) << binding::UBLK_QID_OFF)
+                    + ((tag as u64) << binding::UBLK_TAG_OFF);
                 let get_buf = || {
                     match &io_bufs {
                         // SAFETY: This buffer is exclusive for task of `tag`.
@@ -1128,9 +1160,7 @@ impl<B: BlockDevice, RB: AsyncRuntimeBuilder> IoWorker<'_, B, RB> {
                         },
                         None => RawBuf::UserCopy {
                             cdev: self.cdev,
-                            off: binding::UBLKSRV_IO_BUF_OFFSET as u64
-                                + ((self.thread_id as u64) << binding::UBLK_QID_OFF)
-                                + ((tag as u64) << binding::UBLK_TAG_OFF),
+                            off: pwrite_off,
                             len: len as _,
                         },
                     }
@@ -1180,14 +1210,41 @@ impl<B: BlockDevice, RB: AsyncRuntimeBuilder> IoWorker<'_, B, RB> {
                         "WRITE_ZEROES offset={off} len={len} flags={flags:?}";
                         h.write_zeroes(off, len, flags)
                     },
-                    // binding::UBLK_IO_OP_WRITE_SAME |
-                    // binding::UBLK_IO_OP_ZONE_OPEN |
-                    // binding::UBLK_IO_OP_ZONE_CLOSE |
-                    // binding::UBLK_IO_OP_ZONE_FINISH |
-                    // binding::UBLK_IO_OP_ZONE_APPEND |
-                    // binding::UBLK_IO_OP_ZONE_RESET_ALL |
-                    // binding::UBLK_IO_OP_ZONE_RESET |
-                    // binding::UBLK_IO_OP_REPORT_ZONES  |
+                    binding::UBLK_IO_OP_REPORT_ZONES => op! {
+                        "REPORT_ZONES offset={off} zones={zones} flags={flags:?}";
+                        let buf = ZoneBuf {
+                            cdev: self.cdev,
+                            off: pwrite_off,
+                            zones,
+                            _not_send_invariant: PhantomData,
+                        };
+                        h.report_zones(off, buf, flags)
+                    },
+                    binding::UBLK_IO_OP_ZONE_APPEND => op! {
+                        "ZONE_APPEND offset={off} len={len} flags={flags:?}";
+                        let buf = WriteBuf(get_buf(), PhantomData);
+                        h.zone_append(off, buf, flags)
+                    },
+                    binding::UBLK_IO_OP_ZONE_OPEN => op! {
+                        "ZONE_OPEN offset={off} flags={flags:?}";
+                        h.zone_open(off, flags)
+                    },
+                    binding::UBLK_IO_OP_ZONE_CLOSE => op! {
+                        "ZONE_CLOSE offset={off} flags={flags:?}";
+                        h.zone_close(off, flags)
+                    },
+                    binding::UBLK_IO_OP_ZONE_FINISH => op! {
+                        "ZONE_FINISH offset={off} flags={flags:?}";
+                        h.zone_finish(off, flags)
+                    },
+                    binding::UBLK_IO_OP_ZONE_RESET => op! {
+                        "ZONE_RESET offset={off} flags={flags:?}";
+                        h.zone_reset(off, flags)
+                    },
+                    binding::UBLK_IO_OP_ZONE_RESET_ALL => op! {
+                        "ZONE_RESET_ALL flags={flags:?}";
+                        h.zone_reset_all(flags)
+                    },
                     op => {
                         log::error!("unsupported op: {op}");
                         commit_and_fetch(-Errno::IO.raw_os_error());
@@ -1212,6 +1269,7 @@ pub struct DeviceParams {
     io_max_size: u32,
     virt_boundary_mask: u64,
     discard: Option<DiscardParams>,
+    zoned: Option<ZonedParams>,
 }
 
 impl Default for DeviceParams {
@@ -1234,6 +1292,7 @@ impl DeviceParams {
             chunk_size: 0,
             virt_boundary_mask: 0,
             discard: None,
+            zoned: None,
         }
     }
 
@@ -1285,6 +1344,16 @@ impl DeviceParams {
         self.discard = Some(params);
         self
     }
+
+    /// Set zone parameters for zoned devices.
+    ///
+    /// The device must be created with [`FeatureFlags::Zoned`] set, and
+    /// [`DeviceParams::chunk_size`] must be set to the zone size.
+    pub fn zoned(&mut self, params: ZonedParams) -> &mut Self {
+        assert_eq!(params.max_zone_append_size % SECTOR_SIZE, 0);
+        self.zoned = Some(params);
+        self
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1296,10 +1365,18 @@ pub struct DiscardParams {
     pub max_segments: u16,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ZonedParams {
+    pub max_open_zones: u32,
+    pub max_active_zones: u32,
+    pub max_zone_append_size: u32,
+}
+
 impl DeviceParams {
     fn build(&self) -> binding::ublk_params {
         let mut attrs = DeviceParamsType::Basic;
         attrs.set(DeviceParamsType::Discard, self.discard.is_some());
+        attrs.set(DeviceParamsType::Zoned, self.zoned.is_some());
 
         binding::ublk_params {
             len: mem::size_of::<binding::ublk_params>() as _,
@@ -1326,11 +1403,97 @@ impl DeviceParams {
                     max_discard_segments: p.max_segments,
                     reserved0: 0,
                 }),
-            zoned: Default::default(),
+            zoned: self
+                .zoned
+                .map_or(Default::default(), |p| binding::ublk_param_zoned {
+                    max_open_zones: p.max_open_zones,
+                    max_active_zones: p.max_active_zones,
+                    max_zone_append_sectors: p.max_zone_append_size / SECTOR_SIZE,
+                    reserved: [0; 20],
+                }),
             // This is read-only.
             devt: Default::default(),
         }
     }
+}
+
+/// Zone descriptor for [`BlockDevice::report_zones`].
+///
+/// Aka. `struct blk_zone`.
+///
+/// See: https://elixir.bootlin.com/linux/v6.7/source/include/uapi/linux/blkzoned.h#L85
+#[derive(Debug, Clone, Copy)]
+#[repr(transparent)]
+pub struct Zone(binding::blk_zone);
+
+impl Zone {
+    pub fn new(
+        start_bytes: u64,
+        len_bytes: u64,
+        rel_write_pointer_bytes: u64,
+        type_: ZoneType,
+        cond: ZoneCond,
+    ) -> Self {
+        assert_eq!(start_bytes % SECTOR_SIZE as u64, 0);
+        assert_eq!(len_bytes % SECTOR_SIZE as u64, 0);
+        assert_eq!(rel_write_pointer_bytes % SECTOR_SIZE as u64, 0);
+        let start_sec = start_bytes / SECTOR_SIZE as u64;
+        Self(binding::blk_zone {
+            start: start_sec,
+            len: len_bytes / SECTOR_SIZE as u64,
+            wp: start_sec + rel_write_pointer_bytes / SECTOR_SIZE as u64,
+            type_: type_ as _,
+            cond: cond as _,
+            non_seq: 0,
+            reset: 0,
+            resv: [0; 4],
+            capacity: 0,
+            reserved: [0; 24],
+        })
+    }
+}
+
+/// Type of zones.
+///
+/// Aka. `enum blk_zone_type`.
+/// See: https://elixir.bootlin.com/linux/v6.7/source/include/uapi/linux/blkzoned.h#L22
+#[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
+#[repr(u8)]
+pub enum ZoneType {
+    /// The zone has no write pointer and can be writen randomly. Zone reset has no effect on the
+    /// zone.
+    Conventional = binding::BLK_ZONE_TYPE_CONVENTIONAL as u8,
+    /// The zone must be written sequentially.
+    SeqWriteReq = binding::BLK_ZONE_TYPE_SEQWRITE_REQ as u8,
+    /// The zone can be written non-sequentially.
+    SeqWritePref = binding::BLK_ZONE_TYPE_SEQWRITE_PREF as u8,
+}
+
+/// Condition/state of a zone in a zoned device.
+///
+/// Aka. `enum blk_zone_cond`.
+/// See: https://elixir.bootlin.com/linux/v6.7/source/include/uapi/linux/blkzoned.h#L38
+#[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
+#[repr(u8)]
+pub enum ZoneCond {
+    /// The zone has no write pointer, it is conventional.
+    NotWp = binding::BLK_ZONE_COND_NOT_WP as u8,
+    /// The zone is empty.
+    Empty = binding::BLK_ZONE_COND_EMPTY as u8,
+    /// The zone is open, but not explicitly opened.
+    ImpOpen = binding::BLK_ZONE_COND_IMP_OPEN as u8,
+    /// The zones was explicitly opened by an OPEN ZONE command.
+    ExpOpen = binding::BLK_ZONE_COND_EXP_OPEN as u8,
+    /// The zone was *explicitly* closed after writing.
+    Closed = binding::BLK_ZONE_COND_CLOSED as u8,
+    /// The zone is marked as full, possibly by a zone FINISH ZONE command.
+    Full = binding::BLK_ZONE_COND_FULL as u8,
+    /// The zone is read-only.
+    Readonly = binding::BLK_ZONE_COND_READONLY as u8,
+    /// The zone is offline (sectors cannot be read/written).
+    Offline = binding::BLK_ZONE_COND_OFFLINE as u8,
 }
 
 trait IntoCResult {
@@ -1375,6 +1538,44 @@ pub trait BlockDevice {
     async fn write_zeroes(&self, _off: u64, _len: usize, _flags: IoFlags) -> Result<(), Errno> {
         Err(Errno::OPNOTSUPP)
     }
+
+    async fn zone_append(
+        &self,
+        _off: u64,
+        _buf: WriteBuf<'_>,
+        _flags: IoFlags,
+    ) -> Result<(), Errno> {
+        Err(Errno::OPNOTSUPP)
+    }
+
+    async fn zone_open(&self, _off: u64, _flags: IoFlags) -> Result<(), Errno> {
+        Err(Errno::OPNOTSUPP)
+    }
+
+    async fn zone_close(&self, _off: u64, _flags: IoFlags) -> Result<(), Errno> {
+        Err(Errno::OPNOTSUPP)
+    }
+
+    async fn zone_finish(&self, _off: u64, _flags: IoFlags) -> Result<(), Errno> {
+        Err(Errno::OPNOTSUPP)
+    }
+
+    async fn zone_reset(&self, _off: u64, _flags: IoFlags) -> Result<(), Errno> {
+        Err(Errno::OPNOTSUPP)
+    }
+
+    async fn zone_reset_all(&self, _flags: IoFlags) -> Result<(), Errno> {
+        Err(Errno::OPNOTSUPP)
+    }
+
+    async fn report_zones(
+        &self,
+        _off: u64,
+        _buf: ZoneBuf<'_>,
+        _flags: IoFlags,
+    ) -> Result<usize, Errno> {
+        Err(Errno::OPNOTSUPP)
+    }
 }
 
 #[derive(Debug)]
@@ -1412,7 +1613,6 @@ impl ReadBuf<'_> {
         match &mut self.0 {
             RawBuf::PreCopied(b) => b.copy_from_slice(data),
             RawBuf::UserCopy { cdev, off, .. } => {
-                // cov_mark::hit!(user_copy);
                 // SAFETY: The fd is valid and `ManuallyDrop` prevents its close.
                 let cdev = unsafe { ManuallyDrop::new(File::from_raw_fd(cdev.as_raw_fd())) };
                 cdev.write_all_at(data, *off)
@@ -1473,5 +1673,39 @@ impl WriteBuf<'_> {
             RawBuf::PreCopied(b) => Some(b),
             RawBuf::UserCopy { .. } => None,
         }
+    }
+}
+
+/// The return buffer for [`BlockDevice::report_zones`].
+#[derive(Debug)]
+pub struct ZoneBuf<'a> {
+    cdev: BorrowedFd<'a>,
+    off: u64,
+    zones: u32,
+    _not_send_invariant: PhantomData<(*mut (), &'a mut &'a mut ())>,
+}
+
+impl ZoneBuf<'_> {
+    /// The number of zones requested, which must not be zero.
+    // It must not be empty.
+    #[allow(clippy::len_without_is_empty)]
+    pub fn len(&self) -> usize {
+        self.zones as _
+    }
+
+    /// Return zones informations as response.
+    ///
+    /// The length of `zones` must be the length requested.
+    pub fn report(&mut self, zones: &[Zone]) -> Result<usize, Errno> {
+        assert_eq!(zones.len(), self.zones as _);
+        // SAFETY: `Zone` is `repr(transparent)` to `struct blk_zone`.
+        let data = unsafe {
+            std::slice::from_raw_parts(zones.as_ptr().cast::<u8>(), mem::size_of_val(zones))
+        };
+        // SAFETY: The fd is valid and `ManuallyDrop` prevents its close.
+        let cdev = unsafe { ManuallyDrop::new(File::from_raw_fd(self.cdev.as_raw_fd())) };
+        cdev.write_all_at(data, self.off)
+            .map_err(|e| Errno::from_io_error(&e).unwrap())?;
+        Ok(data.len())
     }
 }
