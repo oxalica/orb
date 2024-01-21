@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 use orb::runtime::{AsyncRuntimeBuilder, SyncRuntimeBuilder, TokioRuntimeBuilder};
 use orb::ublk::{
     BlockDevice, ControlDevice, DevState, DeviceAttrs, DeviceBuilder, DeviceInfo, DeviceParams,
-    FeatureFlags, IoFlags, ReadBuf, Stopper, WriteBuf, BDEV_PREFIX, SECTOR_SIZE,
+    DiscardParams, FeatureFlags, IoFlags, ReadBuf, Stopper, WriteBuf, BDEV_PREFIX, SECTOR_SIZE,
 };
 use rand::rngs::StdRng;
 use rand::{Rng, RngCore, SeedableRng};
@@ -61,6 +61,14 @@ fn test_service<B: BlockDevice + Sync>(
             .unwrap();
     }
     assert!(tested.load(Ordering::Relaxed));
+}
+
+fn wait_blockdev_ready(info: &DeviceInfo) -> io::Result<String> {
+    let path = format!("{}{}", BDEV_PREFIX, info.dev_id());
+    retry_on_perm(|| {
+        rustix::fs::access(&path, rustix::fs::Access::WRITE_OK).map_err(|e| e.into())
+    })?;
+    Ok(path)
 }
 
 #[rstest]
@@ -200,7 +208,7 @@ fn read_write(ctl: ControlDevice, #[case] flags: FeatureFlags, #[case] queues: u
     }
     impl BlockDevice for Handler {
         fn ready(&self, dev_info: &DeviceInfo, stop: Stopper) {
-            let dev_path = format!("{}{}", BDEV_PREFIX, dev_info.dev_id());
+            let dev_info = *dev_info;
             let Handler {
                 tested,
                 data,
@@ -209,11 +217,7 @@ fn read_write(ctl: ControlDevice, #[case] flags: FeatureFlags, #[case] queues: u
             std::thread::spawn(move || {
                 scopeguard::defer!(stop.stop());
 
-                retry_on_perm(|| {
-                    rustix::fs::access(&dev_path, rustix::fs::Access::WRITE_OK)
-                        .map_err(|e| e.into())
-                })
-                .unwrap();
+                let dev_path = wait_blockdev_ready(&dev_info).unwrap();
 
                 // NB. Perform I/O in another process to avoid deadlocks.
                 let sh = Shell::new().unwrap();
@@ -359,16 +363,12 @@ fn tokio_null(ctl: ControlDevice, #[case] flags: FeatureFlags, #[case] queues: u
     }
     impl BlockDevice for Handler {
         fn ready(&self, dev_info: &DeviceInfo, stop: Stopper) {
-            let dev_path = format!("{}{}", BDEV_PREFIX, dev_info.dev_id());
+            let dev_info = *dev_info;
             let tested = self.tested.clone();
             std::thread::spawn(move || {
                 scopeguard::defer!(stop.stop());
 
-                retry_on_perm(|| {
-                    rustix::fs::access(&dev_path, rustix::fs::Access::WRITE_OK)
-                        .map_err(|e| e.into())
-                })
-                .unwrap();
+                let dev_path = wait_blockdev_ready(&dev_info).unwrap();
 
                 // NB. Perform I/O in another process to avoid deadlocks.
                 let sh = Shell::new().unwrap();
@@ -407,6 +407,94 @@ fn tokio_null(ctl: ControlDevice, #[case] flags: FeatureFlags, #[case] queues: u
             _flags: IoFlags,
         ) -> Result<usize, Errno> {
             Err(Errno::IO)
+        }
+    }
+}
+
+#[rstest]
+fn discard(ctl: ControlDevice) {
+    const SIZE: u64 = 4 << 10;
+    const GRANULARITY: u32 = 1 << 10;
+
+    test_service(
+        &ctl,
+        FeatureFlags::empty(),
+        1,
+        DeviceParams::new().size(SIZE).discard(DiscardParams {
+            alignment: GRANULARITY,
+            granularity: GRANULARITY,
+            max_size: SIZE as _,
+            max_write_zeroes_size: SIZE as _,
+            max_segments: 1,
+        }),
+        SyncRuntimeBuilder,
+        |tested| Handler {
+            tested,
+            discarded: Default::default(),
+        },
+    );
+
+    #[derive(Clone)]
+    struct Handler {
+        tested: Arc<AtomicBool>,
+        discarded: Arc<Mutex<Vec<(bool, u64, usize)>>>,
+    }
+    impl BlockDevice for Handler {
+        fn ready(&self, dev_info: &DeviceInfo, stop: Stopper) {
+            let dev_info = *dev_info;
+            let Self { tested, discarded } = self.clone();
+            std::thread::spawn(move || {
+                scopeguard::defer!(stop.stop());
+                let dev_path = wait_blockdev_ready(&dev_info).unwrap();
+
+                let sh = Shell::new().unwrap();
+                let take_discarded = || std::mem::take(&mut *discarded.lock().unwrap());
+
+                cmd!(sh, "blkdiscard {dev_path}").run().unwrap();
+                assert_eq!(take_discarded(), [(false, 0, SIZE as _)]);
+                cmd!(sh, "blkdiscard --zeroout {dev_path}").run().unwrap();
+                assert_eq!(take_discarded(), [(true, 0, SIZE as _)]);
+
+                cmd!(sh, "blkdiscard -o 1024 -l 2048 {dev_path}")
+                    .run()
+                    .unwrap();
+                assert_eq!(take_discarded(), [(false, 1024, 2048)]);
+                cmd!(sh, "blkdiscard --zeroout -o 1024 -l 2048 {dev_path}")
+                    .run()
+                    .unwrap();
+                assert_eq!(take_discarded(), [(true, 1024, 2048)]);
+
+                tested.store(true, Ordering::Relaxed);
+            });
+        }
+
+        async fn read(
+            &self,
+            _off: u64,
+            mut buf: ReadBuf<'_>,
+            _flags: IoFlags,
+        ) -> Result<usize, Errno> {
+            buf.fill(0)?;
+            Ok(buf.len())
+        }
+
+        async fn write(
+            &self,
+            _off: u64,
+            buf: WriteBuf<'_>,
+            _flags: IoFlags,
+        ) -> Result<usize, Errno> {
+            Ok(buf.len())
+        }
+
+        async fn discard(&self, off: u64, len: usize, _flags: IoFlags) -> Result<(), Errno> {
+            self.discarded.lock().unwrap().push((false, off, len));
+            Ok(())
+        }
+
+        async fn write_zeroes(&self, off: u64, len: usize, _flags: IoFlags) -> Result<(), Errno> {
+            self.discarded.lock().unwrap().push((true, off, len));
+            Ok(())
         }
     }
 }
