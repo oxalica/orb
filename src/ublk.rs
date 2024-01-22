@@ -16,8 +16,8 @@ use io_uring::{cqueue, opcode, squeue, IoUring, SubmissionQueue};
 use rustix::event::{EventfdFlags, PollFd, PollFlags};
 use rustix::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
 use rustix::io::Errno;
+use rustix::mm;
 use rustix::process::Pid;
-use rustix::{ioctl, mm};
 
 use crate::runtime::{AsyncRuntime, AsyncRuntimeBuilder, AsyncScopeSpawner};
 
@@ -139,8 +139,7 @@ impl ControlDevice {
     unsafe fn execute_ctrl_cmd_opt_cdev<T>(
         &self,
         include_cdev: bool,
-        direction: ioctl::Direction,
-        cmd_op: u32,
+        ioctl_op: u32,
         dev_id: u32,
         buf: T,
         mut cmd: binding::ublksrv_ctrl_cmd,
@@ -152,17 +151,16 @@ impl ControlDevice {
         if include_cdev {
             let buf = Payload(CdevPath::from_id(dev_id), buf);
             cmd.dev_path_len = CdevPath::MAX_LEN as _;
-            let ret = self.execute_ctrl_cmd(direction, cmd_op, buf, cmd)?;
+            let ret = self.execute_ctrl_cmd(ioctl_op, buf, cmd)?;
             Ok(ret.1)
         } else {
-            self.execute_ctrl_cmd(direction, cmd_op, buf, cmd)
+            self.execute_ctrl_cmd(ioctl_op, buf, cmd)
         }
     }
 
     unsafe fn execute_ctrl_cmd<T>(
         &self,
-        direction: ioctl::Direction,
-        cmd_op: u32,
+        ioctl_op: u32,
         mut buf: T,
         mut cmd: binding::ublksrv_ctrl_cmd,
     ) -> io::Result<T> {
@@ -171,14 +169,7 @@ impl ControlDevice {
 
         let mut cmd_buf = CtrlCmdBuf { cmd: [0; 80] };
         cmd_buf.data = cmd;
-        let opcode = ioctl::Opcode::from_components(
-            direction,
-            b'u',
-            // FIXME: Type mismatch?
-            cmd_op as u8,
-            mem::size_of::<binding::ublksrv_ctrl_cmd>(),
-        );
-        let sqe = opcode::UringCmd80::new(Fd(self.fd.as_raw_fd()), opcode.raw())
+        let sqe = opcode::UringCmd80::new(Fd(self.fd.as_raw_fd()), ioctl_op)
             .cmd(cmd_buf.cmd)
             .build();
         // SAFETY: `ControlDevice` is not `Send`, so we are the only thread running this block.
@@ -213,14 +204,8 @@ impl ControlDevice {
     pub fn get_features(&self) -> io::Result<FeatureFlags> {
         // SAFETY: Valid uring_cmd.
         unsafe {
-            self.execute_ctrl_cmd(
-                ioctl::Direction::Read,
-                // FIXME: Not exported by bindgen.
-                0x13,
-                0u64,
-                Default::default(),
-            )
-            .map(FeatureFlags::from_bits_truncate)
+            self.execute_ctrl_cmd(binding::UBLK_U_CMD_GET_FEATURES, 0u64, Default::default())
+                .map(FeatureFlags::from_bits_truncate)
         }
     }
 
@@ -230,8 +215,7 @@ impl ControlDevice {
             self.execute_ctrl_cmd_opt_cdev::<binding::ublksrv_ctrl_dev_info>(
                 // Always include cdev_path.
                 true,
-                ioctl::Direction::Read,
-                binding::UBLK_CMD_GET_DEV_INFO2,
+                binding::UBLK_U_CMD_GET_DEV_INFO2,
                 dev_id,
                 mem::zeroed(),
                 Default::default(),
@@ -247,8 +231,7 @@ impl ControlDevice {
         // SAFETY: Valid uring_cmd.
         unsafe {
             self.execute_ctrl_cmd(
-                ioctl::Direction::ReadWrite,
-                binding::UBLK_CMD_ADD_DEV,
+                binding::UBLK_U_CMD_ADD_DEV,
                 binding::ublksrv_ctrl_dev_info {
                     nr_hw_queues: builder.nr_hw_queues,
                     queue_depth: builder.queue_depth,
@@ -280,8 +263,7 @@ impl ControlDevice {
             self.execute_ctrl_cmd_opt_cdev(
                 // Carries no data, so just pass cdev_path anyway.
                 true,
-                ioctl::Direction::ReadWrite,
-                binding::UBLK_CMD_DEL_DEV,
+                binding::UBLK_U_CMD_DEL_DEV,
                 dev_id,
                 [0u8; 0],
                 Default::default(),
@@ -300,8 +282,7 @@ impl ControlDevice {
             self.execute_ctrl_cmd_opt_cdev(
                 // Carries no data, so just pass cdev_path anyway.
                 true,
-                ioctl::Direction::ReadWrite,
-                binding::UBLK_CMD_START_DEV,
+                binding::UBLK_U_CMD_START_DEV,
                 dev_id,
                 [0u8; 0],
                 binding::ublksrv_ctrl_cmd {
@@ -338,13 +319,7 @@ impl ControlDevice {
         };
         log::trace!("start device {dev_id} on pid {pid}");
 
-        let opcode = ioctl::Opcode::from_components(
-            ioctl::Direction::ReadWrite,
-            b'u',
-            binding::UBLK_CMD_START_DEV as _,
-            mem::size_of::<binding::ublksrv_ctrl_cmd>(),
-        );
-        let sqe = opcode::UringCmd80::new(Fd(self.fd.as_raw_fd()), opcode.raw())
+        let sqe = opcode::UringCmd80::new(Fd(self.fd.as_raw_fd()), binding::UBLK_U_CMD_START_DEV)
             .cmd(cmd_buf.cmd)
             .build();
         // SAFETY: Single-threaded and it is a valid uring_cmd.
@@ -360,8 +335,7 @@ impl ControlDevice {
             self.execute_ctrl_cmd_opt_cdev(
                 // Carries no data, so just pass cdev_path anyway.
                 true,
-                ioctl::Direction::ReadWrite,
-                binding::UBLK_CMD_STOP_DEV,
+                binding::UBLK_U_CMD_STOP_DEV,
                 dev_id,
                 [0u8; 0],
                 Default::default(),
@@ -381,8 +355,7 @@ impl ControlDevice {
         unsafe {
             self.execute_ctrl_cmd_opt_cdev::<binding::ublk_params>(
                 unprivileged,
-                ioctl::Direction::ReadWrite,
-                binding::UBLK_CMD_SET_PARAMS,
+                binding::UBLK_U_CMD_SET_PARAMS,
                 dev_id,
                 params.build(),
                 Default::default(),
