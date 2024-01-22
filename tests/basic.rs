@@ -145,6 +145,15 @@ fn device_attrs(ctl: ControlDevice, #[case] queues: u16) {
         fn ready(&self, dev_info: &DeviceInfo, stop: Stopper) {
             scopeguard::defer!(stop.stop());
 
+            assert_eq!(
+                ControlDevice::open()
+                    .unwrap()
+                    .get_device_info(dev_info.dev_id())
+                    .unwrap()
+                    .state(),
+                DevState::Live,
+            );
+
             let dev_sys_path = PathBuf::from(format!("/sys/block/ublkb{}", dev_info.dev_id()));
             let size = fs::read_to_string(dev_sys_path.join("size"))
                 .unwrap()

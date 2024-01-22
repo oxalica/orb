@@ -779,7 +779,6 @@ impl Service<'_> {
                 self.ctl.start_device(dev_id, rustix::process::getpid())?;
 
                 // Now device is started, and `/dev/ublkbX` appears.
-                // FIXME: The device status still reports DEAD here.
                 *stop_device_guard = true;
                 handler.ready(self.dev_info(), Stopper(Arc::clone(&exit_fd)));
 
