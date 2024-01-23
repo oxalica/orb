@@ -20,9 +20,10 @@ struct Cli {
 
     #[clap(long)]
     discard: bool,
-
     #[clap(long)]
     user_copy: bool,
+    #[clap(long)]
+    privileged: bool,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -46,7 +47,10 @@ fn main() -> anyhow::Result<()> {
     let ctl = ControlDevice::open()
         .context("failed to open control device, kernel module 'ublk_drv' not loaded?")?;
     let mut builder = DeviceBuilder::new();
-    builder.name("ublk-loop").unprivileged();
+    builder.name("ublk-loop");
+    if !cli.privileged {
+        builder.unprivileged();
+    }
     if cli.user_copy {
         builder.user_copy();
     }
@@ -55,7 +59,8 @@ fn main() -> anyhow::Result<()> {
         .context("failed to create ublk device")?;
     let mut params = *DeviceParams::new()
         .size(size)
-        .attrs(DeviceAttrs::VolatileCache);
+        .attrs(DeviceAttrs::VolatileCache)
+        .set_io_flusher(cli.privileged);
     if cli.discard {
         params.discard(DiscardParams {
             alignment: SECTOR_SIZE,

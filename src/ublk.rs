@@ -785,6 +785,7 @@ impl Service<'_> {
                         dev_info: &self.dev_info,
                         handler: &handler,
                         runtime_builder: &runtime_builder,
+                        set_io_flusher: params.set_io_flusher,
                         wait_device_start: None,
                         stop_guard: thread_stop_guard.clone(),
                     };
@@ -879,6 +880,7 @@ impl Service<'_> {
             dev_info: &self.dev_info,
             handler,
             runtime_builder: &runtime_builder,
+            set_io_flusher: params.set_io_flusher,
             wait_device_start: Some((&self.ctl.uring, stopper)),
             stop_guard: SignalStopOnDrop(exit_fd.as_fd()),
         };
@@ -984,6 +986,7 @@ struct IoWorker<'a, B, RB> {
     dev_info: &'a DeviceInfo,
     handler: &'a B,
     runtime_builder: &'a RB,
+    set_io_flusher: bool,
 
     // If the worker is running in-place by `Service::serve_local`, we need to wait for the
     // device start command in the control io-uring to finish before sending a `BlockDevice::ready`
@@ -996,10 +999,18 @@ struct IoWorker<'a, B, RB> {
 
 impl<B: BlockDevice, RB: AsyncRuntimeBuilder> IoWorker<'_, B, RB> {
     fn run(&mut self) -> io::Result<()> {
-        if let Err(err) = rustix::process::configure_io_flusher_behavior(true) {
-            // TODO: Option to make this a hard error?
-            log::error!("failed to configure as IO_FLUSHER: {err}");
-        }
+        let _reset_io_flusher_guard = self
+            .set_io_flusher
+            .then(|| -> io::Result<_> {
+                rustix::process::configure_io_flusher_behavior(true)?;
+                log::debug!("set thread as IO_FLUSHER");
+                Ok(scopeguard::guard((), |()| {
+                    if let Err(err) = rustix::process::configure_io_flusher_behavior(false) {
+                        log::error!("failed to reset IO_FLUSHER state: {err}");
+                    }
+                }))
+            })
+            .transpose()?;
 
         let shm = IoDescShm::new(self.cdev, self.dev_info, self.thread_id)?;
 
@@ -1259,6 +1270,7 @@ impl<B: BlockDevice, RB: AsyncRuntimeBuilder> IoWorker<'_, B, RB> {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DeviceParams {
+    set_io_flusher: bool,
     attrs: DeviceAttrs,
     size: u64,
     logical_block_size: u32,
@@ -1283,6 +1295,7 @@ impl DeviceParams {
     pub const fn new() -> Self {
         // The default values here are somewhat arbitrary.
         Self {
+            set_io_flusher: false,
             attrs: DeviceAttrs::empty(),
             size: 0,
             logical_block_size: 512,
@@ -1295,6 +1308,19 @@ impl DeviceParams {
             discard: None,
             zoned: None,
         }
+    }
+
+    /// Set the worker threads in `IO_FLUSHER` state.
+    ///
+    /// > This will put the process in the IO_FLUSHER state, which allows it special treatment to
+    /// > make progress when allocating memory.
+    ///
+    /// It requires `CAP_SYS_RESOURCE` to do so.
+    ///
+    /// [`IO_FLUSHER`]: https://man7.org/linux/man-pages/man2/prctl.2.html
+    pub fn set_io_flusher(&mut self, io_flusher: bool) -> &mut Self {
+        self.set_io_flusher = io_flusher;
+        self
     }
 
     /// Set the total size of the block device.
