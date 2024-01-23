@@ -1040,16 +1040,22 @@ impl<B: BlockDevice, RB: AsyncRuntimeBuilder> IoWorker<'_, B, RB> {
 
         let mut runtime = self.runtime_builder.build()?;
 
-        let refill_sqe = |sq: &mut SubmissionQueue<'_>, i: u16, result: Option<i32>| {
+        let refill_sqe = |sq: &mut SubmissionQueue<'_>,
+                          i: u16,
+                          result: Option<i32>,
+                          zone_append_lba: Option<u64>| {
             let cmd = binding::ublksrv_io_cmd {
                 q_id: self.thread_id,
                 tag: i,
                 result: result.unwrap_or(-1),
-                __bindgen_anon_1: match &io_bufs {
-                    Some(bufs) => binding::ublksrv_io_cmd__bindgen_ty_1 {
+                __bindgen_anon_1: match (&io_bufs, zone_append_lba) {
+                    (Some(bufs), _) => binding::ublksrv_io_cmd__bindgen_ty_1 {
                         addr: bufs.get(i.into()).as_ptr().cast::<u8>() as _,
                     },
-                    None => binding::ublksrv_io_cmd__bindgen_ty_1 { addr: 0 },
+                    (None, Some(zone_append_lba)) => {
+                        binding::ublksrv_io_cmd__bindgen_ty_1 { zone_append_lba }
+                    }
+                    (None, None) => binding::ublksrv_io_cmd__bindgen_ty_1 { addr: 0 },
                 },
             };
             let cmd_op = if result.is_some() {
@@ -1085,7 +1091,7 @@ impl<B: BlockDevice, RB: AsyncRuntimeBuilder> IoWorker<'_, B, RB> {
             };
             enqueue_poll_in(&mut sq, fd);
             for i in 0..self.dev_info.queue_depth() {
-                refill_sqe(&mut sq, i, None);
+                refill_sqe(&mut sq, i, None, None);
             }
         }
         io_ring.submit()?;
@@ -1141,13 +1147,14 @@ impl<B: BlockDevice, RB: AsyncRuntimeBuilder> IoWorker<'_, B, RB> {
 
                 let tag = cqe.user_data() as u16;
                 let io_ring = &*io_ring;
-                let commit_and_fetch = move |ret: i32| {
+                let commit_and_fetch = move |ret: i32, zone_append_lba: Option<u64>| {
+                    log::trace!("-> respond {ret} {zone_append_lba:?}");
                     // SAFETY: All futures are executed on the same thread, which is guarantee
                     // by no `Send` bound on parameters of `Runtime::{block_on,spawn_local}`.
                     // So there can only be one future running this block at the same time.
                     unsafe {
                         let mut sq = io_ring.submission_shared();
-                        refill_sqe(&mut sq, tag, Some(ret));
+                        refill_sqe(&mut sq, tag, Some(ret), zone_append_lba);
                     }
                     io_ring.submit().expect("failed to submit");
                 };
@@ -1190,7 +1197,7 @@ impl<B: BlockDevice, RB: AsyncRuntimeBuilder> IoWorker<'_, B, RB> {
                                 if std::thread::panicking() {
                                     log::warn!("handler panicked, returning EIO");
                                 }
-                                commit_and_fetch(ret)
+                                commit_and_fetch(ret, None)
                             });
                             let ret = $handle_expr.await.into_c_result();
                             *guard = ret;
@@ -1231,11 +1238,27 @@ impl<B: BlockDevice, RB: AsyncRuntimeBuilder> IoWorker<'_, B, RB> {
                         };
                         h.report_zones(off, buf, flags)
                     },
-                    binding::UBLK_IO_OP_ZONE_APPEND => op! {
-                        "ZONE_APPEND offset={off} len={len} flags={flags:?}";
+                    binding::UBLK_IO_OP_ZONE_APPEND => {
+                        // TODO: Ugly special case.
+                        log::trace!("ZONE_APPEND offset={off} len={len} flags={flags:?}");
                         let buf = WriteBuf(get_buf(), PhantomData);
-                        h.zone_append(off, buf, flags)
-                    },
+                        spawner.spawn(async move {
+                            let mut guard =
+                                scopeguard::guard((-Errno::IO.raw_os_error(), 0), |(ret, lba)| {
+                                    if std::thread::panicking() {
+                                        log::warn!("handler panicked, returning EIO");
+                                    }
+                                    commit_and_fetch(ret, Some(lba))
+                                });
+                            *guard = match h.zone_append(off, buf, flags).await {
+                                Ok(lba) => {
+                                    assert_eq!(lba % SECTOR_SIZE as u64, 0);
+                                    (0, lba)
+                                }
+                                Err(err) => (err.raw_os_error(), 0),
+                            };
+                        });
+                    }
                     binding::UBLK_IO_OP_ZONE_OPEN => op! {
                         "ZONE_OPEN offset={off} flags={flags:?}";
                         h.zone_open(off, flags)
@@ -1258,7 +1281,7 @@ impl<B: BlockDevice, RB: AsyncRuntimeBuilder> IoWorker<'_, B, RB> {
                     },
                     op => {
                         log::error!("unsupported op: {op}");
-                        commit_and_fetch(-Errno::IO.raw_os_error());
+                        commit_and_fetch(-Errno::IO.raw_os_error(), None);
                     }
                 }
             }
@@ -1572,7 +1595,7 @@ pub trait BlockDevice {
         _off: u64,
         _buf: WriteBuf<'_>,
         _flags: IoFlags,
-    ) -> Result<(), Errno> {
+    ) -> Result<u64, Errno> {
         Err(Errno::OPNOTSUPP)
     }
 
