@@ -76,10 +76,10 @@ struct LoopDev {
 }
 
 impl BlockDevice for LoopDev {
-    fn ready(&self, dev_info: &DeviceInfo, stop: Stopper) {
+    fn ready(&self, dev_info: &DeviceInfo, stop: Stopper) -> io::Result<()> {
         log::info!("device ready on {}", dev_info.dev_id());
-        // TODO: Make `ready` return a `Result`?
         ctrlc::set_handler(move || stop.stop()).expect("failed to set Ctrl-C hook");
+        Ok(())
     }
 
     async fn read(&self, off: u64, mut buf: ReadBuf<'_>, _flags: IoFlags) -> Result<usize, Errno> {

@@ -780,7 +780,7 @@ impl Service<'_> {
 
                 // Now device is started, and `/dev/ublkbX` appears.
                 *stop_device_guard = true;
-                handler.ready(self.dev_info(), Stopper(Arc::clone(&exit_fd)));
+                handler.ready(self.dev_info(), Stopper(Arc::clone(&exit_fd)))?;
 
                 let ret = rustix::io::retry_on_intr(|| {
                     rustix::event::poll(
@@ -1078,7 +1078,8 @@ impl<B: BlockDevice, RB: AsyncRuntimeBuilder> IoWorker<'_, B, RB> {
                         if cqe.result() < 0 {
                             return Err(io::Error::from_raw_os_error(-cqe.result()));
                         }
-                        self.handler.ready(self.dev_info, stopper);
+                        self.handler.ready(self.dev_info, stopper)?;
+
                         // SAFETY: All SQ writing is done on the same current thread.
                         // See below in `commit_and_fetch`.
                         unsafe {
@@ -1493,7 +1494,9 @@ impl IntoCResult for Result<usize, Errno> {
 // We do suppose to enforce non-`Send` `Future`s.
 #[allow(async_fn_in_trait)]
 pub trait BlockDevice {
-    fn ready(&self, dev_info: &DeviceInfo, stop: Stopper);
+    fn ready(&self, _dev_info: &DeviceInfo, _stop: Stopper) -> io::Result<()> {
+        Ok(())
+    }
 
     async fn read(&self, off: u64, buf: ReadBuf<'_>, flags: IoFlags) -> Result<usize, Errno>;
 

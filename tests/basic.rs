@@ -142,7 +142,7 @@ fn device_attrs(ctl: ControlDevice, #[case] queues: u16) {
         tested: Arc<AtomicBool>,
     }
     impl BlockDevice for Handler {
-        fn ready(&self, dev_info: &DeviceInfo, stop: Stopper) {
+        fn ready(&self, dev_info: &DeviceInfo, stop: Stopper) -> io::Result<()> {
             scopeguard::defer!(stop.stop());
 
             assert_eq!(
@@ -167,6 +167,7 @@ fn device_attrs(ctl: ControlDevice, #[case] queues: u16) {
             assert_eq!(ro.trim(), "0");
 
             self.tested.store(true, Ordering::Relaxed);
+            Ok(())
         }
 
         async fn read(
@@ -220,7 +221,7 @@ fn read_write(ctl: ControlDevice, #[case] flags: FeatureFlags, #[case] queues: u
         rng: StdRng,
     }
     impl BlockDevice for Handler {
-        fn ready(&self, dev_info: &DeviceInfo, stop: Stopper) {
+        fn ready(&self, dev_info: &DeviceInfo, stop: Stopper) -> io::Result<()> {
             let dev_info = *dev_info;
             let Handler {
                 tested,
@@ -265,6 +266,7 @@ fn read_write(ctl: ControlDevice, #[case] flags: FeatureFlags, #[case] queues: u
 
                 tested.store(true, Ordering::Relaxed);
             });
+            Ok(())
         }
 
         async fn read(
@@ -308,7 +310,7 @@ fn error(ctl: ControlDevice) {
         tested: Arc<AtomicBool>,
     }
     impl BlockDevice for Handler {
-        fn ready(&self, dev_info: &DeviceInfo, stop: Stopper) {
+        fn ready(&self, dev_info: &DeviceInfo, stop: Stopper) -> io::Result<()> {
             let dev_path = PathBuf::from(format!("{}{}", BDEV_PREFIX, dev_info.dev_id()));
             let tested = self.tested.clone();
             std::thread::spawn(move || {
@@ -330,6 +332,7 @@ fn error(ctl: ControlDevice) {
 
                 tested.store(true, Ordering::Relaxed);
             });
+            Ok(())
         }
 
         async fn read(
@@ -379,7 +382,7 @@ fn handler_panic(ctl: ControlDevice, #[case] queues: u16) {
         tested: Arc<AtomicBool>,
     }
     impl BlockDevice for Handler {
-        fn ready(&self, dev_info: &DeviceInfo, stop: Stopper) {
+        fn ready(&self, dev_info: &DeviceInfo, stop: Stopper) -> io::Result<()> {
             let dev_info = *dev_info;
             let Handler { should_ok, tested } = self.clone();
             std::thread::spawn(move || {
@@ -404,6 +407,7 @@ fn handler_panic(ctl: ControlDevice, #[case] queues: u16) {
 
                 tested.store(true, Ordering::Relaxed);
             });
+            Ok(())
         }
 
         async fn read(
@@ -454,7 +458,7 @@ fn tokio_null(ctl: ControlDevice, #[case] flags: FeatureFlags, #[case] queues: u
         tested: Arc<AtomicBool>,
     }
     impl BlockDevice for Handler {
-        fn ready(&self, dev_info: &DeviceInfo, stop: Stopper) {
+        fn ready(&self, dev_info: &DeviceInfo, stop: Stopper) -> io::Result<()> {
             let dev_info = *dev_info;
             let tested = self.tested.clone();
             std::thread::spawn(move || {
@@ -479,6 +483,7 @@ fn tokio_null(ctl: ControlDevice, #[case] flags: FeatureFlags, #[case] queues: u
 
                 tested.store(true, Ordering::Relaxed);
             });
+            Ok(())
         }
 
         async fn read(
@@ -532,7 +537,7 @@ fn discard(ctl: ControlDevice) {
         discarded: Arc<Mutex<Vec<(bool, u64, usize)>>>,
     }
     impl BlockDevice for Handler {
-        fn ready(&self, dev_info: &DeviceInfo, stop: Stopper) {
+        fn ready(&self, dev_info: &DeviceInfo, stop: Stopper) -> io::Result<()> {
             let dev_info = *dev_info;
             let Self { tested, discarded } = self.clone();
             std::thread::spawn(move || {
@@ -558,6 +563,7 @@ fn discard(ctl: ControlDevice) {
 
                 tested.store(true, Ordering::Relaxed);
             });
+            Ok(())
         }
 
         async fn read(
@@ -649,7 +655,7 @@ fn zoned(ctl: ControlDevice) {
         ops: Arc<Mutex<String>>,
     }
     impl BlockDevice for Handler {
-        fn ready(&self, dev_info: &DeviceInfo, stop: Stopper) {
+        fn ready(&self, dev_info: &DeviceInfo, stop: Stopper) -> io::Result<()> {
             let dev_info = *dev_info;
             let Self { tested, ops, .. } = self.clone();
             std::thread::spawn(move || {
@@ -702,6 +708,7 @@ fn zoned(ctl: ControlDevice) {
 
                 tested.store(true, Ordering::Relaxed);
             });
+            Ok(())
         }
 
         async fn read(
