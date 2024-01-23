@@ -21,8 +21,6 @@ use rustix::process::Pid;
 
 use crate::runtime::{AsyncRuntime, AsyncRuntimeBuilder, AsyncScopeSpawner};
 
-// TODO
-const PAGE_SIZE: u32 = 4 << 10;
 pub const SECTOR_SIZE: u32 = 512;
 
 const DEFAULT_IO_BUF_SIZE: u32 = 512 << 10;
@@ -224,6 +222,10 @@ impl ControlDevice {
         }
     }
 
+    /// Create raw ublk device.
+    ///
+    /// This is the raw method and does not have device lifecycle management.
+    /// [`DeviceBuilder::create_service`] should be preferred instead.
     pub fn create_device(&self, builder: &DeviceBuilder) -> io::Result<DeviceInfo> {
         // `-1` for auto-allocation.
         let dev_id = builder.id.unwrap_or(!0);
@@ -239,11 +241,12 @@ impl ControlDevice {
                     dev_id,
                     ublksrv_pid: pid.as_raw_nonzero().get() as _,
                     flags: builder.features.bits(),
-                    // TODO
-                    // state
-                    // ublksrv_flags
-                    // owner_uid
-                    // owner_gid
+                    state: DevState::Dead.into_raw(),
+                    // Unused.
+                    ublksrv_flags: 0,
+                    // Does not matter here and will always be set by the driver.
+                    owner_uid: 0,
+                    owner_gid: 0,
                     ..Default::default()
                 },
                 binding::ublksrv_ctrl_cmd {
@@ -479,6 +482,13 @@ impl DeviceBuilder {
         self
     }
 
+    /// Create a block device service with lifecycle management.
+    ///
+    /// This will create a ublk device in a RAII manner, so the device will be deleted when the
+    /// returned [`Service`] is dropped. Once the device is created, the per-device control file
+    /// `/dev/ublkcX` will appear to support parameters and state setting. The user block device
+    /// file `/dev/ublkbX` will still not be online before calling [`Service::serve`] or
+    /// [`Service::serve_local`].
     pub fn create_service<'ctl>(&self, ctl: &'ctl ControlDevice) -> io::Result<Service<'ctl>> {
         let dev_info = ctl.create_device(self)?;
         let dev_id = dev_info.dev_id();
@@ -543,6 +553,17 @@ pub enum DevState {
     Quiesced = binding::UBLK_S_DEV_QUIESCED as _,
     #[doc(hidden)]
     Unknown(u16),
+}
+
+impl DevState {
+    fn into_raw(self) -> u16 {
+        match self {
+            DevState::Dead => binding::UBLK_S_DEV_DEAD as _,
+            DevState::Live => binding::UBLK_S_DEV_LIVE as _,
+            DevState::Quiesced => binding::UBLK_S_DEV_QUIESCED as _,
+            DevState::Unknown(x) => x,
+        }
+    }
 }
 
 impl DeviceInfo {
@@ -706,6 +727,9 @@ impl Service<'_> {
     ///
     /// The main thread will call [`BlockDevice::ready`] once all worker are initialized and the
     /// block device `/dev/ublkbX` is created.
+    ///
+    /// When the service is signalled to exit (by [`Stopper::stop`], an error, or being stopped by
+    /// another process), it will automatically stop the device `/dev/ublkbX`.
     pub fn serve<RB, D>(
         &mut self,
         runtime_builder: RB,
@@ -809,11 +833,14 @@ impl Service<'_> {
 
     /// Start and run the service on current thread.
     ///
-    /// Similar to [`Service::run`] but the asynchronous runtime, IO-uring and request handlers are
-    /// all running on the current thread, thus they do not need to be [`Sync`].
+    /// Similar to [`Service::serve`] but the asynchronous runtime, IO-uring and request handlers
+    /// are all running on the current thread, thus they do not need to be [`Sync`].
     ///
     /// Be aware that [`BlockDevice::ready`] is also called from the current thread. Inside it,
     /// doing any I/O actions to the target block device `/dev/ublkbX` would cause a dead-lock.
+    ///
+    /// When the service is signalled to exit (by [`Stopper::stop`], an error, or being stopped by
+    /// another process), it will automatically stop the device `/dev/ublkbX`.
     ///
     /// # Panics
     ///
@@ -1254,13 +1281,14 @@ impl Default for DeviceParams {
 impl DeviceParams {
     /// Default parameters.
     pub const fn new() -> Self {
+        // The default values here are somewhat arbitrary.
         Self {
             attrs: DeviceAttrs::empty(),
             size: 0,
             logical_block_size: 512,
-            physical_block_size: PAGE_SIZE,
-            io_optimal_size: PAGE_SIZE,
-            io_min_size: PAGE_SIZE,
+            physical_block_size: 4 << 10,
+            io_optimal_size: 4 << 10,
+            io_min_size: 4 << 10,
             io_max_size: DEFAULT_IO_BUF_SIZE,
             chunk_size: 0,
             virt_boundary_mask: 0,
@@ -1372,7 +1400,6 @@ impl DeviceParams {
                     discard_granularity: p.granularity,
                     max_discard_sectors: p.max_size / SECTOR_SIZE,
                     max_write_zeroes_sectors: p.max_write_zeroes_size / SECTOR_SIZE,
-                    // TODO: What's this?
                     max_discard_segments: p.max_segments,
                     reserved0: 0,
                 }),
@@ -1394,7 +1421,7 @@ impl DeviceParams {
 ///
 /// Aka. `struct blk_zone`.
 ///
-/// See: https://elixir.bootlin.com/linux/v6.7/source/include/uapi/linux/blkzoned.h#L85
+/// See: <https://elixir.bootlin.com/linux/v6.7/source/include/uapi/linux/blkzoned.h#L85>
 #[derive(Debug, Clone, Copy)]
 #[repr(transparent)]
 pub struct Zone(binding::blk_zone);
@@ -1429,7 +1456,7 @@ impl Zone {
 /// Type of zones.
 ///
 /// Aka. `enum blk_zone_type`.
-/// See: https://elixir.bootlin.com/linux/v6.7/source/include/uapi/linux/blkzoned.h#L22
+/// See: <https://elixir.bootlin.com/linux/v6.7/source/include/uapi/linux/blkzoned.h#L22>
 #[derive(Debug, Clone, Copy)]
 #[non_exhaustive]
 #[repr(u8)]
@@ -1446,7 +1473,7 @@ pub enum ZoneType {
 /// Condition/state of a zone in a zoned device.
 ///
 /// Aka. `enum blk_zone_cond`.
-/// See: https://elixir.bootlin.com/linux/v6.7/source/include/uapi/linux/blkzoned.h#L38
+/// See: <https://elixir.bootlin.com/linux/v6.7/source/include/uapi/linux/blkzoned.h#L38>
 #[derive(Debug, Clone, Copy)]
 #[non_exhaustive]
 #[repr(u8)]
@@ -1577,12 +1604,22 @@ impl RawBuf<'_> {
 pub struct ReadBuf<'a>(RawBuf<'a>, PhantomData<*mut ()>);
 
 impl ReadBuf<'_> {
+    /// Returns the byte length requested for read, which must not be zero.
     // It must not be empty.
     #[allow(clippy::len_without_is_empty)]
     pub fn len(&self) -> usize {
         self.0.len()
     }
 
+    /// Reply `data` to fulfill the read request.
+    ///
+    /// This method will automatically select the correct way to transfer. In case of
+    /// [`FeatureFlags::UserCopy`], pwrite(2) is used; otherwise, it does an ordinary memory copy
+    /// to the kernel driver buffer.
+    ///
+    /// # Panics
+    ///
+    /// Panic if `data.len()` differs from [`Self::len()`].
     pub fn copy_from(&mut self, data: &[u8]) -> Result<(), Errno> {
         assert_eq!(data.len(), self.len());
         match &mut self.0 {
@@ -1597,19 +1634,12 @@ impl ReadBuf<'_> {
         Ok(())
     }
 
-    pub fn fill(&mut self, byte: u8) -> Result<(), Errno> {
-        match &mut self.0 {
-            RawBuf::PreCopied(b) => {
-                b.fill(byte);
-                Ok(())
-            }
-            RawBuf::UserCopy { .. } => {
-                // TODO: Avoid allocation.
-                self.copy_from(&vec![byte; self.len()])
-            }
-        }
-    }
-
+    /// Try to get the internal buffer as a mutable slice for manual filling.
+    ///
+    /// It will returns `None` if the device is created with [`FeatureFlags::UserCopy`].
+    /// Generally [`Self::copy_from`] should be preferred if applicatable.
+    ///
+    /// The returned slice (if any) will have the same length as [`Self::len()`].
     pub fn as_slice(&mut self) -> Option<&'_ mut [u8]> {
         match &mut self.0 {
             RawBuf::PreCopied(b) => Some(b),
@@ -1623,12 +1653,22 @@ impl ReadBuf<'_> {
 pub struct WriteBuf<'a>(RawBuf<'a>, PhantomData<*mut ()>);
 
 impl WriteBuf<'_> {
+    /// Returns the byte length requested for write, which must not be zero.
     // It must not be empty.
     #[allow(clippy::len_without_is_empty)]
     pub fn len(&self) -> usize {
         self.0.len()
     }
 
+    /// Copy the data to be written into `out`.
+    ///
+    /// This method will automatically select the correct way to transfer. In case of
+    /// [`FeatureFlags::UserCopy`], pread(2) is used; otherwise, it does an ordinary memory copy
+    /// from the kernel driver buffer.
+    ///
+    /// # Panics
+    ///
+    /// Panic if `out.len()` differs from [`Self::len()`].
     pub fn copy_to(&self, out: &mut [u8]) -> Result<(), Errno> {
         assert_eq!(out.len(), self.len());
         match &self.0 {
@@ -1643,6 +1683,12 @@ impl WriteBuf<'_> {
         Ok(())
     }
 
+    /// Try to get the internal buffer as a slice for manual usage.
+    ///
+    /// It will returns `None` if the device is created with [`FeatureFlags::UserCopy`].
+    /// Generally [`Self::copy_to`] should be preferred if applicatable.
+    ///
+    /// The returned slice (if any) will have the same length as [`Self::len()`].
     pub fn as_slice(&self) -> Option<&[u8]> {
         match &self.0 {
             RawBuf::PreCopied(b) => Some(b),
@@ -1661,7 +1707,7 @@ pub struct ZoneBuf<'a> {
 }
 
 impl ZoneBuf<'_> {
-    /// The number of zones requested, which must not be zero.
+    /// Returns the number of zones requested, which must not be zero.
     // It must not be empty.
     #[allow(clippy::len_without_is_empty)]
     pub fn len(&self) -> usize {
@@ -1670,7 +1716,9 @@ impl ZoneBuf<'_> {
 
     /// Return zones informations as response.
     ///
-    /// The length of `zones` must be the length requested.
+    /// # Panics
+    ///
+    /// Panic if `zones.len()` differs from [`Self::len()`].
     pub fn report(&mut self, zones: &[Zone]) -> Result<usize, Errno> {
         assert_eq!(zones.len(), self.zones as _);
         // SAFETY: `Zone` is `repr(transparent)` to `struct blk_zone`.

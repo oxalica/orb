@@ -18,6 +18,9 @@ use rustix::io::Errno;
 use xshell::{cmd, Shell};
 
 const QUEUE_DEPTH: u16 = 2;
+const MAX_READ_LEN: usize = 1 << 20; // Is there really a limit in Linux?
+
+static ZEROES: [u8; MAX_READ_LEN] = [0; MAX_READ_LEN];
 
 #[fixture]
 fn ctl() -> ControlDevice {
@@ -417,7 +420,7 @@ fn handler_panic(ctl: ControlDevice, #[case] queues: u16) {
             _flags: IoFlags,
         ) -> Result<usize, Errno> {
             if self.should_ok.load(Ordering::Relaxed) {
-                buf.fill(0)?;
+                buf.copy_from(&ZEROES[..buf.len()])?;
                 Ok(buf.len())
             } else {
                 panic!("nooo");
@@ -493,7 +496,7 @@ fn tokio_null(ctl: ControlDevice, #[case] flags: FeatureFlags, #[case] queues: u
             _flags: IoFlags,
         ) -> Result<usize, Errno> {
             tokio::time::sleep(DELAY).await;
-            buf.fill(0)?;
+            buf.copy_from(&ZEROES[..buf.len()])?;
             Ok(buf.len())
         }
 
@@ -572,7 +575,7 @@ fn discard(ctl: ControlDevice) {
             mut buf: ReadBuf<'_>,
             _flags: IoFlags,
         ) -> Result<usize, Errno> {
-            buf.fill(0)?;
+            buf.copy_from(&ZEROES[..buf.len()])?;
             Ok(buf.len())
         }
 
@@ -717,7 +720,7 @@ fn zoned(ctl: ControlDevice) {
             mut buf: ReadBuf<'_>,
             _flags: IoFlags,
         ) -> Result<usize, Errno> {
-            buf.fill(0)?;
+            buf.copy_from(&ZEROES[..buf.len()])?;
             Ok(buf.len())
         }
 
