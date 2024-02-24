@@ -1131,11 +1131,11 @@ impl<B: BlockDevice, RB: AsyncRuntimeBuilder> IoWorker<'_, B, RB> {
                         }
                         io_ring.submit()?;
                         continue;
-                    } else {
-                        // Multi-threaded worker.
-                        log::debug!("IO worker signaled to exit");
-                        return Ok(ControlFlow::Break(()));
                     }
+
+                    // Multi-threaded worker.
+                    log::debug!("IO worker signaled to exit");
+                    return Ok(ControlFlow::Break(()));
                 }
 
                 // Here it must be a FETCH request.
