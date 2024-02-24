@@ -27,3 +27,26 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1.35.1", features = ["time"] }
 xshell = "0.2.5"
+
+[lints.rust]
+missing_debug_implementations = "warn"
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+# Of course system calls can fail.
+missing-errors-doc = "allow"
+# Interop with generated constants
+cast-possible-truncation = "allow"
+cast-sign-loss = "allow"
+# Convenient for C structs.
+default-trait-access = "allow"
+# For semantics.
+items-after-statements = "allow"
+
+# TODO
+missing-panics-doc = "allow"
+cast-lossless = "allow"
+wildcard-imports = "allow"
+
+# WAIT: https://github.com/rust-lang/rust-clippy/issues/12279
+no-effect-underscore-binding = "allow"

@@ -159,7 +159,7 @@ fn main() -> anyhow::Result<()> {
         zones: Mutex::new(zones),
         metadata_path: cli.metadata_file,
     };
-    srv.serve(TokioRuntimeBuilder, &params, handler)
+    srv.serve(&TokioRuntimeBuilder, &params, &handler)
         .context("service error")?;
     Ok(())
 }
@@ -326,6 +326,7 @@ impl BlockDevice for ZonedDev {
     }
 }
 
+#[allow(clippy::needless_pass_by_value)]
 fn convert_err(err: io::Error) -> Errno {
     log::error!("{err}");
     Errno::from_io_error(&err).unwrap_or(Errno::IO)

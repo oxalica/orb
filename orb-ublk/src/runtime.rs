@@ -1,3 +1,4 @@
+#![allow(clippy::module_name_repetitions)]
 use std::future::Future;
 use std::io;
 use std::marker::PhantomData;
@@ -139,6 +140,7 @@ mod tokio_support {
 
     // Workaround: This is bounded by `'env` rather than `'scope`, so it's not possible to place a
     // `&'scope LocalSet` inside. We go through global `spawn_local` instead.
+    #[derive(Debug)]
     pub struct Spawner<'env>(PhantomData<&'env mut &'env ()>);
 
     impl<'env> AsyncScopeSpawner<'env> for Spawner<'env> {

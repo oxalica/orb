@@ -43,6 +43,7 @@ fn retry_on_perm<T>(mut f: impl FnMut() -> io::Result<T>) -> io::Result<T> {
     }
 }
 
+#[allow(clippy::needless_pass_by_value)]
 fn test_service<B: BlockDevice + Sync>(
     ctl: &ControlDevice,
     flags: FeatureFlags,
@@ -61,10 +62,10 @@ fn test_service<B: BlockDevice + Sync>(
         .unwrap();
     let tested = Arc::new(AtomicBool::new(false));
     if queues == 1 {
-        srv.serve_local(rt_builder, params, &handler(tested.clone()))
+        srv.serve_local(&rt_builder, params, &handler(tested.clone()))
             .unwrap();
     } else {
-        srv.serve(rt_builder, params, handler(tested.clone()))
+        srv.serve(&rt_builder, params, &handler(tested.clone()))
             .unwrap();
     }
     assert!(tested.load(Ordering::Relaxed));
@@ -72,9 +73,7 @@ fn test_service<B: BlockDevice + Sync>(
 
 fn wait_blockdev_ready(info: &DeviceInfo) -> io::Result<String> {
     let path = format!("{}{}", BDEV_PREFIX, info.dev_id());
-    retry_on_perm(|| {
-        rustix::fs::access(&path, rustix::fs::Access::WRITE_OK).map_err(|e| e.into())
-    })?;
+    retry_on_perm(|| rustix::fs::access(&path, rustix::fs::Access::WRITE_OK).map_err(Into::into))?;
     Ok(path)
 }
 

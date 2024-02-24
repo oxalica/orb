@@ -1,4 +1,3 @@
-#![warn(missing_debug_implementations)]
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::fs::File;
 use std::marker::PhantomData;
@@ -28,7 +27,7 @@ const DEFAULT_IO_BUF_SIZE: u32 = 512 << 10;
 pub const CDEV_PREFIX: &str = "/dev/ublkc";
 pub const BDEV_PREFIX: &str = "/dev/ublkb";
 
-#[allow(non_camel_case_types, non_snake_case, unused)]
+#[allow(warnings)]
 mod binding {
     include!(concat!(env!("OUT_DIR"), "/ublk_cmd.rs"));
 }
@@ -162,7 +161,7 @@ impl ControlDevice {
         mut buf: T,
         mut cmd: binding::ublksrv_ctrl_cmd,
     ) -> io::Result<T> {
-        cmd.addr = &mut buf as *mut T as _;
+        cmd.addr = ptr::addr_of_mut!(buf) as _;
         cmd.len = mem::size_of::<T>() as _;
 
         let mut cmd_buf = CtrlCmdBuf { cmd: [0; 80] };
@@ -400,6 +399,7 @@ impl Default for DeviceBuilder {
 }
 
 impl DeviceBuilder {
+    #[must_use]
     pub fn new() -> Self {
         Self {
             name: String::new(),
@@ -418,24 +418,36 @@ impl DeviceBuilder {
         self
     }
 
+    /// # Panics
+    ///
+    /// Panic if `id` is `u32::MAX` which coresponds to automatic id (which is the default).
     pub fn id(&mut self, id: u32) -> &mut Self {
         assert_ne!(id, !0);
         self.id = Some(id);
         self
     }
 
+    /// # Panics
+    ///
+    /// Panic if `nr_hw_queues` is zero or exceeds `UBLK_QID_BITS` bits, which is `1 << 12 = 4096`.
     pub fn queues(&mut self, nr_hw_queues: u16) -> &mut Self {
         assert!((1..=(1 << binding::UBLK_QID_BITS)).contains(&nr_hw_queues));
         self.nr_hw_queues = nr_hw_queues;
         self
     }
 
+    /// # Panics
+    ///
+    /// Panic if `queue_depth` is zero or exceeds `UBLK_MAX_QUEUE_DEPTH` which is 4096.
     pub fn queue_depth(&mut self, queue_depth: u16) -> &mut Self {
         assert!((1..=binding::UBLK_MAX_QUEUE_DEPTH as u16).contains(&queue_depth));
         self.queue_depth = queue_depth;
         self
     }
 
+    /// # Panics
+    ///
+    /// Panic if `bytes` exceeds `UBLK_IO_BUF_BITS` bits, which is `1 << 25` bytes or 32MiB.
     pub fn io_buf_size(&mut self, bytes: u32) -> &mut Self {
         assert!((1..=(1 << binding::UBLK_IO_BUF_BITS)).contains(&bytes));
         self.io_buf_bytes = bytes;
@@ -567,16 +579,19 @@ impl DevState {
 }
 
 impl DeviceInfo {
+    #[must_use]
     pub fn dev_id(&self) -> u32 {
         self.0.dev_id
     }
 
+    #[must_use]
     pub fn queue_depth(&self) -> u16 {
         self.0.queue_depth
     }
 
+    #[must_use]
     pub fn state(&self) -> DevState {
-        match self.0.state as u32 {
+        match self.0.state.into() {
             binding::UBLK_S_DEV_DEAD => DevState::Dead,
             binding::UBLK_S_DEV_LIVE => DevState::Live,
             binding::UBLK_S_DEV_QUIESCED => DevState::Quiesced,
@@ -584,14 +599,17 @@ impl DeviceInfo {
         }
     }
 
+    #[must_use]
     pub fn nr_queues(&self) -> u16 {
         self.0.nr_hw_queues
     }
 
+    #[must_use]
     pub fn io_buf_size(&self) -> usize {
-        self.0.max_io_buf_bytes.try_into().unwrap()
+        self.0.max_io_buf_bytes as _
     }
 
+    #[must_use]
     pub fn flags(&self) -> FeatureFlags {
         FeatureFlags::from_bits_truncate(self.0.flags)
     }
@@ -694,6 +712,7 @@ impl Service<'_> {
         .union(FeatureFlags::UserCopy)
         .union(FeatureFlags::Zoned);
 
+    #[must_use]
     pub fn dev_info(&self) -> &DeviceInfo {
         &self.dev_info
     }
@@ -730,11 +749,15 @@ impl Service<'_> {
     ///
     /// When the service is signalled to exit (by [`Stopper::stop`], an error, or being stopped by
     /// another process), it will automatically stop the device `/dev/ublkbX`.
+    ///
+    /// # Panics
+    ///
+    /// Panic if the device parameters are invalid.
     pub fn serve<RB, D>(
         &mut self,
-        runtime_builder: RB,
+        runtime_builder: &RB,
         params: &DeviceParams,
-        handler: D,
+        handler: &D,
     ) -> io::Result<()>
     where
         RB: AsyncRuntimeBuilder + Sync,
@@ -776,15 +799,15 @@ impl Service<'_> {
             // during force join.
             let thread_stop_guard = SignalStopOnDrop(exit_fd.as_fd());
 
-            let handles = (0..nr_queues)
+            let threads = (0..nr_queues)
                 .map(|thread_id| {
                     let mut worker = IoWorker {
                         thread_id,
                         ready_tx: Some(ready_tx.clone().clone()),
                         cdev: self.cdev.as_fd(),
                         dev_info: &self.dev_info,
-                        handler: &handler,
-                        runtime_builder: &runtime_builder,
+                        handler,
+                        runtime_builder,
                         set_io_flusher: params.set_io_flusher,
                         wait_device_start: None,
                         stop_guard: thread_stop_guard.clone(),
@@ -817,7 +840,7 @@ impl Service<'_> {
             }
 
             // Collect panics and errors.
-            for (thread_id, h) in handles.into_iter().enumerate() {
+            for (thread_id, h) in threads.into_iter().enumerate() {
                 match h.join() {
                     Ok(Ok(())) => {}
                     // Device deleted by other thread or process. Treat it as a graceful shutdown.
@@ -848,7 +871,7 @@ impl Service<'_> {
     /// Panic if the number of [`queues`](DeviceBuilder::queues) of this device is not one.
     pub fn serve_local<RB, D>(
         &mut self,
-        runtime_builder: RB,
+        runtime_builder: &RB,
         params: &DeviceParams,
         handler: &D,
     ) -> io::Result<()>
@@ -879,7 +902,7 @@ impl Service<'_> {
             cdev: self.cdev.as_fd(),
             dev_info: &self.dev_info,
             handler,
-            runtime_builder: &runtime_builder,
+            runtime_builder,
             set_io_flusher: params.set_io_flusher,
             wait_device_start: Some((&self.ctl.uring, stopper)),
             stop_guard: SignalStopOnDrop(exit_fd.as_fd()),
@@ -998,6 +1021,9 @@ struct IoWorker<'a, B, RB> {
 }
 
 impl<B: BlockDevice, RB: AsyncRuntimeBuilder> IoWorker<'_, B, RB> {
+    // FIXME: Break this up?
+    #[allow(clippy::too_many_lines)]
+    #[allow(clippy::items_after_statements)]
     fn run(&mut self) -> io::Result<()> {
         let _reset_io_flusher_guard = self
             .set_io_flusher
@@ -1024,7 +1050,7 @@ impl<B: BlockDevice, RB: AsyncRuntimeBuilder> IoWorker<'_, B, RB> {
         });
 
         // Plus `PollAdd` for stop guard xor ready hook.
-        let ring_size = (self.dev_info.queue_depth() as u32 + 1)
+        let ring_size = (u32::from(self.dev_info.queue_depth()) + 1)
             .checked_next_power_of_two()
             .unwrap();
         // NB. Ensure all inflight ops are cancelled before dropping the buffer defined above,
@@ -1162,14 +1188,14 @@ impl<B: BlockDevice, RB: AsyncRuntimeBuilder> IoWorker<'_, B, RB> {
                 let iod = shm.get(tag);
                 let flags = IoFlags::from_bits_truncate(iod.op_flags);
                 // These fields may contain garbage for ops without them.
-                let off = iod.start_sector.wrapping_mul(SECTOR_SIZE as u64);
+                let off = iod.start_sector.wrapping_mul(SECTOR_SIZE.into());
                 // The 2 variants both have type `u32`.
                 let zones = unsafe { iod.__bindgen_anon_1.nr_zones };
                 let len = unsafe { iod.__bindgen_anon_1.nr_sectors as usize }
                     .wrapping_mul(SECTOR_SIZE as usize);
-                let pwrite_off = binding::UBLKSRV_IO_BUF_OFFSET as u64
-                    + ((self.thread_id as u64) << binding::UBLK_QID_OFF)
-                    + ((tag as u64) << binding::UBLK_TAG_OFF);
+                let pwrite_off = u64::from(binding::UBLKSRV_IO_BUF_OFFSET)
+                    + (u64::from(self.thread_id) << binding::UBLK_QID_OFF)
+                    + (u64::from(tag) << binding::UBLK_TAG_OFF);
                 let get_buf = || {
                     match &io_bufs {
                         // SAFETY: This buffer is exclusive for task of `tag`.
@@ -1248,11 +1274,11 @@ impl<B: BlockDevice, RB: AsyncRuntimeBuilder> IoWorker<'_, B, RB> {
                                     if std::thread::panicking() {
                                         log::warn!("handler panicked, returning EIO");
                                     }
-                                    commit_and_fetch(ret, Some(lba))
+                                    commit_and_fetch(ret, Some(lba));
                                 });
                             *guard = match h.zone_append(off, buf, flags).await {
                                 Ok(lba) => {
-                                    assert_eq!(lba % SECTOR_SIZE as u64, 0);
+                                    assert_eq!(lba % u64::from(SECTOR_SIZE), 0);
                                     (0, lba)
                                 }
                                 Err(err) => (err.raw_os_error(), 0),
@@ -1315,6 +1341,7 @@ impl Default for DeviceParams {
 
 impl DeviceParams {
     /// Default parameters.
+    #[must_use]
     pub const fn new() -> Self {
         // The default values here are somewhat arbitrary.
         Self {
@@ -1333,10 +1360,10 @@ impl DeviceParams {
         }
     }
 
-    /// Set the worker threads in `IO_FLUSHER` state.
+    /// Set the worker threads in [`IO_FLUSHER`] state.
     ///
-    /// > This will put the process in the IO_FLUSHER state, which allows it special treatment to
-    /// > make progress when allocating memory.
+    /// > This will put the process in the [`IO_FLUSHER`] state, which allows it special treatment
+    /// > to make progress when allocating memory.
     ///
     /// It requires `CAP_SYS_RESOURCE` to do so.
     ///
@@ -1387,8 +1414,10 @@ impl DeviceParams {
         self
     }
 
+    /// # Panics
+    ///
+    /// Panic if `params` is invalid, eg. `max_zone_append_size` is 0.
     pub fn discard(&mut self, params: DiscardParams) -> &mut Self {
-        assert_ne!(params.granularity, 0);
         assert_eq!(params.max_size % SECTOR_SIZE, 0);
         assert_eq!(params.max_write_zeroes_size % SECTOR_SIZE, 0);
         self.discard = Some(params);
@@ -1438,7 +1467,7 @@ impl DeviceParams {
                 io_opt_shift: self.io_optimal_size.trailing_zeros() as _,
                 io_min_shift: self.io_min_size.trailing_zeros() as _,
                 max_sectors: self.io_max_size / SECTOR_SIZE,
-                dev_sectors: self.size / SECTOR_SIZE as u64,
+                dev_sectors: self.size / u64::from(SECTOR_SIZE),
                 chunk_sectors: self.chunk_size / SECTOR_SIZE,
                 virt_boundary_mask: self.virt_boundary_mask,
             },
@@ -1476,6 +1505,7 @@ impl DeviceParams {
 pub struct Zone(binding::blk_zone);
 
 impl Zone {
+    #[must_use]
     pub fn new(
         start_bytes: u64,
         len_bytes: u64,
@@ -1569,6 +1599,8 @@ impl IntoCResult for Result<usize, Errno> {
 
 // We do suppose to enforce non-`Send` `Future`s.
 #[allow(async_fn_in_trait)]
+// They are indeed async fns.
+#[allow(clippy::unused_async)]
 pub trait BlockDevice {
     fn ready(&self, _dev_info: &DeviceInfo, _stop: Stopper) -> io::Result<()> {
         Ok(())
@@ -1656,6 +1688,7 @@ impl ReadBuf<'_> {
     /// Returns the byte length requested for read, which must not be zero.
     // It must not be empty.
     #[allow(clippy::len_without_is_empty)]
+    #[must_use]
     pub fn len(&self) -> usize {
         self.0.len()
     }
@@ -1705,6 +1738,7 @@ impl WriteBuf<'_> {
     /// Returns the byte length requested for write, which must not be zero.
     // It must not be empty.
     #[allow(clippy::len_without_is_empty)]
+    #[must_use]
     pub fn len(&self) -> usize {
         self.0.len()
     }
@@ -1738,6 +1772,7 @@ impl WriteBuf<'_> {
     /// Generally [`Self::copy_to`] should be preferred if applicatable.
     ///
     /// The returned slice (if any) will have the same length as [`Self::len()`].
+    #[must_use]
     pub fn as_slice(&self) -> Option<&[u8]> {
         match &self.0 {
             RawBuf::PreCopied(b) => Some(b),
@@ -1752,12 +1787,14 @@ pub struct ZoneBuf<'a> {
     cdev: BorrowedFd<'a>,
     off: u64,
     zones: u32,
+    #[allow(clippy::mut_mut)]
     _not_send_invariant: PhantomData<(*mut (), &'a mut &'a mut ())>,
 }
 
 impl ZoneBuf<'_> {
     /// Returns the number of zones requested, which must not be zero.
     // It must not be empty.
+    #[must_use]
     #[allow(clippy::len_without_is_empty)]
     pub fn len(&self) -> usize {
         self.zones as _

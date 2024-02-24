@@ -71,7 +71,7 @@ fn main() -> anyhow::Result<()> {
         });
     }
     let handler = LoopDev { file };
-    srv.serve(TokioRuntimeBuilder, &params, handler)
+    srv.serve(&TokioRuntimeBuilder, &params, &handler)
         .context("service error")?;
     Ok(())
 }
@@ -114,6 +114,7 @@ impl BlockDevice for LoopDev {
     }
 }
 
+#[allow(clippy::needless_pass_by_value)]
 fn convert_err(err: io::Error) -> Errno {
     Errno::from_io_error(&err).unwrap_or(Errno::IO)
 }
