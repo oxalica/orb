@@ -3,12 +3,12 @@ use std::io;
 use std::os::unix::fs::FileExt;
 use std::path::PathBuf;
 
-use anyhow::{ensure, Context};
+use anyhow::Context;
 use clap::Parser;
 use orb_ublk::runtime::TokioRuntimeBuilder;
 use orb_ublk::{
     BlockDevice, ControlDevice, DeviceAttrs, DeviceBuilder, DeviceInfo, DeviceParams,
-    DiscardParams, IoFlags, ReadBuf, Stopper, WriteBuf, SECTOR_SIZE,
+    DiscardParams, IoFlags, ReadBuf, Sector, Stopper, WriteBuf,
 };
 use rustix::fs::{fallocate, FallocateFlags};
 use rustix::io::Errno;
@@ -39,10 +39,8 @@ fn main() -> anyhow::Result<()> {
         .metadata()
         .context("failed to query backing file")?
         .len();
-    ensure!(
-        size % SECTOR_SIZE as u64 == 0,
-        "backing file size must be multiples of {SECTOR_SIZE}"
-    );
+    let size_sectors =
+        Sector::try_from_bytes(size).context("backing file size must be multiples of sectors")?;
 
     let ctl = ControlDevice::open()
         .context("failed to open control device, kernel module 'ublk_drv' not loaded?")?;
@@ -58,15 +56,15 @@ fn main() -> anyhow::Result<()> {
         .create_service(&ctl)
         .context("failed to create ublk device")?;
     let mut params = *DeviceParams::new()
-        .size(size)
+        .dev_sectors(size_sectors)
         .attrs(DeviceAttrs::VolatileCache)
         .set_io_flusher(cli.privileged);
     if cli.discard {
         params.discard(DiscardParams {
-            alignment: SECTOR_SIZE,
-            granularity: SECTOR_SIZE,
-            max_size: 1 << 30,
-            max_write_zeroes_size: 1 << 30,
+            alignment: Sector::SIZE as _,
+            granularity: Sector::SIZE as _,
+            max_size: Sector(1 << 30),
+            max_write_zeroes_size: Sector(1 << 30),
             max_segments: 1,
         });
     }

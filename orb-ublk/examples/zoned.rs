@@ -10,7 +10,7 @@ use clap::Parser;
 use orb_ublk::runtime::TokioRuntimeBuilder;
 use orb_ublk::{
     BlockDevice, ControlDevice, DeviceAttrs, DeviceBuilder, DeviceInfo, DeviceParams, IoFlags,
-    ReadBuf, Stopper, WriteBuf, Zone, ZoneBuf, ZoneCond, ZoneType, ZonedParams, SECTOR_SIZE,
+    ReadBuf, Sector, Stopper, WriteBuf, Zone, ZoneBuf, ZoneCond, ZoneType, ZonedParams,
 };
 use rustix::io::Errno;
 use serde::{Deserialize, Serialize};
@@ -95,16 +95,15 @@ fn main() -> anyhow::Result<()> {
         .metadata()
         .context("failed to query backing file")?
         .len();
-    ensure!(
-        size % SECTOR_SIZE as u64 == 0,
-        "backing file size must be multiples of {SECTOR_SIZE}"
-    );
     let zone_size = cli.zone_size.0;
+    let zone_sectors =
+        Sector::try_from_bytes(zone_size).context("zone size mut be multiple of sectors")?;
     ensure!(
-        size % zone_size == 0,
-        "device size is not multiples of zone size"
+        size % zone_sectors.bytes() == 0,
+        "device size must be multiples of zone size"
     );
-    let zones_cnt = size / zone_size;
+    let size_sectors = Sector::try_from_bytes(size).unwrap();
+    let zones_cnt = size / zone_sectors.bytes();
 
     let zones = cli
         .metadata_file
@@ -144,14 +143,14 @@ fn main() -> anyhow::Result<()> {
         .create_service(&ctl)
         .context("failed to create ublk device")?;
     let params = *DeviceParams::new()
-        .size(size)
-        .chunk_size(zone_size.try_into().unwrap())
+        .dev_sectors(size_sectors)
+        .chunk_sectors(zone_sectors)
         .attrs(DeviceAttrs::VolatileCache)
         .set_io_flusher(cli.privileged)
         .zoned(ZonedParams {
             max_open_zones: cli.max_open_zones,
             max_active_zones: cli.max_active_zones,
-            max_zone_append_size: cli.max_zone_append_size.0.try_into().unwrap(),
+            max_zone_append_size: Sector::try_from_bytes(cli.max_zone_append_size.0).unwrap(),
         });
     let handler = ZonedDev {
         file: backing_file,
@@ -285,9 +284,9 @@ impl BlockDevice for ZonedDev {
             .zip(zid..)
             .map(|(z, zid)| {
                 Zone::new(
-                    zid * self.zone_size,
-                    self.zone_size,
-                    z.rel_wptr,
+                    Sector::from_bytes(zid * self.zone_size),
+                    Sector::from_bytes(self.zone_size),
+                    Sector::from_bytes(z.rel_wptr),
                     ZoneType::SeqWriteReq,
                     z.cond,
                 )

@@ -8,8 +8,8 @@ use std::time::{Duration, Instant};
 use orb_ublk::runtime::{AsyncRuntimeBuilder, SyncRuntimeBuilder, TokioRuntimeBuilder};
 use orb_ublk::{
     BlockDevice, ControlDevice, DevState, DeviceAttrs, DeviceBuilder, DeviceInfo, DeviceParams,
-    DiscardParams, FeatureFlags, IoFlags, ReadBuf, Stopper, WriteBuf, Zone, ZoneBuf, ZoneCond,
-    ZoneType, ZonedParams, BDEV_PREFIX, SECTOR_SIZE,
+    DiscardParams, FeatureFlags, IoFlags, ReadBuf, Sector, Stopper, WriteBuf, Zone, ZoneBuf,
+    ZoneCond, ZoneType, ZonedParams, BDEV_PREFIX,
 };
 use rand::rngs::StdRng;
 use rand::{Rng, RngCore, SeedableRng};
@@ -126,9 +126,9 @@ fn create_info_delete(ctl: ControlDevice) {
 #[case::local(1)]
 #[case::threaded(1)]
 fn device_attrs(ctl: ControlDevice, #[case] queues: u16) {
-    const SIZE: u64 = 42 << 10;
+    const DEV_SECTORS: Sector = Sector::from_bytes(42 << 10);
     let params = *DeviceParams::new()
-        .size(SIZE)
+        .dev_sectors(DEV_SECTORS)
         .attrs(DeviceAttrs::Rotational);
 
     test_service(
@@ -157,12 +157,12 @@ fn device_attrs(ctl: ControlDevice, #[case] queues: u16) {
             );
 
             let dev_sys_path = PathBuf::from(format!("/sys/block/ublkb{}", dev_info.dev_id()));
-            let size = fs::read_to_string(dev_sys_path.join("size"))
+            let size_sec = fs::read_to_string(dev_sys_path.join("size"))
                 .unwrap()
                 .trim()
                 .parse::<u64>()
                 .unwrap();
-            assert_eq!(size * SECTOR_SIZE as u64, SIZE);
+            assert_eq!(Sector(size_sec), DEV_SECTORS);
             let rotational = fs::read_to_string(dev_sys_path.join("queue/rotational")).unwrap();
             assert_eq!(rotational.trim(), "1");
             let ro = fs::read_to_string(dev_sys_path.join("ro")).unwrap();
@@ -198,12 +198,12 @@ fn device_attrs(ctl: ControlDevice, #[case] queues: u16) {
 #[case::user_copy_local(FeatureFlags::UserCopy, 1)]
 #[case::user_copy_threaded(FeatureFlags::UserCopy, 2)]
 fn read_write(ctl: ControlDevice, #[case] flags: FeatureFlags, #[case] queues: u16) {
-    const SIZE: u64 = 32 << 10;
+    const SIZE_SECTORS: Sector = Sector::from_bytes(32 << 10);
     const TEST_WRITE_ROUNDS: usize = 32;
     const SEED: u64 = 0xDEAD_BEEF_DEAD_BEEF;
 
     let mut rng = StdRng::seed_from_u64(SEED);
-    let mut data = vec![0u8; SIZE as usize];
+    let mut data = vec![0u8; SIZE_SECTORS.bytes() as usize];
     rng.fill_bytes(&mut data);
     let data = Arc::new(Mutex::new(data));
 
@@ -211,7 +211,7 @@ fn read_write(ctl: ControlDevice, #[case] flags: FeatureFlags, #[case] queues: u
         &ctl,
         flags,
         queues,
-        DeviceParams::new().size(SIZE),
+        DeviceParams::new().dev_sectors(SIZE_SECTORS),
         SyncRuntimeBuilder,
         |tested| Handler { tested, data, rng },
     );
@@ -239,13 +239,13 @@ fn read_write(ctl: ControlDevice, #[case] flags: FeatureFlags, #[case] queues: u
                 let sh = Shell::new().unwrap();
                 let mut state = cmd!(sh, "cat {dev_path}").output().unwrap().stdout;
                 // The initial data should match.
-                assert_eq!(state.len(), SIZE as usize);
+                assert_eq!(state.len() as u64, SIZE_SECTORS.bytes());
                 assert_eq!(state, *data.lock().unwrap());
 
-                let mut buf = [0u8; SECTOR_SIZE as usize];
+                let mut buf = [0u8; Sector::SIZE as usize];
                 for _ in 0..TEST_WRITE_ROUNDS {
                     // Write a random block at random sector.
-                    let sector_offset = rng.gen_range(0..(SIZE / SECTOR_SIZE as u64));
+                    let sector_offset = rng.gen_range(0..SIZE_SECTORS.0);
                     rng.fill_bytes(&mut buf);
                     let sector_offset_s = sector_offset.to_string();
                     cmd!(
@@ -256,8 +256,8 @@ fn read_write(ctl: ControlDevice, #[case] flags: FeatureFlags, #[case] queues: u
                     .stdin(buf)
                     .run()
                     .unwrap();
-                    let offset = sector_offset * SECTOR_SIZE as u64;
-                    state[offset as usize..][..SECTOR_SIZE as usize].copy_from_slice(&buf);
+                    let offset = sector_offset * Sector::SIZE as u64;
+                    state[offset as usize..][..Sector::SIZE as usize].copy_from_slice(&buf);
 
                     // Retrieve all data, and they should match.
                     let got = cmd!(sh, "cat {dev_path}").output().unwrap().stdout;
@@ -297,13 +297,13 @@ fn read_write(ctl: ControlDevice, #[case] flags: FeatureFlags, #[case] queues: u
 #[rstest]
 #[ignore = "spam dmesg"]
 fn error(ctl: ControlDevice) {
-    const SIZE: u64 = 4 << 10;
+    const SIZE_SECTORS: Sector = Sector::from_bytes(4 << 10);
 
     test_service(
         &ctl,
         FeatureFlags::empty(),
         1,
-        DeviceParams::new().size(SIZE),
+        DeviceParams::new().dev_sectors(SIZE_SECTORS),
         SyncRuntimeBuilder,
         |tested| Handler { tested },
     );
@@ -363,14 +363,14 @@ fn error(ctl: ControlDevice) {
 #[ignore = "spam dmesg"]
 #[case::threaded(1)]
 fn handler_panic(ctl: ControlDevice, #[case] queues: u16) {
-    const SIZE: u64 = SECTOR_SIZE as _;
+    const SIZE_SECTORS: Sector = Sector(1);
     const TEST_ROUNDS: u16 = QUEUE_DEPTH * 2;
 
     test_service(
         &ctl,
         FeatureFlags::empty(),
         queues,
-        DeviceParams::new().size(SIZE),
+        DeviceParams::new().dev_sectors(SIZE_SECTORS),
         TokioRuntimeBuilder,
         |tested| Handler {
             should_ok: Default::default(),
@@ -404,7 +404,7 @@ fn handler_panic(ctl: ControlDevice, #[case] queues: u16) {
                 should_ok.store(true, Ordering::Relaxed);
                 for _ in 0..TEST_ROUNDS {
                     let ret = cmd!(sh, "cat {dev_path}").ignore_stderr().read().unwrap();
-                    assert_eq!(ret.as_bytes(), [0u8; SECTOR_SIZE as _]);
+                    assert_eq!(ret.as_bytes(), [0u8; Sector::SIZE as _]);
                 }
 
                 tested.store(true, Ordering::Relaxed);
@@ -443,7 +443,7 @@ fn handler_panic(ctl: ControlDevice, #[case] queues: u16) {
 #[case::user_copy_local(FeatureFlags::UserCopy, 1)]
 #[case::user_copy_threaded(FeatureFlags::UserCopy, 2)]
 fn tokio_null(ctl: ControlDevice, #[case] flags: FeatureFlags, #[case] queues: u16) {
-    const SIZE: u64 = 4 << 10;
+    const SIZE_SECTORS: Sector = Sector::from_bytes(4 << 10);
     const DELAY: Duration = Duration::from_millis(500);
     const TOLERANCE: Duration = Duration::from_millis(50);
 
@@ -451,7 +451,7 @@ fn tokio_null(ctl: ControlDevice, #[case] flags: FeatureFlags, #[case] queues: u
         &ctl,
         flags,
         queues,
-        DeviceParams::new().size(SIZE),
+        DeviceParams::new().dev_sectors(SIZE_SECTORS),
         TokioRuntimeBuilder,
         |tested| Handler { tested },
     );
@@ -477,7 +477,7 @@ fn tokio_null(ctl: ControlDevice, #[case] flags: FeatureFlags, #[case] queues: u
                     .unwrap()
                     .stdout;
                 let elapsed = inst.elapsed();
-                assert_eq!(out, [0u8; SECTOR_SIZE as _]);
+                assert_eq!(out, [0u8; Sector::SIZE as _]);
                 assert!(
                     DELAY - TOLERANCE <= elapsed && elapsed <= DELAY + TOLERANCE,
                     "unexpected delay: {elapsed:?}",
@@ -512,20 +512,22 @@ fn tokio_null(ctl: ControlDevice, #[case] flags: FeatureFlags, #[case] queues: u
 
 #[rstest]
 fn discard(ctl: ControlDevice) {
-    const SIZE: u64 = 4 << 10;
+    const SIZE_SECTORS: Sector = Sector::from_bytes(4 << 10);
     const GRANULARITY: u32 = 1 << 10;
 
     test_service(
         &ctl,
         FeatureFlags::empty(),
         1,
-        DeviceParams::new().size(SIZE).discard(DiscardParams {
-            alignment: GRANULARITY,
-            granularity: GRANULARITY,
-            max_size: SIZE as _,
-            max_write_zeroes_size: SIZE as _,
-            max_segments: 1,
-        }),
+        DeviceParams::new()
+            .dev_sectors(SIZE_SECTORS)
+            .discard(DiscardParams {
+                alignment: GRANULARITY,
+                granularity: GRANULARITY,
+                max_size: SIZE_SECTORS as _,
+                max_write_zeroes_size: SIZE_SECTORS as _,
+                max_segments: 1,
+            }),
         SyncRuntimeBuilder,
         |tested| Handler {
             tested,
@@ -550,9 +552,9 @@ fn discard(ctl: ControlDevice) {
                 let take_discarded = || std::mem::take(&mut *discarded.lock().unwrap());
 
                 cmd!(sh, "blkdiscard {dev_path}").run().unwrap();
-                assert_eq!(take_discarded(), [(false, 0, SIZE as _)]);
+                assert_eq!(take_discarded(), [(false, 0, SIZE_SECTORS.bytes() as _)]);
                 cmd!(sh, "blkdiscard --zeroout {dev_path}").run().unwrap();
-                assert_eq!(take_discarded(), [(true, 0, SIZE as _)]);
+                assert_eq!(take_discarded(), [(true, 0, SIZE_SECTORS.bytes() as _)]);
 
                 cmd!(sh, "blkdiscard -o 1024 -l 2048 {dev_path}")
                     .run()
@@ -601,28 +603,28 @@ fn discard(ctl: ControlDevice) {
 
 #[rstest]
 fn zoned(ctl: ControlDevice) {
-    const SIZE: u64 = 4 << 10;
-    const ZONE_SIZE: u32 = 1 << 10;
-    const ZONES: u64 = SIZE / ZONE_SIZE as u64;
+    const SIZE_SECTORS: Sector = Sector::from_bytes(4 << 10);
+    const ZONE_SECTORS: Sector = Sector::from_bytes(1 << 10);
+    const ZONES: u64 = SIZE_SECTORS.0 / ZONE_SECTORS.0;
     const MAX_OPEN_ZONES: u32 = ZONES as u32;
     const MAX_ACTIVE_ZONES: u32 = ZONES as u32;
-    const MAX_ZONE_APPEND_SIZE: u32 = 1 << 10;
+    const MAX_ZONE_APPEND_SECTORS: Sector = Sector::from_bytes(1 << 10);
 
     let zones = (0..ZONES)
         .map(|i| {
             if i < 2 {
                 Zone::new(
-                    i * ZONE_SIZE as u64,
-                    ZONE_SIZE as u64,
-                    0,
+                    ZONE_SECTORS * i,
+                    ZONE_SECTORS,
+                    Sector(0),
                     ZoneType::Conventional,
                     ZoneCond::NotWp,
                 )
             } else {
                 Zone::new(
-                    i * ZONE_SIZE as u64,
-                    ZONE_SIZE as u64,
-                    i * SECTOR_SIZE as u64,
+                    ZONE_SECTORS * i,
+                    ZONE_SECTORS,
+                    Sector(i),
                     ZoneType::SeqWriteReq,
                     ZoneCond::Empty,
                 )
@@ -635,12 +637,12 @@ fn zoned(ctl: ControlDevice) {
         FeatureFlags::Zoned | FeatureFlags::UserCopy,
         1,
         DeviceParams::new()
-            .size(SIZE)
-            .chunk_size(ZONE_SIZE)
+            .dev_sectors(SIZE_SECTORS)
+            .chunk_sectors(ZONE_SECTORS)
             .zoned(ZonedParams {
                 max_open_zones: MAX_OPEN_ZONES,
                 max_active_zones: MAX_ACTIVE_ZONES,
-                max_zone_append_size: MAX_ZONE_APPEND_SIZE,
+                max_zone_append_size: MAX_ZONE_APPEND_SECTORS,
             }),
         SyncRuntimeBuilder,
         |tested| Handler {
@@ -672,14 +674,17 @@ fn zoned(ctl: ControlDevice) {
                         .trim()
                         .to_owned()
                 };
-                let opt_u32 = |subpath: &str| opt_str(subpath).parse::<u32>().unwrap();
+                let opt_u64 = |subpath: &str| opt_str(subpath).parse::<u64>().unwrap();
 
                 assert_eq!(opt_str("zoned"), "host-managed");
-                assert_eq!(opt_u32("chunk_sectors"), ZONE_SIZE / SECTOR_SIZE);
-                assert_eq!(opt_u32("nr_zones"), SIZE as u32 / ZONE_SIZE);
-                assert_eq!(opt_u32("zone_append_max_bytes"), MAX_ZONE_APPEND_SIZE);
-                assert_eq!(opt_u32("max_open_zones"), MAX_OPEN_ZONES);
-                assert_eq!(opt_u32("max_active_zones"), MAX_ACTIVE_ZONES);
+                assert_eq!(opt_u64("chunk_sectors"), ZONE_SECTORS.0);
+                assert_eq!(opt_u64("nr_zones"), SIZE_SECTORS / ZONE_SECTORS);
+                assert_eq!(
+                    opt_u64("zone_append_max_bytes"),
+                    MAX_ZONE_APPEND_SECTORS.bytes()
+                );
+                assert_eq!(opt_u64("max_open_zones"), MAX_OPEN_ZONES as _);
+                assert_eq!(opt_u64("max_active_zones"), MAX_ACTIVE_ZONES as _);
 
                 let sh = Shell::new().unwrap();
                 let report = cmd!(sh, "blkzone report {dev_path}").read().unwrap();
@@ -738,7 +743,7 @@ fn zoned(ctl: ControlDevice) {
             mut buf: ZoneBuf<'_>,
             _flags: IoFlags,
         ) -> Result<usize, Errno> {
-            let zid = off / ZONE_SIZE as u64;
+            let zid = off / ZONE_SECTORS.bytes();
             buf.report(&self.zones[zid as usize..][..buf.len()])
         }
 

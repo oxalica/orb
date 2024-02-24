@@ -19,8 +19,7 @@ use rustix::mm;
 use rustix::process::Pid;
 
 use crate::runtime::{AsyncRuntime, AsyncRuntimeBuilder, AsyncScopeSpawner};
-
-pub const SECTOR_SIZE: u32 = 512;
+use crate::Sector;
 
 const DEFAULT_IO_BUF_SIZE: u32 = 512 << 10;
 
@@ -731,8 +730,9 @@ impl Service<'_> {
         );
         if dev_is_zoned {
             assert_ne!(
-                params.chunk_size, 0,
-                "`chunk_size` must be set for zoned devices",
+                params.chunk_sectors,
+                Sector(0),
+                "`chunk_sectors` must be set for zoned devices",
             );
         }
     }
@@ -1188,11 +1188,11 @@ impl<B: BlockDevice, RB: AsyncRuntimeBuilder> IoWorker<'_, B, RB> {
                 let iod = shm.get(tag);
                 let flags = IoFlags::from_bits_truncate(iod.op_flags);
                 // These fields may contain garbage for ops without them.
-                let off = iod.start_sector.wrapping_mul(SECTOR_SIZE.into());
+                let off = Sector(iod.start_sector).wrapping_bytes();
                 // The 2 variants both have type `u32`.
                 let zones = unsafe { iod.__bindgen_anon_1.nr_zones };
                 let len = unsafe { iod.__bindgen_anon_1.nr_sectors as usize }
-                    .wrapping_mul(SECTOR_SIZE as usize);
+                    .wrapping_mul(Sector::SIZE as usize);
                 let pwrite_off = u64::from(binding::UBLKSRV_IO_BUF_OFFSET)
                     + (u64::from(self.thread_id) << binding::UBLK_QID_OFF)
                     + (u64::from(tag) << binding::UBLK_TAG_OFF);
@@ -1278,7 +1278,7 @@ impl<B: BlockDevice, RB: AsyncRuntimeBuilder> IoWorker<'_, B, RB> {
                                 });
                             *guard = match h.zone_append(off, buf, flags).await {
                                 Ok(lba) => {
-                                    assert_eq!(lba % u64::from(SECTOR_SIZE), 0);
+                                    assert_eq!(lba % u64::from(Sector::SIZE), 0);
                                     (0, lba)
                                 }
                                 Err(err) => (err.raw_os_error(), 0),
@@ -1321,13 +1321,13 @@ impl<B: BlockDevice, RB: AsyncRuntimeBuilder> IoWorker<'_, B, RB> {
 pub struct DeviceParams {
     set_io_flusher: bool,
     attrs: DeviceAttrs,
-    size: u64,
+    dev_sectors: Sector,
     logical_block_size: u32,
     physical_block_size: u32,
-    chunk_size: u32,
+    chunk_sectors: Sector,
     io_optimal_size: u32,
     io_min_size: u32,
-    io_max_size: u32,
+    max_sectors: Sector,
     virt_boundary_mask: u64,
     discard: Option<DiscardParams>,
     zoned: Option<ZonedParams>,
@@ -1347,13 +1347,13 @@ impl DeviceParams {
         Self {
             set_io_flusher: false,
             attrs: DeviceAttrs::empty(),
-            size: 0,
+            dev_sectors: Sector(0),
             logical_block_size: 512,
             physical_block_size: 4 << 10,
             io_optimal_size: 4 << 10,
             io_min_size: 4 << 10,
-            io_max_size: DEFAULT_IO_BUF_SIZE,
-            chunk_size: 0,
+            max_sectors: Sector((DEFAULT_IO_BUF_SIZE / Sector::SIZE) as u64),
+            chunk_sectors: Sector(0),
             virt_boundary_mask: 0,
             discard: None,
             zoned: None,
@@ -1373,30 +1373,29 @@ impl DeviceParams {
         self
     }
 
-    /// Set the total size of the block device.
-    pub fn size(&mut self, size: u64) -> &mut Self {
-        assert_eq!(size % SECTOR_SIZE as u64, 0);
-        self.size = size;
+    /// Set the total size of the block device in [`Sector`]s.
+    pub fn dev_sectors(&mut self, sec: Sector) -> &mut Self {
+        self.dev_sectors = sec;
         self
     }
 
-    /// Set minimum request size for the queue.
+    /// Set minimum request size for the queue in [`Sector`]s.
     ///
     /// See:
     /// <https://www.kernel.org/doc/html/v6.7/core-api/kernel-api.html#c.blk_queue_io_min>
-    pub fn io_max_size(&mut self, size: u32) -> &mut Self {
-        assert_eq!(size % SECTOR_SIZE, 0);
-        self.io_max_size = size;
+    pub fn max_sectors(&mut self, sec: Sector) -> &mut Self {
+        assert!(u32::try_from(sec.0).is_ok());
+        self.max_sectors = sec;
         self
     }
 
-    /// Set size of the chunk for this queue.
+    /// Set size of the chunk for this queue in [`Sector`]s.
     ///
     /// See:
     /// <https://www.kernel.org/doc/html/v6.7/core-api/kernel-api.html#c.blk_queue_chunk_sectors>
-    pub fn chunk_size(&mut self, size: u32) -> &mut Self {
-        assert_eq!(size % SECTOR_SIZE, 0);
-        self.chunk_size = size;
+    pub fn chunk_sectors(&mut self, sec: Sector) -> &mut Self {
+        assert!(u32::try_from(sec.0).is_ok());
+        self.chunk_sectors = sec;
         self
     }
 
@@ -1418,8 +1417,6 @@ impl DeviceParams {
     ///
     /// Panic if `params` is invalid, eg. `max_zone_append_size` is 0.
     pub fn discard(&mut self, params: DiscardParams) -> &mut Self {
-        assert_eq!(params.max_size % SECTOR_SIZE, 0);
-        assert_eq!(params.max_write_zeroes_size % SECTOR_SIZE, 0);
         self.discard = Some(params);
         self
     }
@@ -1429,7 +1426,6 @@ impl DeviceParams {
     /// The device must be created with [`FeatureFlags::Zoned`] set, and
     /// [`DeviceParams::chunk_size`] must be set to the zone size.
     pub fn zoned(&mut self, params: ZonedParams) -> &mut Self {
-        assert_eq!(params.max_zone_append_size % SECTOR_SIZE, 0);
         self.zoned = Some(params);
         self
     }
@@ -1439,8 +1435,8 @@ impl DeviceParams {
 pub struct DiscardParams {
     pub alignment: u32,
     pub granularity: u32,
-    pub max_size: u32,
-    pub max_write_zeroes_size: u32,
+    pub max_size: Sector,
+    pub max_write_zeroes_size: Sector,
     pub max_segments: u16,
 }
 
@@ -1448,7 +1444,7 @@ pub struct DiscardParams {
 pub struct ZonedParams {
     pub max_open_zones: u32,
     pub max_active_zones: u32,
-    pub max_zone_append_size: u32,
+    pub max_zone_append_size: Sector,
 }
 
 impl DeviceParams {
@@ -1466,9 +1462,9 @@ impl DeviceParams {
                 physical_bs_shift: self.physical_block_size.trailing_zeros() as _,
                 io_opt_shift: self.io_optimal_size.trailing_zeros() as _,
                 io_min_shift: self.io_min_size.trailing_zeros() as _,
-                max_sectors: self.io_max_size / SECTOR_SIZE,
-                dev_sectors: self.size / u64::from(SECTOR_SIZE),
-                chunk_sectors: self.chunk_size / SECTOR_SIZE,
+                max_sectors: self.max_sectors.0.try_into().unwrap(),
+                dev_sectors: self.dev_sectors.0,
+                chunk_sectors: self.chunk_sectors.0.try_into().unwrap(),
                 virt_boundary_mask: self.virt_boundary_mask,
             },
             discard: self
@@ -1476,8 +1472,8 @@ impl DeviceParams {
                 .map_or(Default::default(), |p| binding::ublk_param_discard {
                     discard_alignment: p.alignment,
                     discard_granularity: p.granularity,
-                    max_discard_sectors: p.max_size / SECTOR_SIZE,
-                    max_write_zeroes_sectors: p.max_write_zeroes_size / SECTOR_SIZE,
+                    max_discard_sectors: p.max_size.0.try_into().unwrap(),
+                    max_write_zeroes_sectors: p.max_write_zeroes_size.0.try_into().unwrap(),
                     max_discard_segments: p.max_segments,
                     reserved0: 0,
                 }),
@@ -1486,7 +1482,7 @@ impl DeviceParams {
                 .map_or(Default::default(), |p| binding::ublk_param_zoned {
                     max_open_zones: p.max_open_zones,
                     max_active_zones: p.max_active_zones,
-                    max_zone_append_sectors: p.max_zone_append_size / SECTOR_SIZE,
+                    max_zone_append_sectors: p.max_zone_append_size.0.try_into().unwrap(),
                     reserved: [0; 20],
                 }),
             // This is read-only.
@@ -1507,20 +1503,16 @@ pub struct Zone(binding::blk_zone);
 impl Zone {
     #[must_use]
     pub fn new(
-        start_bytes: u64,
-        len_bytes: u64,
-        rel_write_pointer_bytes: u64,
+        start: Sector,
+        len: Sector,
+        rel_write_pointer: Sector,
         type_: ZoneType,
         cond: ZoneCond,
     ) -> Self {
-        assert_eq!(start_bytes % SECTOR_SIZE as u64, 0);
-        assert_eq!(len_bytes % SECTOR_SIZE as u64, 0);
-        assert_eq!(rel_write_pointer_bytes % SECTOR_SIZE as u64, 0);
-        let start_sec = start_bytes / SECTOR_SIZE as u64;
         Self(binding::blk_zone {
-            start: start_sec,
-            len: len_bytes / SECTOR_SIZE as u64,
-            wp: start_sec + rel_write_pointer_bytes / SECTOR_SIZE as u64,
+            start: start.0,
+            len: len.0,
+            wp: start.0 + rel_write_pointer.0,
             type_: type_ as _,
             cond: cond as _,
             non_seq: 0,
