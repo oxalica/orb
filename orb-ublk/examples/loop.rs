@@ -5,8 +5,8 @@ use std::path::PathBuf;
 
 use anyhow::{ensure, Context};
 use clap::Parser;
-use orb::runtime::TokioRuntimeBuilder;
-use orb::ublk::{
+use orb_ublk::runtime::TokioRuntimeBuilder;
+use orb_ublk::{
     BlockDevice, ControlDevice, DeviceAttrs, DeviceBuilder, DeviceInfo, DeviceParams,
     DiscardParams, IoFlags, ReadBuf, Stopper, WriteBuf, SECTOR_SIZE,
 };

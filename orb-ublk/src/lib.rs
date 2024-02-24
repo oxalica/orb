@@ -1,2 +1,4 @@
 pub mod runtime;
-pub mod ublk;
+mod ublk;
+
+pub use ublk::*;

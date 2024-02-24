@@ -5,8 +5,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use orb::runtime::{AsyncRuntimeBuilder, SyncRuntimeBuilder, TokioRuntimeBuilder};
-use orb::ublk::{
+use orb_ublk::runtime::{AsyncRuntimeBuilder, SyncRuntimeBuilder, TokioRuntimeBuilder};
+use orb_ublk::{
     BlockDevice, ControlDevice, DevState, DeviceAttrs, DeviceBuilder, DeviceInfo, DeviceParams,
     DiscardParams, FeatureFlags, IoFlags, ReadBuf, Stopper, WriteBuf, Zone, ZoneBuf, ZoneCond,
     ZoneType, ZonedParams, BDEV_PREFIX, SECTOR_SIZE,

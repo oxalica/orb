@@ -7,8 +7,8 @@ use std::sync::Mutex;
 use anyhow::{ensure, Context};
 use bytesize::ByteSize;
 use clap::Parser;
-use orb::runtime::TokioRuntimeBuilder;
-use orb::ublk::{
+use orb_ublk::runtime::TokioRuntimeBuilder;
+use orb_ublk::{
     BlockDevice, ControlDevice, DeviceAttrs, DeviceBuilder, DeviceInfo, DeviceParams, IoFlags,
     ReadBuf, Stopper, WriteBuf, Zone, ZoneBuf, ZoneCond, ZoneType, ZonedParams, SECTOR_SIZE,
 };

@@ -1,6 +1,6 @@
 use anyhow::{ensure, Context};
 use clap::Parser;
-use orb::ublk::ControlDevice;
+use orb_ublk::ControlDevice;
 
 /// Ublk device management.
 #[derive(Debug, Parser)]
