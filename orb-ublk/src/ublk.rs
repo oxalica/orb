@@ -1528,7 +1528,7 @@ impl Zone {
 ///
 /// Aka. `enum blk_zone_type`.
 /// See: <https://elixir.bootlin.com/linux/v6.7/source/include/uapi/linux/blkzoned.h#L22>
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 #[repr(u8)]
 pub enum ZoneType {
@@ -1545,7 +1545,7 @@ pub enum ZoneType {
 ///
 /// Aka. `enum blk_zone_cond`.
 /// See: <https://elixir.bootlin.com/linux/v6.7/source/include/uapi/linux/blkzoned.h#L38>
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 #[repr(u8)]
 pub enum ZoneCond {
