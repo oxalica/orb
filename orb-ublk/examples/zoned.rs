@@ -12,6 +12,7 @@ use orb_ublk::{
     BlockDevice, ControlDevice, DeviceAttrs, DeviceBuilder, DeviceInfo, DeviceParams, IoFlags,
     ReadBuf, Sector, Stopper, WriteBuf, Zone, ZoneBuf, ZoneCond, ZoneType, ZonedParams,
 };
+use rustix::fs::{fallocate, FallocateFlags};
 use rustix::io::Errno;
 use serde::{Deserialize, Serialize};
 
@@ -135,11 +136,12 @@ fn main() -> anyhow::Result<()> {
     let ctl = ControlDevice::open()
         .context("failed to open control device, kernel module 'ublk_drv' not loaded?")?;
     let mut builder = DeviceBuilder::new();
-    builder.name("ublk-zoned").zoned();
     if !cli.privileged {
         builder.unprivileged();
     }
     let mut srv = builder
+        .name("ublk-zoned")
+        .zoned()
         .create_service(&ctl)
         .context("failed to create ublk device")?;
     let params = *DeviceParams::new()
@@ -154,6 +156,7 @@ fn main() -> anyhow::Result<()> {
         });
     let handler = ZonedDev {
         file: backing_file,
+        size,
         zone_size,
         zones: Mutex::new(zones),
         metadata_path: cli.metadata_file,
@@ -165,6 +168,7 @@ fn main() -> anyhow::Result<()> {
 
 struct ZonedDev {
     file: File,
+    size: u64,
     zone_size: u64,
     zones: Mutex<ZonesMetadata>,
     metadata_path: PathBuf,
@@ -205,7 +209,7 @@ impl BlockDevice for ZonedDev {
             z.rel_wptr = new_rel_wptr;
             if new_rel_wptr == self.zone_size {
                 z.cond = ZoneCond::Full;
-            } else {
+            } else if z.cond == ZoneCond::Closed {
                 z.cond = ZoneCond::ImpOpen;
             }
         }
@@ -260,6 +264,12 @@ impl BlockDevice for ZonedDev {
         let zid = off / self.zone_size;
         let mut zones = self.zones.lock().unwrap();
         let z = &mut zones.zones[zid as usize];
+        fallocate(
+            &self.file,
+            FallocateFlags::PUNCH_HOLE | FallocateFlags::KEEP_SIZE,
+            off,
+            self.zone_size,
+        )?;
         z.rel_wptr = 0;
         z.cond = ZoneCond::Empty;
         Ok(())
@@ -267,6 +277,12 @@ impl BlockDevice for ZonedDev {
 
     async fn zone_reset_all(&self, _flags: IoFlags) -> Result<(), Errno> {
         let mut zones = self.zones.lock().unwrap();
+        fallocate(
+            &self.file,
+            FallocateFlags::PUNCH_HOLE | FallocateFlags::KEEP_SIZE,
+            0,
+            self.size,
+        )?;
         zones.zones.fill_with(ZoneState::default);
         Ok(())
     }
@@ -318,7 +334,7 @@ impl BlockDevice for ZonedDev {
         z.rel_wptr = new_rel_wptr;
         if new_rel_wptr == self.zone_size {
             z.cond = ZoneCond::Full;
-        } else {
+        } else if z.cond == ZoneCond::Closed {
             z.cond = ZoneCond::ImpOpen;
         }
         Ok(old_wptr)
