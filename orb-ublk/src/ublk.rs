@@ -1187,8 +1187,10 @@ impl<B: BlockDevice, RB: AsyncRuntimeBuilder> IoWorker<'_, B, RB> {
 
                 let iod = shm.get(tag);
                 let flags = IoFlags::from_bits_truncate(iod.op_flags);
-                // These fields may contain garbage for ops without them.
-                let off = Sector(iod.start_sector).wrapping_bytes();
+
+                // NB. These fields may contain garbage for ops without them.
+                // Use `wrapping_` to ignore errors.
+                let off = Sector(iod.start_sector);
                 // The 2 variants both have type `u32`.
                 let zones = unsafe { iod.__bindgen_anon_1.nr_zones };
                 let len = unsafe { iod.__bindgen_anon_1.nr_sectors as usize }
@@ -1598,44 +1600,44 @@ pub trait BlockDevice {
         Ok(())
     }
 
-    async fn read(&self, off: u64, buf: ReadBuf<'_>, flags: IoFlags) -> Result<usize, Errno>;
+    async fn read(&self, off: Sector, buf: ReadBuf<'_>, flags: IoFlags) -> Result<usize, Errno>;
 
-    async fn write(&self, off: u64, buf: WriteBuf<'_>, flags: IoFlags) -> Result<usize, Errno>;
+    async fn write(&self, off: Sector, buf: WriteBuf<'_>, flags: IoFlags) -> Result<usize, Errno>;
 
     async fn flush(&self, _flags: IoFlags) -> Result<(), Errno> {
         Ok(())
     }
 
-    async fn discard(&self, _off: u64, _len: usize, _flags: IoFlags) -> Result<(), Errno> {
+    async fn discard(&self, _off: Sector, _len: usize, _flags: IoFlags) -> Result<(), Errno> {
         Err(Errno::OPNOTSUPP)
     }
 
-    async fn write_zeroes(&self, _off: u64, _len: usize, _flags: IoFlags) -> Result<(), Errno> {
+    async fn write_zeroes(&self, _off: Sector, _len: usize, _flags: IoFlags) -> Result<(), Errno> {
         Err(Errno::OPNOTSUPP)
     }
 
     async fn zone_append(
         &self,
-        _off: u64,
+        _off: Sector,
         _buf: WriteBuf<'_>,
         _flags: IoFlags,
     ) -> Result<u64, Errno> {
         Err(Errno::OPNOTSUPP)
     }
 
-    async fn zone_open(&self, _off: u64, _flags: IoFlags) -> Result<(), Errno> {
+    async fn zone_open(&self, _off: Sector, _flags: IoFlags) -> Result<(), Errno> {
         Err(Errno::OPNOTSUPP)
     }
 
-    async fn zone_close(&self, _off: u64, _flags: IoFlags) -> Result<(), Errno> {
+    async fn zone_close(&self, _off: Sector, _flags: IoFlags) -> Result<(), Errno> {
         Err(Errno::OPNOTSUPP)
     }
 
-    async fn zone_finish(&self, _off: u64, _flags: IoFlags) -> Result<(), Errno> {
+    async fn zone_finish(&self, _off: Sector, _flags: IoFlags) -> Result<(), Errno> {
         Err(Errno::OPNOTSUPP)
     }
 
-    async fn zone_reset(&self, _off: u64, _flags: IoFlags) -> Result<(), Errno> {
+    async fn zone_reset(&self, _off: Sector, _flags: IoFlags) -> Result<(), Errno> {
         Err(Errno::OPNOTSUPP)
     }
 
@@ -1645,7 +1647,7 @@ pub trait BlockDevice {
 
     async fn report_zones(
         &self,
-        _off: u64,
+        _off: Sector,
         _buf: ZoneBuf<'_>,
         _flags: IoFlags,
     ) -> Result<usize, Errno> {

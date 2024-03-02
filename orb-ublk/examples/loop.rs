@@ -85,16 +85,21 @@ impl BlockDevice for LoopDev {
         Ok(())
     }
 
-    async fn read(&self, off: u64, mut buf: ReadBuf<'_>, _flags: IoFlags) -> Result<usize, Errno> {
+    async fn read(
+        &self,
+        off: Sector,
+        mut buf: ReadBuf<'_>,
+        _flags: IoFlags,
+    ) -> Result<usize, Errno> {
         self.file
-            .read_exact_at(buf.as_slice().unwrap(), off)
+            .read_exact_at(buf.as_slice().unwrap(), off.bytes())
             .map_err(convert_err)?;
         Ok(buf.len())
     }
 
-    async fn write(&self, off: u64, buf: WriteBuf<'_>, _flags: IoFlags) -> Result<usize, Errno> {
+    async fn write(&self, off: Sector, buf: WriteBuf<'_>, _flags: IoFlags) -> Result<usize, Errno> {
         self.file
-            .write_all_at(buf.as_slice().unwrap(), off)
+            .write_all_at(buf.as_slice().unwrap(), off.bytes())
             .map_err(convert_err)?;
         Ok(buf.len())
     }
@@ -103,12 +108,22 @@ impl BlockDevice for LoopDev {
         self.file.sync_data().map_err(convert_err)
     }
 
-    async fn discard(&self, off: u64, len: usize, _flags: IoFlags) -> Result<(), Errno> {
-        fallocate(&self.file, FallocateFlags::PUNCH_HOLE, off, len as _)
+    async fn discard(&self, off: Sector, len: usize, _flags: IoFlags) -> Result<(), Errno> {
+        fallocate(
+            &self.file,
+            FallocateFlags::PUNCH_HOLE,
+            off.bytes(),
+            len as _,
+        )
     }
 
-    async fn write_zeroes(&self, off: u64, len: usize, _flags: IoFlags) -> Result<(), Errno> {
-        fallocate(&self.file, FallocateFlags::PUNCH_HOLE, off, len as _)
+    async fn write_zeroes(&self, off: Sector, len: usize, _flags: IoFlags) -> Result<(), Errno> {
+        fallocate(
+            &self.file,
+            FallocateFlags::PUNCH_HOLE,
+            off.bytes(),
+            len as _,
+        )
     }
 }
 

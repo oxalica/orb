@@ -174,7 +174,7 @@ fn device_attrs(ctl: ControlDevice, #[case] queues: u16) {
 
         async fn read(
             &self,
-            _off: u64,
+            _off: Sector,
             _buf: ReadBuf<'_>,
             _flags: IoFlags,
         ) -> Result<usize, Errno> {
@@ -183,7 +183,7 @@ fn device_attrs(ctl: ControlDevice, #[case] queues: u16) {
 
         async fn write(
             &self,
-            _off: u64,
+            _off: Sector,
             _buf: WriteBuf<'_>,
             _flags: IoFlags,
         ) -> Result<usize, Errno> {
@@ -273,22 +273,22 @@ fn read_write(ctl: ControlDevice, #[case] flags: FeatureFlags, #[case] queues: u
 
         async fn read(
             &self,
-            off: u64,
+            off: Sector,
             mut buf: ReadBuf<'_>,
             _flags: IoFlags,
         ) -> Result<usize, Errno> {
-            buf.copy_from(&self.data.lock().unwrap()[off as usize..][..buf.len()])?;
+            buf.copy_from(&self.data.lock().unwrap()[off.bytes() as usize..][..buf.len()])?;
             Ok(buf.len())
         }
 
         async fn write(
             &self,
-            off: u64,
+            off: Sector,
             buf: WriteBuf<'_>,
             _flags: IoFlags,
         ) -> Result<usize, Errno> {
             let len = buf.len();
-            buf.copy_to(&mut self.data.lock().unwrap()[off as usize..][..len])?;
+            buf.copy_to(&mut self.data.lock().unwrap()[off.bytes() as usize..][..len])?;
             Ok(len)
         }
     }
@@ -339,7 +339,7 @@ fn error(ctl: ControlDevice) {
 
         async fn read(
             &self,
-            _off: u64,
+            _off: Sector,
             _buf: ReadBuf<'_>,
             _flags: IoFlags,
         ) -> Result<usize, Errno> {
@@ -348,7 +348,7 @@ fn error(ctl: ControlDevice) {
 
         async fn write(
             &self,
-            _off: u64,
+            _off: Sector,
             _buf: WriteBuf<'_>,
             _flags: IoFlags,
         ) -> Result<usize, Errno> {
@@ -414,7 +414,7 @@ fn handler_panic(ctl: ControlDevice, #[case] queues: u16) {
 
         async fn read(
             &self,
-            _off: u64,
+            _off: Sector,
             mut buf: ReadBuf<'_>,
             _flags: IoFlags,
         ) -> Result<usize, Errno> {
@@ -428,7 +428,7 @@ fn handler_panic(ctl: ControlDevice, #[case] queues: u16) {
 
         async fn write(
             &self,
-            _off: u64,
+            _off: Sector,
             _buf: WriteBuf<'_>,
             _flags: IoFlags,
         ) -> Result<usize, Errno> {
@@ -490,7 +490,7 @@ fn tokio_null(ctl: ControlDevice, #[case] flags: FeatureFlags, #[case] queues: u
 
         async fn read(
             &self,
-            _off: u64,
+            _off: Sector,
             mut buf: ReadBuf<'_>,
             _flags: IoFlags,
         ) -> Result<usize, Errno> {
@@ -501,7 +501,7 @@ fn tokio_null(ctl: ControlDevice, #[case] flags: FeatureFlags, #[case] queues: u
 
         async fn write(
             &self,
-            _off: u64,
+            _off: Sector,
             _buf: WriteBuf<'_>,
             _flags: IoFlags,
         ) -> Result<usize, Errno> {
@@ -572,7 +572,7 @@ fn discard(ctl: ControlDevice) {
 
         async fn read(
             &self,
-            _off: u64,
+            _off: Sector,
             mut buf: ReadBuf<'_>,
             _flags: IoFlags,
         ) -> Result<usize, Errno> {
@@ -582,20 +582,31 @@ fn discard(ctl: ControlDevice) {
 
         async fn write(
             &self,
-            _off: u64,
+            _off: Sector,
             buf: WriteBuf<'_>,
             _flags: IoFlags,
         ) -> Result<usize, Errno> {
             Ok(buf.len())
         }
 
-        async fn discard(&self, off: u64, len: usize, _flags: IoFlags) -> Result<(), Errno> {
-            self.discarded.lock().unwrap().push((false, off, len));
+        async fn discard(&self, off: Sector, len: usize, _flags: IoFlags) -> Result<(), Errno> {
+            self.discarded
+                .lock()
+                .unwrap()
+                .push((false, off.bytes(), len));
             Ok(())
         }
 
-        async fn write_zeroes(&self, off: u64, len: usize, _flags: IoFlags) -> Result<(), Errno> {
-            self.discarded.lock().unwrap().push((true, off, len));
+        async fn write_zeroes(
+            &self,
+            off: Sector,
+            len: usize,
+            _flags: IoFlags,
+        ) -> Result<(), Errno> {
+            self.discarded
+                .lock()
+                .unwrap()
+                .push((true, off.bytes(), len));
             Ok(())
         }
     }
@@ -720,7 +731,7 @@ fn zoned(ctl: ControlDevice) {
 
         async fn read(
             &self,
-            _off: u64,
+            _off: Sector,
             mut buf: ReadBuf<'_>,
             _flags: IoFlags,
         ) -> Result<usize, Errno> {
@@ -730,7 +741,7 @@ fn zoned(ctl: ControlDevice) {
 
         async fn write(
             &self,
-            _off: u64,
+            _off: Sector,
             _buf: WriteBuf<'_>,
             _flags: IoFlags,
         ) -> Result<usize, Errno> {
@@ -739,34 +750,34 @@ fn zoned(ctl: ControlDevice) {
 
         async fn report_zones(
             &self,
-            off: u64,
+            off: Sector,
             mut buf: ZoneBuf<'_>,
             _flags: IoFlags,
         ) -> Result<usize, Errno> {
-            let zid = off / ZONE_SECTORS.bytes();
+            let zid = off / ZONE_SECTORS;
             buf.report(&self.zones[zid as usize..][..buf.len()])
         }
 
-        async fn zone_open(&self, off: u64, _flags: IoFlags) -> Result<(), Errno> {
-            assert_eq!(off, 2 << 10);
+        async fn zone_open(&self, off: Sector, _flags: IoFlags) -> Result<(), Errno> {
+            assert_eq!(off.bytes(), 2 << 10);
             self.ops.lock().unwrap().push_str("open;");
             Ok(())
         }
 
-        async fn zone_close(&self, off: u64, _flags: IoFlags) -> Result<(), Errno> {
-            assert_eq!(off, 2 << 10);
+        async fn zone_close(&self, off: Sector, _flags: IoFlags) -> Result<(), Errno> {
+            assert_eq!(off.bytes(), 2 << 10);
             self.ops.lock().unwrap().push_str("close;");
             Ok(())
         }
 
-        async fn zone_finish(&self, off: u64, _flags: IoFlags) -> Result<(), Errno> {
-            assert_eq!(off, 2 << 10);
+        async fn zone_finish(&self, off: Sector, _flags: IoFlags) -> Result<(), Errno> {
+            assert_eq!(off.bytes(), 2 << 10);
             self.ops.lock().unwrap().push_str("finish;");
             Ok(())
         }
 
-        async fn zone_reset(&self, off: u64, _flags: IoFlags) -> Result<(), Errno> {
-            assert_eq!(off, 2 << 10);
+        async fn zone_reset(&self, off: Sector, _flags: IoFlags) -> Result<(), Errno> {
+            assert_eq!(off.bytes(), 2 << 10);
             self.ops.lock().unwrap().push_str("reset;");
             Ok(())
         }

@@ -181,16 +181,22 @@ impl BlockDevice for ZonedDev {
         Ok(())
     }
 
-    async fn read(&self, off: u64, mut buf: ReadBuf<'_>, _flags: IoFlags) -> Result<usize, Errno> {
+    async fn read(
+        &self,
+        off: Sector,
+        mut buf: ReadBuf<'_>,
+        _flags: IoFlags,
+    ) -> Result<usize, Errno> {
         let mut buf2 = vec![0u8; buf.len()];
         self.file
-            .read_exact_at(&mut buf2, off)
+            .read_exact_at(&mut buf2, off.bytes())
             .map_err(convert_err)?;
         buf.copy_from(&buf2)?;
         Ok(buf.len())
     }
 
-    async fn write(&self, off: u64, buf: WriteBuf<'_>, _flags: IoFlags) -> Result<usize, Errno> {
+    async fn write(&self, off: Sector, buf: WriteBuf<'_>, _flags: IoFlags) -> Result<usize, Errno> {
+        let off = off.bytes();
         let zid = off / self.zone_size;
         {
             let mut zones = self.zones.lock().unwrap();
@@ -226,8 +232,8 @@ impl BlockDevice for ZonedDev {
         Ok(())
     }
 
-    async fn zone_open(&self, off: u64, _flags: IoFlags) -> Result<(), Errno> {
-        let zid = off / self.zone_size;
+    async fn zone_open(&self, off: Sector, _flags: IoFlags) -> Result<(), Errno> {
+        let zid = off.bytes() / self.zone_size;
         let mut zones = self.zones.lock().unwrap();
         let z = &mut zones.zones[zid as usize];
         z.cond = match z.cond {
@@ -239,8 +245,8 @@ impl BlockDevice for ZonedDev {
         Ok(())
     }
 
-    async fn zone_close(&self, off: u64, _flags: IoFlags) -> Result<(), Errno> {
-        let zid = off / self.zone_size;
+    async fn zone_close(&self, off: Sector, _flags: IoFlags) -> Result<(), Errno> {
+        let zid = off.bytes() / self.zone_size;
         let mut zones = self.zones.lock().unwrap();
         let z = &mut zones.zones[zid as usize];
         z.cond = match z.cond {
@@ -251,8 +257,8 @@ impl BlockDevice for ZonedDev {
         Ok(())
     }
 
-    async fn zone_finish(&self, off: u64, _flags: IoFlags) -> Result<(), Errno> {
-        let zid = off / self.zone_size;
+    async fn zone_finish(&self, off: Sector, _flags: IoFlags) -> Result<(), Errno> {
+        let zid = off.bytes() / self.zone_size;
         let mut zones = self.zones.lock().unwrap();
         let z = &mut zones.zones[zid as usize];
         z.rel_wptr = self.zone_size;
@@ -260,14 +266,14 @@ impl BlockDevice for ZonedDev {
         Ok(())
     }
 
-    async fn zone_reset(&self, off: u64, _flags: IoFlags) -> Result<(), Errno> {
-        let zid = off / self.zone_size;
+    async fn zone_reset(&self, off: Sector, _flags: IoFlags) -> Result<(), Errno> {
+        let zid = off.bytes() / self.zone_size;
         let mut zones = self.zones.lock().unwrap();
         let z = &mut zones.zones[zid as usize];
         fallocate(
             &self.file,
             FallocateFlags::PUNCH_HOLE | FallocateFlags::KEEP_SIZE,
-            off,
+            off.bytes(),
             self.zone_size,
         )?;
         z.rel_wptr = 0;
@@ -289,11 +295,11 @@ impl BlockDevice for ZonedDev {
 
     async fn report_zones(
         &self,
-        off: u64,
+        off: Sector,
         mut buf: ZoneBuf<'_>,
         _flags: IoFlags,
     ) -> Result<usize, Errno> {
-        let zid = off / self.zone_size;
+        let zid = off.bytes() / self.zone_size;
         let zones = self.zones.lock().unwrap();
         let info = zones.zones[zid as usize..][..buf.len()]
             .iter()
@@ -313,11 +319,11 @@ impl BlockDevice for ZonedDev {
 
     async fn zone_append(
         &self,
-        off: u64,
+        off: Sector,
         buf: WriteBuf<'_>,
         _flags: IoFlags,
     ) -> Result<u64, Errno> {
-        let zid = off / self.zone_size;
+        let zid = off.bytes() / self.zone_size;
         let mut zones = self.zones.lock().unwrap();
         let z = &mut zones.zones[zid as usize];
         let new_rel_wptr = z

@@ -1,6 +1,8 @@
 pub mod runtime;
 mod ublk;
 
+use std::fmt;
+
 pub use ublk::*;
 
 /// Size or offset in unit of sectors (512bytes).
@@ -20,6 +22,13 @@ pub use ublk::*;
     derive_more::SubAssign,
 )]
 pub struct Sector(pub u64);
+
+impl fmt::Display for Sector {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)?;
+        "s".fmt(f)
+    }
+}
 
 impl Sector {
     pub const SHIFT: u32 = 9;
