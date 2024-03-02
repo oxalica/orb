@@ -1254,13 +1254,18 @@ impl<B: BlockDevice, RB: AsyncRuntimeBuilder> IoWorker<'_, B, RB> {
                     }
                     binding::UBLK_IO_OP_REPORT_ZONES => {
                         log::trace!("REPORT_ZONES offset={off} zones={zones} flags={flags:?}");
-                        let buf = ZoneBuf {
+                        let mut buf = ZoneBuf {
                             cdev: self.cdev,
                             off: pwrite_off,
-                            zones,
+                            remaining_zones: zones,
                             _not_send_invariant: PhantomData,
                         };
-                        spawn!(h.report_zones(off, buf, flags).await);
+                        spawn!(h.report_zones(off, &mut buf, flags).await.map(|()| {
+                            let written = (buf.off - pwrite_off)
+                                .try_into()
+                                .expect("buffer size must not exceed i32");
+                            (written, 0)
+                        }));
                     }
                     binding::UBLK_IO_OP_ZONE_APPEND => {
                         log::trace!("ZONE_APPEND offset={off} len={len} flags={flags:?}");
@@ -1645,9 +1650,9 @@ pub trait BlockDevice {
     async fn report_zones(
         &self,
         _off: Sector,
-        _buf: ZoneBuf<'_>,
+        _buf: &mut ZoneBuf<'_>,
         _flags: IoFlags,
-    ) -> Result<usize, Errno> {
+    ) -> Result<(), Errno> {
         Err(Errno::OPNOTSUPP)
     }
 }
@@ -1777,35 +1782,41 @@ impl WriteBuf<'_> {
 pub struct ZoneBuf<'a> {
     cdev: BorrowedFd<'a>,
     off: u64,
-    zones: u32,
+    remaining_zones: u32,
     #[allow(clippy::mut_mut)]
     _not_send_invariant: PhantomData<(*mut (), &'a mut &'a mut ())>,
 }
 
 impl ZoneBuf<'_> {
-    /// Returns the number of zones requested, which must not be zero.
-    // It must not be empty.
+    /// Returns the remaining number of zones unfilled in this buffer, which must not be zero
+    /// initially.
     #[must_use]
-    #[allow(clippy::len_without_is_empty)]
-    pub fn len(&self) -> usize {
-        self.zones as _
+    pub fn remaining(&self) -> usize {
+        self.remaining_zones as _
     }
 
-    /// Return zones informations as response.
+    /// Fill buffer with zones informations response and returns the number of zones written.
     ///
-    /// # Panics
+    /// This will advance the buffer end pointer. It can be called multiple times and responses
+    /// will be concatenated sequentially. Be aware that filling the buffer can do syscalls in case
+    /// of [`FeatureFlags::UserCopy`].
     ///
-    /// Panic if `zones.len()` differs from [`Self::len()`].
+    /// This handles retriable failures like `EINTR`, thus the only reason for returning a number
+    /// less than `zones.len()` is the buffer is full.
     pub fn report(&mut self, zones: &[Zone]) -> Result<usize, Errno> {
-        assert_eq!(zones.len(), self.zones as _);
+        let len = self.remaining().min(zones.len());
+        let zones = &zones[..len];
         // SAFETY: `Zone` is `repr(transparent)` to `struct blk_zone`.
         let data = unsafe {
             std::slice::from_raw_parts(zones.as_ptr().cast::<u8>(), mem::size_of_val(zones))
         };
         // SAFETY: The fd is valid and `ManuallyDrop` prevents its close.
         let cdev = unsafe { ManuallyDrop::new(File::from_raw_fd(self.cdev.as_raw_fd())) };
+        // XXX: Should we handle partial write?
         cdev.write_all_at(data, self.off)
             .map_err(|e| Errno::from_io_error(&e).unwrap())?;
-        Ok(data.len())
+        self.remaining_zones -= len as u32;
+        self.off += data.len() as u64;
+        Ok(len)
     }
 }

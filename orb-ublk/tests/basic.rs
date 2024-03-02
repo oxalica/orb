@@ -751,11 +751,12 @@ fn zoned(ctl: ControlDevice) {
         async fn report_zones(
             &self,
             off: Sector,
-            mut buf: ZoneBuf<'_>,
+            buf: &mut ZoneBuf<'_>,
             _flags: IoFlags,
-        ) -> Result<usize, Errno> {
+        ) -> Result<(), Errno> {
             let zid = off / ZONE_SECTORS;
-            buf.report(&self.zones[zid as usize..][..buf.len()])
+            buf.report(&self.zones[zid as usize..][..buf.remaining()])?;
+            Ok(())
         }
 
         async fn zone_open(&self, off: Sector, _flags: IoFlags) -> Result<(), Errno> {

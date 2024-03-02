@@ -296,12 +296,12 @@ impl BlockDevice for ZonedDev {
     async fn report_zones(
         &self,
         off: Sector,
-        mut buf: ZoneBuf<'_>,
+        buf: &mut ZoneBuf<'_>,
         _flags: IoFlags,
-    ) -> Result<usize, Errno> {
+    ) -> Result<(), Errno> {
         let zid = off.bytes() / self.zone_size;
         let zones = self.zones.lock().unwrap();
-        let info = zones.zones[zid as usize..][..buf.len()]
+        let info = zones.zones[zid as usize..][..buf.remaining()]
             .iter()
             .zip(zid..)
             .map(|(z, zid)| {
@@ -314,7 +314,8 @@ impl BlockDevice for ZonedDev {
                 )
             })
             .collect::<Vec<_>>();
-        buf.report(&info)
+        buf.report(&info)?;
+        Ok(())
     }
 
     async fn zone_append(
