@@ -1066,37 +1066,34 @@ impl<B: BlockDevice, RB: AsyncRuntimeBuilder> IoWorker<'_, B, RB> {
 
         let mut runtime = self.runtime_builder.build()?;
 
-        let refill_sqe = |sq: &mut SubmissionQueue<'_>,
-                          i: u16,
-                          result: Option<i32>,
-                          zone_append_lba: Option<u64>| {
-            let cmd = binding::ublksrv_io_cmd {
-                q_id: self.thread_id,
-                tag: i,
-                result: result.unwrap_or(-1),
-                __bindgen_anon_1: match (&io_bufs, zone_append_lba) {
-                    (Some(bufs), _) => binding::ublksrv_io_cmd__bindgen_ty_1 {
-                        addr: bufs.get(i.into()).as_ptr().cast::<u8>() as _,
+        let refill_sqe =
+            |sq: &mut SubmissionQueue<'_>, i: u16, result: Option<i32>, zone_append_lba: u64| {
+                let cmd = binding::ublksrv_io_cmd {
+                    q_id: self.thread_id,
+                    tag: i,
+                    result: result.unwrap_or(-1),
+                    __bindgen_anon_1: match &io_bufs {
+                        Some(bufs) => binding::ublksrv_io_cmd__bindgen_ty_1 {
+                            addr: bufs.get(i.into()).as_ptr().cast::<u8>() as _,
+                        },
+                        // If this is not ZONE_APPEND, this is zero and has the same repr as
+                        // `{ addr: 0 }`, which is expected by the driver.
+                        None => binding::ublksrv_io_cmd__bindgen_ty_1 { zone_append_lba },
                     },
-                    (None, Some(zone_append_lba)) => {
-                        binding::ublksrv_io_cmd__bindgen_ty_1 { zone_append_lba }
-                    }
-                    (None, None) => binding::ublksrv_io_cmd__bindgen_ty_1 { addr: 0 },
-                },
+                };
+                let cmd_op = if result.is_some() {
+                    binding::UBLK_IO_COMMIT_AND_FETCH_REQ
+                } else {
+                    binding::UBLK_IO_FETCH_REQ
+                };
+                let sqe = opcode::UringCmd16::new(CDEV_FIXED_FD, cmd_op)
+                    .cmd(unsafe { mem::transmute(cmd) })
+                    .build()
+                    .user_data(i.into());
+                unsafe {
+                    sq.push(&sqe).expect("squeue should be big enough");
+                }
             };
-            let cmd_op = if result.is_some() {
-                binding::UBLK_IO_COMMIT_AND_FETCH_REQ
-            } else {
-                binding::UBLK_IO_FETCH_REQ
-            };
-            let sqe = opcode::UringCmd16::new(CDEV_FIXED_FD, cmd_op)
-                .cmd(unsafe { mem::transmute(cmd) })
-                .build()
-                .user_data(i.into());
-            unsafe {
-                sq.push(&sqe).expect("squeue should be big enough");
-            }
-        };
 
         // SAFETY: `BorrowedFd` is valid.
         let enqueue_poll_in = |sq: &mut SubmissionQueue<'_>, fd: BorrowedFd<'_>| unsafe {
@@ -1117,7 +1114,7 @@ impl<B: BlockDevice, RB: AsyncRuntimeBuilder> IoWorker<'_, B, RB> {
             };
             enqueue_poll_in(&mut sq, fd);
             for i in 0..self.dev_info.queue_depth() {
-                refill_sqe(&mut sq, i, None, None);
+                refill_sqe(&mut sq, i, None, 0);
             }
         }
         io_ring.submit()?;
@@ -1173,8 +1170,8 @@ impl<B: BlockDevice, RB: AsyncRuntimeBuilder> IoWorker<'_, B, RB> {
 
                 let tag = cqe.user_data() as u16;
                 let io_ring = &*io_ring;
-                let commit_and_fetch = move |ret: i32, zone_append_lba: Option<u64>| {
-                    log::trace!("-> respond {ret} {zone_append_lba:?}");
+                let commit_and_fetch = move |ret: i32, zone_append_lba: u64| {
+                    log::trace!("-> respond {ret} {zone_append_lba}");
                     // SAFETY: All futures are executed on the same thread, which is guarantee
                     // by no `Send` bound on parameters of `Runtime::{block_on,spawn_local}`.
                     // So there can only be one future running this block at the same time.
@@ -1214,102 +1211,88 @@ impl<B: BlockDevice, RB: AsyncRuntimeBuilder> IoWorker<'_, B, RB> {
 
                 // Make `async move` only move the reference to the handler.
                 let h = self.handler;
-                // FIXME: Is there a better way to handle panicking here?
-                macro_rules! op {
-                    ($tt:tt; $(let $pat:pat_param = $rhs:expr;)* $handle_expr:expr) => {{
-                        log::trace!($tt);
-                        $(let $pat = $rhs;)*
+                // XXX: Is there a better way to handle panicking here?
+                macro_rules! spawn {
+                    ($handler:expr) => {
                         spawner.spawn(async move {
                             // Always commit.
-                            let mut guard = scopeguard::guard(-Errno::IO.raw_os_error(), |ret| {
-                                if std::thread::panicking() {
-                                    log::warn!("handler panicked, returning EIO");
-                                }
-                                commit_and_fetch(ret, None)
-                            });
-                            let ret = $handle_expr.await.into_c_result();
+                            let mut guard =
+                                scopeguard::guard((-Errno::IO.raw_os_error(), 0), |(ret, lba)| {
+                                    if std::thread::panicking() {
+                                        log::warn!("handler panicked, returning EIO");
+                                    }
+                                    commit_and_fetch(ret, lba)
+                                });
+                            let ret = $handler.into_c_result();
                             *guard = ret;
-                        });
-                    }};
+                        })
+                    };
                 }
 
                 match iod.op_flags & 0xFF {
-                    binding::UBLK_IO_OP_READ => op! {
-                        "READ offset={off} len={len} flags={flags:?}";
+                    binding::UBLK_IO_OP_READ => {
+                        log::trace!("READ offset={off} len={len} flags={flags:?}");
                         let buf = ReadBuf(get_buf(), PhantomData);
-                        h.read(off, buf, flags)
-                    },
-                    binding::UBLK_IO_OP_WRITE => op! {
-                        "WRITE offset={off} len={len} flags={flags:?}";
+                        spawn!(h.read(off, buf, flags).await);
+                    }
+                    binding::UBLK_IO_OP_WRITE => {
+                        log::trace!("WRITE offset={off} len={len} flags={flags:?}");
                         let buf = WriteBuf(get_buf(), PhantomData);
-                        h.write(off, buf, flags)
-                    },
-                    binding::UBLK_IO_OP_FLUSH => op! {
-                        "FLUSH flags={flags:?}";
-                        h.flush(flags)
-                    },
-                    binding::UBLK_IO_OP_DISCARD => op! {
-                        "DISCARD offset={off} len={len} flags={flags:?}";
-                        h.discard(off, len, flags)
-                    },
-                    binding::UBLK_IO_OP_WRITE_ZEROES => op! {
-                        "WRITE_ZEROES offset={off} len={len} flags={flags:?}";
-                        h.write_zeroes(off, len, flags)
-                    },
-                    binding::UBLK_IO_OP_REPORT_ZONES => op! {
-                        "REPORT_ZONES offset={off} zones={zones} flags={flags:?}";
+                        spawn!(h.write(off, buf, flags).await);
+                    }
+                    binding::UBLK_IO_OP_FLUSH => {
+                        log::trace!("FLUSH flags={flags:?}");
+                        spawn!(h.flush(flags).await);
+                    }
+                    binding::UBLK_IO_OP_DISCARD => {
+                        log::trace!("DISCARD offset={off} len={len} flags={flags:?}");
+                        spawn!(h.discard(off, len, flags).await);
+                    }
+                    binding::UBLK_IO_OP_WRITE_ZEROES => {
+                        log::trace!("WRITE_ZEROES offset={off} len={len} flags={flags:?}");
+                        spawn!(h.write_zeroes(off, len, flags).await);
+                    }
+                    binding::UBLK_IO_OP_REPORT_ZONES => {
+                        log::trace!("REPORT_ZONES offset={off} zones={zones} flags={flags:?}");
                         let buf = ZoneBuf {
                             cdev: self.cdev,
                             off: pwrite_off,
                             zones,
                             _not_send_invariant: PhantomData,
                         };
-                        h.report_zones(off, buf, flags)
-                    },
+                        spawn!(h.report_zones(off, buf, flags).await);
+                    }
                     binding::UBLK_IO_OP_ZONE_APPEND => {
-                        // TODO: Ugly special case.
                         log::trace!("ZONE_APPEND offset={off} len={len} flags={flags:?}");
                         let buf = WriteBuf(get_buf(), PhantomData);
-                        spawner.spawn(async move {
-                            let mut guard =
-                                scopeguard::guard((-Errno::IO.raw_os_error(), 0), |(ret, lba)| {
-                                    if std::thread::panicking() {
-                                        log::warn!("handler panicked, returning EIO");
-                                    }
-                                    commit_and_fetch(ret, Some(lba));
-                                });
-                            *guard = match h.zone_append(off, buf, flags).await {
-                                Ok(lba) => {
-                                    assert_eq!(lba % u64::from(Sector::SIZE), 0);
-                                    (0, lba)
-                                }
-                                Err(err) => (err.raw_os_error(), 0),
-                            };
-                        });
+                        spawn!(h.zone_append(off, buf, flags).await.map(|lba| {
+                            assert_eq!(lba % u64::from(Sector::SIZE), 0);
+                            (0, lba)
+                        }));
                     }
-                    binding::UBLK_IO_OP_ZONE_OPEN => op! {
-                        "ZONE_OPEN offset={off} flags={flags:?}";
-                        h.zone_open(off, flags)
-                    },
-                    binding::UBLK_IO_OP_ZONE_CLOSE => op! {
-                        "ZONE_CLOSE offset={off} flags={flags:?}";
-                        h.zone_close(off, flags)
-                    },
-                    binding::UBLK_IO_OP_ZONE_FINISH => op! {
-                        "ZONE_FINISH offset={off} flags={flags:?}";
-                        h.zone_finish(off, flags)
-                    },
-                    binding::UBLK_IO_OP_ZONE_RESET => op! {
-                        "ZONE_RESET offset={off} flags={flags:?}";
-                        h.zone_reset(off, flags)
-                    },
-                    binding::UBLK_IO_OP_ZONE_RESET_ALL => op! {
-                        "ZONE_RESET_ALL flags={flags:?}";
-                        h.zone_reset_all(flags)
-                    },
+                    binding::UBLK_IO_OP_ZONE_OPEN => {
+                        log::trace!("ZONE_OPEN offset={off} flags={flags:?}");
+                        spawn!(h.zone_open(off, flags).await);
+                    }
+                    binding::UBLK_IO_OP_ZONE_CLOSE => {
+                        log::trace!("ZONE_CLOSE offset={off} flags={flags:?}");
+                        spawn!(h.zone_close(off, flags).await);
+                    }
+                    binding::UBLK_IO_OP_ZONE_FINISH => {
+                        log::trace!("ZONE_FINISH offset={off} flags={flags:?}");
+                        spawn!(h.zone_finish(off, flags).await);
+                    }
+                    binding::UBLK_IO_OP_ZONE_RESET => {
+                        log::trace!("ZONE_RESET offset={off} flags={flags:?}");
+                        spawn!(h.zone_reset(off, flags).await);
+                    }
+                    binding::UBLK_IO_OP_ZONE_RESET_ALL => {
+                        log::trace!("ZONE_RESET_ALL flags={flags:?}");
+                        spawn!(h.zone_reset_all(flags).await);
+                    }
                     op => {
                         log::error!("unsupported op: {op}");
-                        commit_and_fetch(-Errno::IO.raw_os_error(), None);
+                        commit_and_fetch(-Errno::IO.raw_os_error(), 0);
                     }
                 }
             }
@@ -1570,23 +1553,37 @@ pub enum ZoneCond {
 }
 
 trait IntoCResult {
-    fn into_c_result(self) -> i32;
+    fn into_c_result(self) -> (i32, u64);
 }
 
-impl IntoCResult for Result<(), Errno> {
-    fn into_c_result(self) -> i32 {
-        match self {
-            Ok(()) => 0,
-            Err(err) => -err.raw_os_error(),
+impl IntoCResult for () {
+    fn into_c_result(self) -> (i32, u64) {
+        (0, 0)
+    }
+}
+
+impl IntoCResult for (i32, u64) {
+    fn into_c_result(self) -> (i32, u64) {
+        self
+    }
+}
+
+impl IntoCResult for usize {
+    fn into_c_result(self) -> (i32, u64) {
+        if let Ok(v) = i32::try_from(self) {
+            (v, 0)
+        } else {
+            log::warn!("invalid returning value: {self}");
+            (-Errno::IO.raw_os_error(), 0)
         }
     }
 }
 
-impl IntoCResult for Result<usize, Errno> {
-    fn into_c_result(self) -> i32 {
+impl<T: IntoCResult> IntoCResult for Result<T, Errno> {
+    fn into_c_result(self) -> (i32, u64) {
         match self {
-            Ok(x) => i32::try_from(x).expect("invalid result size"),
-            Err(err) => -err.raw_os_error(),
+            Ok(v) => v.into_c_result(),
+            Err(err) => (-err.raw_os_error(), 0),
         }
     }
 }
