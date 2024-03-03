@@ -318,7 +318,7 @@ impl BlockDevice for ZonedDev {
         off: Sector,
         buf: WriteBuf<'_>,
         _flags: IoFlags,
-    ) -> Result<u64, Errno> {
+    ) -> Result<Sector, Errno> {
         let zid = off.bytes() / self.zone_size;
         let mut zones = self.zones.lock().unwrap();
         let z = &mut zones.zones[zid as usize];
@@ -339,7 +339,7 @@ impl BlockDevice for ZonedDev {
         } else if z.cond == ZoneCond::Closed {
             z.cond = ZoneCond::ImpOpen;
         }
-        Ok(old_wptr)
+        Ok(Sector::from_bytes(old_wptr))
     }
 }
 

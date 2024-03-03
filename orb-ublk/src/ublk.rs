@@ -1275,10 +1275,7 @@ impl<B: BlockDevice, RB: AsyncRuntimeBuilder> IoWorker<'_, B, RB> {
                     binding::UBLK_IO_OP_ZONE_APPEND => {
                         log::trace!("ZONE_APPEND offset={off} len={len} flags={flags:?}");
                         let buf = WriteBuf(get_buf(), PhantomData);
-                        spawn!(h.zone_append(off, buf, flags).await.map(|lba| {
-                            assert_eq!(lba % u64::from(Sector::SIZE), 0);
-                            (0, lba)
-                        }));
+                        spawn!(h.zone_append(off, buf, flags).await.map(|lba| (0, lba.0)));
                     }
                     binding::UBLK_IO_OP_ZONE_OPEN => {
                         log::trace!("ZONE_OPEN offset={off} flags={flags:?}");
@@ -1628,7 +1625,7 @@ pub trait BlockDevice {
         _off: Sector,
         _buf: WriteBuf<'_>,
         _flags: IoFlags,
-    ) -> Result<u64, Errno> {
+    ) -> Result<Sector, Errno> {
         Err(Errno::OPNOTSUPP)
     }
 
