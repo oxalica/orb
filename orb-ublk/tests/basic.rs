@@ -288,7 +288,7 @@ fn read_write(ctl: ControlDevice, #[case] flags: FeatureFlags, #[case] queues: u
             _flags: IoFlags,
         ) -> Result<usize, Errno> {
             let len = buf.len();
-            buf.copy_to(&mut self.data.lock().unwrap()[off.bytes() as usize..][..len])?;
+            buf.copy_to_slice(&mut self.data.lock().unwrap()[off.bytes() as usize..][..len])?;
             Ok(len)
         }
     }

@@ -1751,7 +1751,7 @@ impl WriteBuf<'_> {
     /// # Panics
     ///
     /// Panic if `out.len()` differs from [`Self::len()`].
-    pub fn copy_to(&self, out: &mut [u8]) -> Result<(), Errno> {
+    pub fn copy_to_slice(&self, out: &mut [u8]) -> Result<(), Errno> {
         assert_eq!(out.len(), self.len());
         match &self.0 {
             RawBuf::PreCopied(b) => out.copy_from_slice(b),

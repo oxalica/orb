@@ -205,7 +205,7 @@ impl BlockDevice for ZonedDev {
                 .filter(|&p| p <= self.zone_size)
                 .ok_or(Errno::IO)?;
             let mut buf2 = vec![0u8; buf.len()];
-            buf.copy_to(&mut buf2)?;
+            buf.copy_to_slice(&mut buf2)?;
             self.file.write_all_at(&buf2, off).map_err(convert_err)?;
             z.rel_wptr = new_rel_wptr;
             if new_rel_wptr == self.zone_size {
@@ -328,7 +328,7 @@ impl BlockDevice for ZonedDev {
             .filter(|&p| p <= self.zone_size)
             .ok_or(Errno::IO)?;
         let mut buf2 = vec![0u8; buf.len()];
-        buf.copy_to(&mut buf2)?;
+        buf.copy_to_slice(&mut buf2)?;
         let old_wptr = zid * self.zone_size + z.rel_wptr;
         self.file
             .write_all_at(&buf2, old_wptr)
