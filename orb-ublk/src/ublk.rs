@@ -1204,7 +1204,7 @@ impl<B: BlockDevice, RB: AsyncRuntimeBuilder> IoWorker<'_, B, RB> {
                         None => RawBuf::UserCopy {
                             cdev: self.cdev,
                             off: pwrite_off,
-                            len: len as _,
+                            remaining: len as _,
                         },
                     }
                 };
@@ -1232,8 +1232,13 @@ impl<B: BlockDevice, RB: AsyncRuntimeBuilder> IoWorker<'_, B, RB> {
                 match iod.op_flags & 0xFF {
                     binding::UBLK_IO_OP_READ => {
                         log::trace!("READ offset={off} len={len} flags={flags:?}");
-                        let buf = ReadBuf(get_buf(), PhantomData);
-                        spawn!(h.read(off, buf, flags).await);
+                        let mut buf = ReadBuf(get_buf(), PhantomData);
+                        spawn!(h.read(off, &mut buf, flags).await.map(|()| {
+                            let read = (len - buf.remaining())
+                                .try_into()
+                                .expect("buffer size must not exceed i32");
+                            (read, 0)
+                        }));
                     }
                     binding::UBLK_IO_OP_WRITE => {
                         log::trace!("WRITE offset={off} len={len} flags={flags:?}");
@@ -1602,7 +1607,7 @@ pub trait BlockDevice {
         Ok(())
     }
 
-    async fn read(&self, off: Sector, buf: ReadBuf<'_>, flags: IoFlags) -> Result<usize, Errno>;
+    async fn read(&self, off: Sector, buf: &mut ReadBuf<'_>, flags: IoFlags) -> Result<(), Errno>;
 
     async fn write(&self, off: Sector, buf: WriteBuf<'_>, flags: IoFlags) -> Result<usize, Errno>;
 
@@ -1663,15 +1668,15 @@ enum RawBuf<'a> {
     UserCopy {
         cdev: BorrowedFd<'a>,
         off: u64,
-        len: u32,
+        remaining: u32,
     },
 }
 
 impl RawBuf<'_> {
-    fn len(&self) -> usize {
+    fn remaining(&self) -> usize {
         match self {
             RawBuf::PreCopied(b) => b.len(),
-            RawBuf::UserCopy { len, .. } => *len as _,
+            RawBuf::UserCopy { remaining, .. } => *remaining as _,
         }
     }
 }
@@ -1681,48 +1686,46 @@ impl RawBuf<'_> {
 pub struct ReadBuf<'a>(RawBuf<'a>, PhantomData<*mut ()>);
 
 impl ReadBuf<'_> {
-    /// Returns the byte length requested for read, which must not be zero.
-    // It must not be empty.
-    #[allow(clippy::len_without_is_empty)]
+    /// Returns the number of bytes that have not yet been filled.
     #[must_use]
-    pub fn len(&self) -> usize {
-        self.0.len()
+    pub fn remaining(&self) -> usize {
+        self.0.remaining()
     }
 
-    /// Reply `data` to fulfill the read request.
+    /// Append `data` to the response buffer and advance the write position.
     ///
-    /// This method will automatically select the correct way to transfer. In case of
-    /// [`FeatureFlags::UserCopy`], pwrite(2) is used; otherwise, it does an ordinary memory copy
+    /// This method will automatically use the correct way to transfer. In case of
+    /// [`FeatureFlags::UserCopy`], `pwrite(2)` is used; otherwise, it does an ordinary memory copy
     /// to the kernel driver buffer.
+    ///
+    /// Temporary failures like `EINTR` are handled and retried internally.
     ///
     /// # Panics
     ///
-    /// Panic if `data.len()` differs from [`Self::len()`].
-    pub fn copy_from(&mut self, data: &[u8]) -> Result<(), Errno> {
-        assert_eq!(data.len(), self.len());
+    /// Panic if `data.len() > self.remaining()`.
+    pub fn put_slice(&mut self, data: &[u8]) -> Result<(), Errno> {
+        let len = data.len();
+        assert!(len <= self.remaining());
         match &mut self.0 {
-            RawBuf::PreCopied(b) => b.copy_from_slice(data),
-            RawBuf::UserCopy { cdev, off, .. } => {
+            RawBuf::PreCopied(b) => {
+                b[..len].copy_from_slice(data);
+                *b = &mut mem::take(b)[len..];
+            }
+            RawBuf::UserCopy {
+                cdev,
+                off,
+                remaining,
+                ..
+            } => {
                 // SAFETY: The fd is valid and `ManuallyDrop` prevents its close.
                 let cdev = unsafe { ManuallyDrop::new(File::from_raw_fd(cdev.as_raw_fd())) };
                 cdev.write_all_at(data, *off)
                     .map_err(|e| Errno::from_io_error(&e).unwrap())?;
+                *off += len as u64;
+                *remaining -= len as u32;
             }
         }
         Ok(())
-    }
-
-    /// Try to get the internal buffer as a mutable slice for manual filling.
-    ///
-    /// It will returns `None` if the device is created with [`FeatureFlags::UserCopy`].
-    /// Generally [`Self::copy_from`] should be preferred if applicatable.
-    ///
-    /// The returned slice (if any) will have the same length as [`Self::len()`].
-    pub fn as_slice(&mut self) -> Option<&'_ mut [u8]> {
-        match &mut self.0 {
-            RawBuf::PreCopied(b) => Some(b),
-            RawBuf::UserCopy { .. } => None,
-        }
     }
 }
 
@@ -1736,7 +1739,7 @@ impl WriteBuf<'_> {
     #[allow(clippy::len_without_is_empty)]
     #[must_use]
     pub fn len(&self) -> usize {
-        self.0.len()
+        self.0.remaining()
     }
 
     /// Copy the data to be written into `out`.

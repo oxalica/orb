@@ -181,18 +181,13 @@ impl BlockDevice for ZonedDev {
         Ok(())
     }
 
-    async fn read(
-        &self,
-        off: Sector,
-        mut buf: ReadBuf<'_>,
-        _flags: IoFlags,
-    ) -> Result<usize, Errno> {
-        let mut buf2 = vec![0u8; buf.len()];
+    async fn read(&self, off: Sector, buf: &mut ReadBuf<'_>, _flags: IoFlags) -> Result<(), Errno> {
+        let mut buf2 = vec![0u8; buf.remaining()];
         self.file
             .read_exact_at(&mut buf2, off.bytes())
             .map_err(convert_err)?;
-        buf.copy_from(&buf2)?;
-        Ok(buf.len())
+        buf.put_slice(&buf2)?;
+        Ok(())
     }
 
     async fn write(&self, off: Sector, buf: WriteBuf<'_>, _flags: IoFlags) -> Result<usize, Errno> {

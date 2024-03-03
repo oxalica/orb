@@ -175,9 +175,9 @@ fn device_attrs(ctl: ControlDevice, #[case] queues: u16) {
         async fn read(
             &self,
             _off: Sector,
-            _buf: ReadBuf<'_>,
+            _buf: &mut ReadBuf<'_>,
             _flags: IoFlags,
-        ) -> Result<usize, Errno> {
+        ) -> Result<(), Errno> {
             Err(Errno::IO)
         }
 
@@ -274,11 +274,11 @@ fn read_write(ctl: ControlDevice, #[case] flags: FeatureFlags, #[case] queues: u
         async fn read(
             &self,
             off: Sector,
-            mut buf: ReadBuf<'_>,
+            buf: &mut ReadBuf<'_>,
             _flags: IoFlags,
-        ) -> Result<usize, Errno> {
-            buf.copy_from(&self.data.lock().unwrap()[off.bytes() as usize..][..buf.len()])?;
-            Ok(buf.len())
+        ) -> Result<(), Errno> {
+            buf.put_slice(&self.data.lock().unwrap()[off.bytes() as usize..][..buf.remaining()])?;
+            Ok(())
         }
 
         async fn write(
@@ -340,9 +340,9 @@ fn error(ctl: ControlDevice) {
         async fn read(
             &self,
             _off: Sector,
-            _buf: ReadBuf<'_>,
+            _buf: &mut ReadBuf<'_>,
             _flags: IoFlags,
-        ) -> Result<usize, Errno> {
+        ) -> Result<(), Errno> {
             Err(Errno::IO)
         }
 
@@ -415,12 +415,12 @@ fn handler_panic(ctl: ControlDevice, #[case] queues: u16) {
         async fn read(
             &self,
             _off: Sector,
-            mut buf: ReadBuf<'_>,
+            buf: &mut ReadBuf<'_>,
             _flags: IoFlags,
-        ) -> Result<usize, Errno> {
+        ) -> Result<(), Errno> {
             if self.should_ok.load(Ordering::Relaxed) {
-                buf.copy_from(&ZEROES[..buf.len()])?;
-                Ok(buf.len())
+                buf.put_slice(&ZEROES[..buf.remaining()])?;
+                Ok(())
             } else {
                 panic!("nooo");
             }
@@ -491,12 +491,12 @@ fn tokio_null(ctl: ControlDevice, #[case] flags: FeatureFlags, #[case] queues: u
         async fn read(
             &self,
             _off: Sector,
-            mut buf: ReadBuf<'_>,
+            buf: &mut ReadBuf<'_>,
             _flags: IoFlags,
-        ) -> Result<usize, Errno> {
+        ) -> Result<(), Errno> {
             tokio::time::sleep(DELAY).await;
-            buf.copy_from(&ZEROES[..buf.len()])?;
-            Ok(buf.len())
+            buf.put_slice(&ZEROES[..buf.remaining()])?;
+            Ok(())
         }
 
         async fn write(
@@ -573,11 +573,11 @@ fn discard(ctl: ControlDevice) {
         async fn read(
             &self,
             _off: Sector,
-            mut buf: ReadBuf<'_>,
+            buf: &mut ReadBuf<'_>,
             _flags: IoFlags,
-        ) -> Result<usize, Errno> {
-            buf.copy_from(&ZEROES[..buf.len()])?;
-            Ok(buf.len())
+        ) -> Result<(), Errno> {
+            buf.put_slice(&ZEROES[..buf.remaining()])?;
+            Ok(())
         }
 
         async fn write(
@@ -732,11 +732,11 @@ fn zoned(ctl: ControlDevice) {
         async fn read(
             &self,
             _off: Sector,
-            mut buf: ReadBuf<'_>,
+            buf: &mut ReadBuf<'_>,
             _flags: IoFlags,
-        ) -> Result<usize, Errno> {
-            buf.copy_from(&ZEROES[..buf.len()])?;
-            Ok(buf.len())
+        ) -> Result<(), Errno> {
+            buf.put_slice(&ZEROES[..buf.remaining()])?;
+            Ok(())
         }
 
         async fn write(
