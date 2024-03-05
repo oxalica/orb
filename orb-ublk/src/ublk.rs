@@ -1314,8 +1314,8 @@ pub struct DeviceParams {
     set_io_flusher: bool,
     attrs: DeviceAttrs,
     dev_sectors: Sector,
-    logical_block_size: u32,
-    physical_block_size: u32,
+    logical_block_shift: u8,
+    physical_block_shift: u8,
     chunk_sectors: Sector,
     io_optimal_size: u32,
     io_min_size: u32,
@@ -1340,8 +1340,8 @@ impl DeviceParams {
             set_io_flusher: false,
             attrs: DeviceAttrs::empty(),
             dev_sectors: Sector(0),
-            logical_block_size: 512,
-            physical_block_size: 4 << 10,
+            logical_block_shift: 512u32.trailing_zeros() as u8,
+            physical_block_shift: 4096u32.trailing_zeros() as u8,
             io_optimal_size: 4 << 10,
             io_min_size: 4 << 10,
             max_sectors: Sector((DEFAULT_IO_BUF_SIZE / Sector::SIZE) as u64),
@@ -1368,6 +1368,36 @@ impl DeviceParams {
     /// Set the total size of the block device in [`Sector`]s.
     pub fn dev_sectors(&mut self, sec: Sector) -> &mut Self {
         self.dev_sectors = sec;
+        self
+    }
+
+    /// Set logical block size in bytes.
+    ///
+    /// It must be a power of two and not greater than the page size (typically 4096bytes).
+    ///
+    /// See:
+    /// <https://www.kernel.org/doc/html/v6.7/core-api/kernel-api.html#c.blk_queue_logical_block_size>
+    ///
+    /// # Panics
+    ///
+    /// Panic if `size` is not a power of two.
+    pub fn logical_block_size(&mut self, size: u64) -> &mut Self {
+        assert!(size.is_power_of_two());
+        self.logical_block_shift = size.trailing_zeros() as u8;
+        self
+    }
+
+    /// Set physical block size in bytes.
+    ///
+    /// See:
+    /// <https://www.kernel.org/doc/html/v6.7/core-api/kernel-api.html#c.blk_queue_physical_block_size>
+    ///
+    /// # Panics
+    ///
+    /// Panic if `size` is not a power of two.
+    pub fn physical_block_size(&mut self, size: u64) -> &mut Self {
+        assert!(size.is_power_of_two());
+        self.physical_block_shift = size.trailing_zeros() as u8;
         self
     }
 
@@ -1450,8 +1480,8 @@ impl DeviceParams {
             types: attrs.bits(),
             basic: binding::ublk_param_basic {
                 attrs: self.attrs.bits(),
-                logical_bs_shift: self.logical_block_size.trailing_zeros() as _,
-                physical_bs_shift: self.physical_block_size.trailing_zeros() as _,
+                logical_bs_shift: self.logical_block_shift,
+                physical_bs_shift: self.physical_block_shift,
                 io_opt_shift: self.io_optimal_size.trailing_zeros() as _,
                 io_min_shift: self.io_min_size.trailing_zeros() as _,
                 max_sectors: self.max_sectors.0.try_into().unwrap(),

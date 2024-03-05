@@ -18,6 +18,11 @@ use rustix::io::Errno;
 struct Cli {
     backing_file: PathBuf,
 
+    #[clap(long, default_value = "512")]
+    logical_block_size: u64,
+    #[clap(long, default_value = "4096")]
+    physical_block_size: u64,
+
     #[clap(long)]
     discard: bool,
     #[clap(long)]
@@ -57,6 +62,8 @@ fn main() -> anyhow::Result<()> {
         .context("failed to create ublk device")?;
     let mut params = *DeviceParams::new()
         .dev_sectors(size_sectors)
+        .logical_block_size(cli.logical_block_size)
+        .physical_block_size(cli.physical_block_size)
         .attrs(DeviceAttrs::VolatileCache)
         .set_io_flusher(cli.privileged);
     if cli.discard {
