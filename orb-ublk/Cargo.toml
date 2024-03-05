@@ -43,6 +43,8 @@ cast-sign-loss = "allow"
 default-trait-access = "allow"
 # For semantics.
 items-after-statements = "allow"
+# It makes things more unreadable.
+transmute-ptr-to-ptr = "allow"
 
 # TODO
 missing-panics-doc = "allow"

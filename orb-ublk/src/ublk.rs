@@ -1779,17 +1779,35 @@ impl WriteBuf<'_> {
     ///
     /// Panic if `out.len()` differs from [`Self::len()`].
     pub fn copy_to_slice(&self, out: &mut [u8]) -> Result<(), Errno> {
+        // SAFETY: `&[MaybeUninit<u8>]` has the same repr as `&[u8]`.
+        let out = unsafe { mem::transmute::<&mut [u8], &mut [MaybeUninit<u8>]>(out) };
+        self.copy_to_uninitialized(out)?;
+        Ok(())
+    }
+
+    /// Copy the data to be written into `out`.
+    ///
+    /// Same as [`Self::copy_to_slice`] but accept a maybe-uninitialized slice.
+    ///
+    /// # Panics
+    ///
+    /// Panic if `out.len()` differs from [`Self::len()`].
+    pub fn copy_to_uninitialized<'a>(
+        &self,
+        out: &'a mut [MaybeUninit<u8>],
+    ) -> Result<&'a mut [u8], Errno> {
         assert_eq!(out.len(), self.len());
         match &self.0 {
-            RawBuf::PreCopied(b) => out.copy_from_slice(b),
-            RawBuf::UserCopy { cdev, off, .. } => {
-                // SAFETY: The fd is valid and `ManuallyDrop` prevents its close.
-                let cdev = unsafe { ManuallyDrop::new(File::from_raw_fd(cdev.as_raw_fd())) };
-                cdev.read_exact_at(out, *off)
-                    .map_err(|e| Errno::from_io_error(&e).unwrap())?;
+            RawBuf::PreCopied(buf) => {
+                // SAFETY: `&[MaybeUninit<u8>]` has the same repr as `&[u8]`.
+                let buf = unsafe { mem::transmute::<&[u8], &[MaybeUninit<u8>]>(&**buf) };
+                out.copy_from_slice(buf);
+                // SAFETY: `&[MaybeUninit<u8>]` has the same repr as `&[u8]` and is fully
+                // initialized.
+                unsafe { Ok(mem::transmute::<&mut [MaybeUninit<u8>], &mut [u8]>(out)) }
             }
+            RawBuf::UserCopy { cdev, off, .. } => read_all_uninit_at(*cdev, out, *off),
         }
-        Ok(())
     }
 
     /// Try to get the internal buffer as a slice for manual usage.
@@ -1849,4 +1867,25 @@ impl ZoneBuf<'_> {
         self.off += data.len() as u64;
         Ok(len)
     }
+}
+
+fn read_all_uninit_at<'a>(
+    fd: BorrowedFd<'_>,
+    buf: &'a mut [MaybeUninit<u8>],
+    mut offset: u64,
+) -> Result<&'a mut [u8], Errno> {
+    let mut buf_off = 0usize;
+    while buf_off < buf.len() {
+        match rustix::io::pread_uninit(fd, &mut buf[buf_off..], offset) {
+            Ok(([], _)) => return Err(Errno::INVAL),
+            Ok((read, _)) => {
+                offset += read.len() as u64;
+                buf_off += read.len();
+            }
+            Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
+            Err(err) => return Err(err),
+        }
+    }
+    // SAFETY: `&[MaybeUninit<u8>]` has the same repr as `&[u8]` and is initialized.
+    Ok(unsafe { mem::transmute::<&mut [MaybeUninit<u8>], &mut [u8]>(buf) })
 }
