@@ -1,7 +1,7 @@
 pub mod runtime;
 mod ublk;
 
-use std::fmt;
+use std::{fmt, ops};
 
 pub use ublk::*;
 
@@ -65,7 +65,7 @@ impl Sector {
     }
 }
 
-impl std::ops::Mul<u64> for Sector {
+impl ops::Mul<u64> for Sector {
     type Output = Self;
 
     fn mul(self, rhs: u64) -> Self::Output {
@@ -73,10 +73,18 @@ impl std::ops::Mul<u64> for Sector {
     }
 }
 
-impl std::ops::Div<Sector> for Sector {
+impl ops::Div<Sector> for Sector {
     type Output = u64;
 
     fn div(self, rhs: Self) -> Self::Output {
         self.0 / rhs.0
+    }
+}
+
+impl ops::Rem<Sector> for Sector {
+    type Output = u64;
+
+    fn rem(self, rhs: Sector) -> Self::Output {
+        self.0 % rhs.0
     }
 }
