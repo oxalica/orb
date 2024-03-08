@@ -82,9 +82,9 @@ impl ops::Div<Sector> for Sector {
 }
 
 impl ops::Rem<Sector> for Sector {
-    type Output = u64;
+    type Output = Sector;
 
     fn rem(self, rhs: Sector) -> Self::Output {
-        self.0 % rhs.0
+        Sector(self.0 % rhs.0)
     }
 }
