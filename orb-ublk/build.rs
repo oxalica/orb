@@ -21,11 +21,18 @@ const HEADER_CONTENT: &str = "
 ";
 
 #[derive(Debug)]
-struct PreserveIoctlCallback;
+struct CustomCallback;
 
-impl bindgen::callbacks::ParseCallbacks for PreserveIoctlCallback {
+impl bindgen::callbacks::ParseCallbacks for CustomCallback {
     fn item_name(&self, original_item_name: &str) -> Option<String> {
         Some(original_item_name.trim_start_matches("Fix753_").to_owned())
+    }
+
+    fn add_derives(&self, info: &bindgen::callbacks::DeriveInfo<'_>) -> Vec<String> {
+        if info.name == "blk_zone" {
+            return vec!["PartialEq".into(), "Eq".into()];
+        }
+        Vec::new()
     }
 }
 
@@ -35,7 +42,7 @@ fn main() {
     bindgen::Builder::default()
         .header_contents("wrapper.h", HEADER_CONTENT)
         .parse_callbacks(Box::new(bindgen::CargoCallbacks::new()))
-        .parse_callbacks(Box::new(PreserveIoctlCallback))
+        .parse_callbacks(Box::new(CustomCallback))
         .use_core()
         .allowlist_var("UBLK(?:SRV)?_.*|Fix753_.*")
         .allowlist_type("ublk(?:srv)?_.*|blk_zone(?:_type|_cond|)")

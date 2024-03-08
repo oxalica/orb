@@ -1518,7 +1518,7 @@ impl DeviceParams {
 /// Aka. `struct blk_zone`.
 ///
 /// See: <https://elixir.bootlin.com/linux/v6.7/source/include/uapi/linux/blkzoned.h#L85>
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(transparent)]
 pub struct Zone(binding::blk_zone);
 
