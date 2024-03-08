@@ -1544,13 +1544,38 @@ impl Zone {
             reserved: [0; 24],
         })
     }
+
+    #[must_use]
+    pub fn start(&self) -> Sector {
+        Sector(self.0.start)
+    }
+
+    #[must_use]
+    pub fn len(&self) -> Sector {
+        Sector(self.0.len)
+    }
+
+    #[must_use]
+    pub fn wp(&self) -> Sector {
+        Sector(self.0.wp)
+    }
+
+    #[must_use]
+    pub fn type_(&self) -> ZoneType {
+        ZoneType::from_repr(self.0.type_).expect("invalid type")
+    }
+
+    #[must_use]
+    pub fn cond(&self) -> ZoneCond {
+        ZoneCond::from_repr(self.0.type_).expect("invalid cond")
+    }
 }
 
 /// Type of zones.
 ///
 /// Aka. `enum blk_zone_type`.
 /// See: <https://elixir.bootlin.com/linux/v6.7/source/include/uapi/linux/blkzoned.h#L22>
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, strum::FromRepr)]
 #[non_exhaustive]
 #[repr(u8)]
 pub enum ZoneType {
@@ -1567,7 +1592,7 @@ pub enum ZoneType {
 ///
 /// Aka. `enum blk_zone_cond`.
 /// See: <https://elixir.bootlin.com/linux/v6.7/source/include/uapi/linux/blkzoned.h#L38>
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, strum::FromRepr)]
 #[non_exhaustive]
 #[repr(u8)]
 pub enum ZoneCond {
@@ -1710,9 +1735,15 @@ impl RawBuf<'_> {
 
 /// The return buffer for [`BlockDevice::read`].
 #[derive(Debug)]
-pub struct ReadBuf<'a>(RawBuf<'a>, PhantomData<*mut ()>);
+pub struct ReadBuf<'buf>(RawBuf<'buf>, PhantomData<*mut ()>);
 
-impl ReadBuf<'_> {
+impl<'buf> ReadBuf<'buf> {
+    /// Create a buffer for testing purpose.
+    #[must_use]
+    pub fn from_raw(buf: &'buf mut [u8]) -> Self {
+        Self(RawBuf::PreCopied(buf), PhantomData)
+    }
+
     /// Returns the number of bytes that have not yet been filled.
     #[must_use]
     pub fn remaining(&self) -> usize {
@@ -1758,9 +1789,15 @@ impl ReadBuf<'_> {
 
 /// The input buffer for [`BlockDevice::write`].
 #[derive(Debug)]
-pub struct WriteBuf<'a>(RawBuf<'a>, PhantomData<*mut ()>);
+pub struct WriteBuf<'buf>(RawBuf<'buf>, PhantomData<*mut ()>);
 
-impl WriteBuf<'_> {
+impl<'buf> WriteBuf<'buf> {
+    /// Create a buffer for testing purpose.
+    #[must_use]
+    pub fn from_raw(buf: &'buf mut [u8]) -> Self {
+        Self(RawBuf::PreCopied(buf), PhantomData)
+    }
+
     /// Returns the byte length requested for write, which must not be zero.
     // It must not be empty.
     #[allow(clippy::len_without_is_empty)]
@@ -1827,15 +1864,26 @@ impl WriteBuf<'_> {
 
 /// The return buffer for [`BlockDevice::report_zones`].
 #[derive(Debug)]
-pub struct ZoneBuf<'a> {
-    cdev: BorrowedFd<'a>,
+pub struct ZoneBuf<'buf> {
+    cdev: BorrowedFd<'buf>,
     off: u64,
     remaining_zones: u32,
     #[allow(clippy::mut_mut)]
-    _not_send_invariant: PhantomData<(*mut (), &'a mut &'a mut ())>,
+    _not_send_invariant: PhantomData<(*mut (), &'buf mut &'buf mut ())>,
 }
 
-impl ZoneBuf<'_> {
+impl<'buf> ZoneBuf<'buf> {
+    /// Create a buffer for testing purpose.
+    #[must_use]
+    pub fn from_raw(cdev: BorrowedFd<'buf>, off: u64, remaining_zones: u32) -> Self {
+        Self {
+            cdev,
+            off,
+            remaining_zones,
+            _not_send_invariant: PhantomData,
+        }
+    }
+
     /// Returns the remaining number of zones unfilled in this buffer, which must not be zero
     /// initially.
     #[must_use]
