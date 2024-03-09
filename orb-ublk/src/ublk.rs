@@ -1540,9 +1540,17 @@ impl Zone {
             non_seq: 0,
             reset: 0,
             resv: [0; 4],
-            capacity: 0,
+            // NB. This struct is passed directly into kernel codes, where many code
+            // (like BTRFS) expects `capacity` to be set correctly.
+            capacity: len.0,
             reserved: [0; 24],
         })
+    }
+
+    #[must_use]
+    pub fn with_capacity(mut self, capacity: u64) -> Self {
+        self.0.capacity = capacity;
+        self
     }
 
     #[must_use]

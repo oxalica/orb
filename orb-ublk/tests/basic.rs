@@ -701,10 +701,10 @@ fn zoned(ctl: ControlDevice) {
                 let report = cmd!(sh, "blkzone report {dev_path}").read().unwrap();
                 println!("{report}");
                 let expect = "
-  start: 0x000000000, len 0x000002, cap 0x000000, wptr 0x000000 reset:0 non-seq:0, zcond: 0(nw) [type: 1(CONVENTIONAL)]
-  start: 0x000000002, len 0x000002, cap 0x000000, wptr 0x000000 reset:0 non-seq:0, zcond: 0(nw) [type: 1(CONVENTIONAL)]
-  start: 0x000000004, len 0x000002, cap 0x000000, wptr 0x000002 reset:0 non-seq:0, zcond: 1(em) [type: 2(SEQ_WRITE_REQUIRED)]
-  start: 0x000000006, len 0x000002, cap 0x000000, wptr 0x000003 reset:0 non-seq:0, zcond: 1(em) [type: 2(SEQ_WRITE_REQUIRED)]
+  start: 0x000000000, len 0x000002, cap 0x000002, wptr 0x000000 reset:0 non-seq:0, zcond: 0(nw) [type: 1(CONVENTIONAL)]
+  start: 0x000000002, len 0x000002, cap 0x000002, wptr 0x000000 reset:0 non-seq:0, zcond: 0(nw) [type: 1(CONVENTIONAL)]
+  start: 0x000000004, len 0x000002, cap 0x000002, wptr 0x000002 reset:0 non-seq:0, zcond: 1(em) [type: 2(SEQ_WRITE_REQUIRED)]
+  start: 0x000000006, len 0x000002, cap 0x000002, wptr 0x000003 reset:0 non-seq:0, zcond: 1(em) [type: 2(SEQ_WRITE_REQUIRED)]
                 ";
                 assert_eq!(report.trim(), expect.trim());
 
