@@ -144,15 +144,18 @@ fn main() -> anyhow::Result<()> {
         .zoned()
         .create_service(&ctl)
         .context("failed to create ublk device")?;
+    let zones_cnt_u32 = u32::try_from(zones_cnt).unwrap_or(u32::MAX);
     let params = *DeviceParams::new()
         .dev_sectors(size_sectors)
         .chunk_sectors(zone_sectors)
         .attrs(DeviceAttrs::VolatileCache)
         .set_io_flusher(cli.privileged)
         .zoned(ZonedParams {
-            max_open_zones: cli.max_open_zones,
-            max_active_zones: cli.max_active_zones,
-            max_zone_append_size: Sector::try_from_bytes(cli.max_zone_append_size.0).unwrap(),
+            max_open_zones: cli.max_open_zones.min(zones_cnt_u32),
+            max_active_zones: cli.max_active_zones.min(zones_cnt_u32),
+            max_zone_append_size: Sector::try_from_bytes(cli.max_zone_append_size.0)
+                .unwrap()
+                .min(size_sectors),
         });
     let handler = ZonedDev {
         file: backing_file,
@@ -193,28 +196,25 @@ impl BlockDevice for ZonedDev {
     async fn write(&self, off: Sector, buf: WriteBuf<'_>, _flags: IoFlags) -> Result<usize, Errno> {
         let off = off.bytes();
         let zid = off / self.zone_size;
-        {
-            let mut zones = self.zones.lock().unwrap();
-            let z = &mut zones.zones[zid as usize];
-            if (zid * self.zone_size + z.rel_wptr) != off {
-                return Err(Errno::IO);
-            }
-            let new_rel_wptr = z
-                .rel_wptr
-                .checked_add(buf.len() as u64)
-                .filter(|&p| p <= self.zone_size)
-                .ok_or(Errno::IO)?;
-            let mut buf2 = vec![0u8; buf.len()];
-            buf.copy_to_slice(&mut buf2)?;
-            self.file.write_all_at(&buf2, off).map_err(convert_err)?;
-            z.rel_wptr = new_rel_wptr;
-            if new_rel_wptr == self.zone_size {
-                z.cond = ZoneCond::Full;
-            } else if z.cond == ZoneCond::Closed {
-                z.cond = ZoneCond::ImpOpen;
-            }
+        let mut zones = self.zones.lock().unwrap();
+        let z = &mut zones.zones[zid as usize];
+        if (zid * self.zone_size + z.rel_wptr) != off {
+            return Err(Errno::IO);
         }
-
+        let new_rel_wptr = z
+            .rel_wptr
+            .checked_add(buf.len() as u64)
+            .filter(|&p| p <= self.zone_size)
+            .ok_or(Errno::IO)?;
+        let mut buf2 = vec![0u8; buf.len()];
+        buf.copy_to_slice(&mut buf2)?;
+        self.file.write_all_at(&buf2, off).map_err(convert_err)?;
+        z.rel_wptr = new_rel_wptr;
+        if new_rel_wptr == self.zone_size {
+            z.cond = ZoneCond::Full;
+        } else if matches!(z.cond, ZoneCond::Closed | ZoneCond::Empty) {
+            z.cond = ZoneCond::ImpOpen;
+        }
         Ok(buf.len())
     }
 
@@ -235,6 +235,7 @@ impl BlockDevice for ZonedDev {
             ZoneCond::Empty | ZoneCond::ImpOpen | ZoneCond::ExpOpen | ZoneCond::Closed => {
                 ZoneCond::ExpOpen
             }
+            ZoneCond::Full => return Err(Errno::IO),
             _ => unreachable!(),
         };
         Ok(())
@@ -245,9 +246,16 @@ impl BlockDevice for ZonedDev {
         let mut zones = self.zones.lock().unwrap();
         let z = &mut zones.zones[zid as usize];
         z.cond = match z.cond {
-            ZoneCond::ExpOpen if z.rel_wptr == 0 => ZoneCond::Empty,
-            ZoneCond::ExpOpen => ZoneCond::Closed,
-            st => st,
+            ZoneCond::ExpOpen | ZoneCond::ImpOpen => {
+                if z.rel_wptr == 0 {
+                    ZoneCond::Empty
+                } else {
+                    ZoneCond::Closed
+                }
+            }
+            ZoneCond::Empty | ZoneCond::Closed => z.cond,
+            ZoneCond::Full => return Err(Errno::IO),
+            _ => unreachable!(),
         };
         Ok(())
     }
@@ -336,7 +344,7 @@ impl BlockDevice for ZonedDev {
         z.rel_wptr = new_rel_wptr;
         if new_rel_wptr == self.zone_size {
             z.cond = ZoneCond::Full;
-        } else if z.cond == ZoneCond::Closed {
+        } else if matches!(z.cond, ZoneCond::Closed | ZoneCond::Empty) {
             z.cond = ZoneCond::ImpOpen;
         }
         Ok(Sector::from_bytes(old_wptr))
