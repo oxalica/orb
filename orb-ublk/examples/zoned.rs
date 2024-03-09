@@ -22,6 +22,13 @@ struct Cli {
     backing_file: PathBuf,
     metadata_file: PathBuf,
 
+    #[clap(long, default_value = "512")]
+    logical_block_size: ByteSize,
+    #[clap(long, default_value = "4KiB")]
+    physical_block_size: ByteSize,
+    #[clap(long, default_value = "512KiB")]
+    io_buf_size: ByteSize,
+
     #[clap(long)]
     zone_size: ByteSize,
     #[clap(long)]
@@ -142,6 +149,7 @@ fn main() -> anyhow::Result<()> {
     let mut srv = builder
         .name("ublk-zoned")
         .zoned()
+        .io_buf_size(u32::try_from(cli.io_buf_size.0).context("buffer size too large")?)
         .create_service(&ctl)
         .context("failed to create ublk device")?;
     let zones_cnt_u32 = u32::try_from(zones_cnt).unwrap_or(u32::MAX);
@@ -149,6 +157,11 @@ fn main() -> anyhow::Result<()> {
         .dev_sectors(size_sectors)
         .chunk_sectors(zone_sectors)
         .attrs(DeviceAttrs::VolatileCache)
+        .logical_block_size(cli.logical_block_size.0)
+        .physical_block_size(cli.physical_block_size.0)
+        .io_min_size(cli.physical_block_size.0)
+        .io_opt_size(cli.physical_block_size.0)
+        .io_max_sectors(Sector::from_bytes(cli.io_buf_size.0))
         .set_io_flusher(cli.privileged)
         .zoned(ZonedParams {
             max_open_zones: cli.max_open_zones.min(zones_cnt_u32),
@@ -179,7 +192,11 @@ struct ZonedDev {
 
 impl BlockDevice for ZonedDev {
     fn ready(&self, dev_info: &DeviceInfo, stop: Stopper) -> io::Result<()> {
-        log::info!("device ready on {}", dev_info.dev_id());
+        log::info!(
+            "device ready on {}, info: {:?}",
+            dev_info.dev_id(),
+            dev_info,
+        );
         ctrlc::set_handler(move || stop.stop()).expect("failed to set Ctrl-C hook");
         Ok(())
     }

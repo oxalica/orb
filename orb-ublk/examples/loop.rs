@@ -64,6 +64,8 @@ fn main() -> anyhow::Result<()> {
         .dev_sectors(size_sectors)
         .logical_block_size(cli.logical_block_size)
         .physical_block_size(cli.physical_block_size)
+        .io_min_size(cli.physical_block_size)
+        .io_opt_size(cli.physical_block_size)
         .attrs(DeviceAttrs::VolatileCache)
         .set_io_flusher(cli.privileged);
     if cli.discard {

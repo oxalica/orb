@@ -21,6 +21,7 @@ use rustix::process::Pid;
 use crate::runtime::{AsyncRuntime, AsyncRuntimeBuilder, AsyncScopeSpawner};
 use crate::Sector;
 
+// This is mentioned in docs of `DeviceAttrs::io_max_sectors`.
 const DEFAULT_IO_BUF_SIZE: u32 = 512 << 10;
 
 pub const CDEV_PREFIX: &str = "/dev/ublkc";
@@ -1317,9 +1318,9 @@ pub struct DeviceParams {
     logical_block_shift: u8,
     physical_block_shift: u8,
     chunk_sectors: Sector,
-    io_optimal_size: u32,
-    io_min_size: u32,
-    max_sectors: Sector,
+    io_min_shift: u8,
+    io_opt_shift: u8,
+    io_max_secs: u32,
     virt_boundary_mask: u64,
     discard: Option<DiscardParams>,
     zoned: Option<ZonedParams>,
@@ -1342,9 +1343,9 @@ impl DeviceParams {
             dev_sectors: Sector(0),
             logical_block_shift: 512u32.trailing_zeros() as u8,
             physical_block_shift: 4096u32.trailing_zeros() as u8,
-            io_optimal_size: 4 << 10,
-            io_min_size: 4 << 10,
-            max_sectors: Sector((DEFAULT_IO_BUF_SIZE / Sector::SIZE) as u64),
+            io_min_shift: 4096u32.trailing_zeros() as u8,
+            io_opt_shift: 4096u32.trailing_zeros() as u8,
+            io_max_secs: Sector::from_bytes(DEFAULT_IO_BUF_SIZE as u64).0 as u32,
             chunk_sectors: Sector(0),
             virt_boundary_mask: 0,
             discard: None,
@@ -1401,13 +1402,37 @@ impl DeviceParams {
         self
     }
 
-    /// Set minimum request size for the queue in [`Sector`]s.
+    /// Set minimum request size for the queue in bytes.
     ///
     /// See:
     /// <https://www.kernel.org/doc/html/v6.7/core-api/kernel-api.html#c.blk_queue_io_min>
-    pub fn max_sectors(&mut self, sec: Sector) -> &mut Self {
-        assert!(u32::try_from(sec.0).is_ok());
-        self.max_sectors = sec;
+    pub fn io_min_size(&mut self, size: u64) -> &mut Self {
+        assert!(size.is_power_of_two());
+        self.io_min_shift = size.trailing_zeros() as u8;
+        self
+    }
+
+    /// Set optimal request size for the queue in bytes.
+    ///
+    /// See:
+    /// <https://www.kernel.org/doc/html/v6.7/core-api/kernel-api.html#c.blk_queue_io_opt>
+    pub fn io_opt_size(&mut self, size: u64) -> &mut Self {
+        assert!(size.is_power_of_two());
+        self.io_opt_shift = size.trailing_zeros() as u8;
+        self
+    }
+
+    /// Set maximum request size for the queue in [`Sector`]s.
+    ///
+    /// Note that a single request can still only pass at most [`DeviceBuilder::io_buf_size`] bytes
+    /// data (which is 512KiB by default). Thus it is recommended to set both parameters together
+    /// to make sure it takes effect.
+    ///
+    /// See:
+    /// <https://www.kernel.org/doc/html/v6.7/core-api/kernel-api.html#c.blk_queue_max_hw_sectors>
+    pub fn io_max_sectors(&mut self, size: Sector) -> &mut Self {
+        assert!(u32::try_from(size.0).is_ok());
+        self.io_max_secs = size.0 as u32;
         self
     }
 
@@ -1482,9 +1507,9 @@ impl DeviceParams {
                 attrs: self.attrs.bits(),
                 logical_bs_shift: self.logical_block_shift,
                 physical_bs_shift: self.physical_block_shift,
-                io_opt_shift: self.io_optimal_size.trailing_zeros() as _,
-                io_min_shift: self.io_min_size.trailing_zeros() as _,
-                max_sectors: self.max_sectors.0.try_into().unwrap(),
+                io_opt_shift: self.io_opt_shift,
+                io_min_shift: self.io_min_shift,
+                max_sectors: self.io_max_secs,
                 dev_sectors: self.dev_sectors.0,
                 chunk_sectors: self.chunk_sectors.0.try_into().unwrap(),
                 virt_boundary_mask: self.virt_boundary_mask,
