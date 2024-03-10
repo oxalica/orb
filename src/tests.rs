@@ -85,6 +85,14 @@ impl Backend for TestBackend {
         act!(self, "delete_zone({zid})");
         ready(Ok(()))
     }
+
+    fn delete_all_zones(&self) -> impl Future<Output = Result<()>> + Send + 'static {
+        for zone in &mut *self.chunks.lock() {
+            zone.clear()
+        }
+        act!(self, "delete_all_zones()");
+        ready(Ok(()))
+    }
 }
 
 trait TestFrontend: BlockDevice {
@@ -216,4 +224,93 @@ async fn init_chunks() {
         zone(2, Sector(0), ZoneCond::Empty),
     ];
     assert_eq!(got, expect);
+}
+
+#[tokio::test]
+async fn zone_state_transition() {
+    let dev = new_dev(&[(0, 0, vec![1u8; 512]), (2, 0, vec![2u8; 512])]);
+
+    let got = dev.test_report_zones(Sector(0), 4).await.unwrap();
+    let expect_init = vec![
+        zone(0, Sector(1), ZoneCond::Closed),
+        zone(1, Sector(0), ZoneCond::Empty),
+        zone(2, Sector(1), ZoneCond::Closed),
+        zone(3, Sector(0), ZoneCond::Empty),
+    ];
+    assert_eq!(got, expect_init);
+
+    // ZONE_OPEN and ZONE_CLOSE are idempotent.
+    let open_offsets = [Sector(0), CONFIG.zone_secs].repeat(2);
+
+    for &off in &open_offsets {
+        dev.zone_open(off, IoFlags::empty()).await.unwrap();
+    }
+
+    let got = dev.test_report_zones(Sector(0), 4).await.unwrap();
+    let expect_opened = vec![
+        zone(0, Sector(1), ZoneCond::ExpOpen),
+        zone(1, Sector(0), ZoneCond::ExpOpen),
+        zone(2, Sector(1), ZoneCond::Closed),
+        zone(3, Sector(0), ZoneCond::Empty),
+    ];
+    assert_eq!(got, expect_opened);
+
+    for &off in &open_offsets {
+        dev.zone_close(off, IoFlags::empty()).await.unwrap();
+    }
+
+    let got = dev.test_report_zones(Sector(0), 4).await.unwrap();
+    assert_eq!(got, expect_init);
+
+    assert_eq!(dev.backend().drain_log(), "");
+}
+
+#[tokio::test]
+async fn reset_zone() {
+    let dev = new_dev(&[(0, 0, vec![1u8; 512]), (2, 0, vec![2u8; 512])]);
+    for off in [Sector(0), CONFIG.zone_secs] {
+        dev.zone_open(off, IoFlags::empty()).await.unwrap();
+    }
+
+    let got = dev.test_report_zones(Sector(0), 4).await.unwrap();
+    let expect = vec![
+        zone(0, Sector(1), ZoneCond::ExpOpen),
+        zone(1, Sector(0), ZoneCond::ExpOpen),
+        zone(2, Sector(1), ZoneCond::Closed),
+        zone(3, Sector(0), ZoneCond::Empty),
+    ];
+    assert_eq!(got, expect);
+
+    for i in 0..4 {
+        dev.zone_reset(CONFIG.zone_secs * i, IoFlags::empty())
+            .await
+            .unwrap();
+    }
+
+    let got = dev.test_report_zones(Sector(0), 4).await.unwrap();
+    let expect = vec![
+        zone(0, Sector(0), ZoneCond::Empty),
+        zone(1, Sector(0), ZoneCond::Empty),
+        zone(2, Sector(0), ZoneCond::Empty),
+        zone(3, Sector(0), ZoneCond::Empty),
+    ];
+    assert_eq!(got, expect);
+
+    // Only non-empty zones are committed to backend.
+    assert_eq!(dev.backend().drain_log(), "delete_zone(0);delete_zone(2);");
+}
+
+#[tokio::test]
+async fn reset_all_zone() {
+    let dev = new_dev(&[(0, 0, vec![1u8; 512]), (2, 0, vec![2u8; 512])]);
+    dev.zone_reset_all(IoFlags::empty()).await.unwrap();
+    let got = dev.test_report_zones(Sector(0), 4).await.unwrap();
+    let expect = vec![
+        zone(0, Sector(0), ZoneCond::Empty),
+        zone(1, Sector(0), ZoneCond::Empty),
+        zone(2, Sector(0), ZoneCond::Empty),
+        zone(3, Sector(0), ZoneCond::Empty),
+    ];
+    assert_eq!(got, expect);
+    assert_eq!(dev.backend().drain_log(), "delete_all_zones();");
 }

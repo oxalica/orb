@@ -66,6 +66,7 @@ pub trait Backend: Send + Sync + 'static {
         data: Bytes,
     ) -> impl Future<Output = Result<()>> + Send + 'static;
     fn delete_zone(&self, zid: u64) -> impl Future<Output = Result<()>> + Send + 'static;
+    fn delete_all_zones(&self) -> impl Future<Output = Result<()>> + Send + 'static;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -110,11 +111,17 @@ pub struct Frontend<B> {
     backend: B,
 
     zones: Box<[Zone]>,
+    /// The global write fence for exclusive write operations (RESET_ALL) or synchronization
+    /// (FLUSH). All remote modification holds a read-guard of this lock.
+    exclusive_write_fence: tokio::sync::RwLock<()>,
 }
 
 // `Mutex`es are locked in definition order.
 #[derive(Debug)]
 struct Zone {
+    /// Any remote modification of the zone holds this lock, ie. WRITE, ZONE_APPEND, ZONE_RESET.
+    /// Note that any task holding this lock must hold `exclusive_write_fence` first.
+    commit_lock: tokio::sync::Mutex<()>,
     cond: Mutex<ZoneCond>,
     /// The end-offset relative to this zone for each chunks, in ascending order.
     chunk_ends: Mutex<Vec<u32>>,
@@ -123,6 +130,7 @@ struct Zone {
 impl Default for Zone {
     fn default() -> Self {
         Self {
+            commit_lock: tokio::sync::Mutex::new(()),
             chunk_ends: Mutex::default(),
             cond: Mutex::new(ZoneCond::Empty),
         }
@@ -139,8 +147,10 @@ impl<B> Frontend<B> {
 
         let mut this = Self {
             config,
-            zones,
             backend,
+
+            zones,
+            exclusive_write_fence: tokio::sync::RwLock::new(()),
         };
         this.init_chunks(all_chunks)
             .context("failed to initialize chunks")?;
@@ -339,6 +349,87 @@ impl<B: Backend> BlockDevice for Frontend<B> {
             .collect::<Vec<_>>();
 
         buf.report(&zones)?;
+        Ok(())
+    }
+
+    async fn zone_open(&self, off: Sector, _flags: IoFlags) -> Result<(), Errno> {
+        let zid = self.to_zone_id(off)?;
+        let mut cond = self.zones[zid].cond.lock();
+        match *cond {
+            ZoneCond::Empty | ZoneCond::ImpOpen | ZoneCond::Closed => {}
+            ZoneCond::ExpOpen => return Ok(()),
+            ZoneCond::Full => return Err(Errno::IO),
+            _ => unreachable!(),
+        }
+        *cond = ZoneCond::ExpOpen;
+        Ok(())
+    }
+
+    async fn zone_close(&self, off: Sector, _flags: IoFlags) -> Result<(), Errno> {
+        let zid = self.to_zone_id(off)?;
+        let zone = &self.zones[zid];
+        let mut cond = zone.cond.lock();
+        match *cond {
+            ZoneCond::ImpOpen | ZoneCond::ExpOpen => {}
+            ZoneCond::Empty | ZoneCond::Closed => return Ok(()),
+            ZoneCond::Full => return Err(Errno::IO),
+            _ => unreachable!(),
+        }
+        *cond = if zone.chunk_ends.lock().is_empty() {
+            ZoneCond::Empty
+        } else {
+            ZoneCond::Closed
+        };
+        Ok(())
+    }
+
+    async fn zone_reset(&self, off: Sector, _flags: IoFlags) -> Result<(), Errno> {
+        let zid = self.to_zone_id(off)?;
+        let zone = &self.zones[zid];
+        let _fence = self.exclusive_write_fence.read().await;
+        let _zone_guard = zone.commit_lock.lock().await;
+
+        // Fast path for empty (may or may not be opened) zones.
+        {
+            let mut cond = zone.cond.lock();
+            let chunks = zone.chunk_ends.lock();
+            if chunks.is_empty() {
+                *cond = ZoneCond::Empty;
+                return Ok(());
+            }
+        }
+
+        if let Err(err) = self.backend.delete_zone(zid as u64).await {
+            log::error!("failed to delete zone {zid}: {err}");
+            return Err(Errno::IO);
+        }
+
+        let mut cond = zone.cond.lock();
+        let mut chunks = zone.chunk_ends.lock();
+        *chunks = Vec::new();
+        *cond = ZoneCond::Empty;
+
+        Ok(())
+    }
+
+    async fn zone_reset_all(&self, _flags: IoFlags) -> Result<(), Errno> {
+        let _fence = self.exclusive_write_fence.write().await;
+
+        if let Err(err) = self.backend.delete_all_zones().await {
+            log::error!("failed to delete all zones: {err}");
+            return Err(Errno::IO);
+        }
+        for zone in self.zones.iter() {
+            let mut cond = zone.cond.lock();
+            *cond = ZoneCond::Empty;
+            *zone.chunk_ends.lock() = Vec::new();
+        }
+        Ok(())
+    }
+
+    async fn flush(&self, _flags: IoFlags) -> Result<(), Errno> {
+        // Wait for all committing tasks to complete.
+        let _fence = self.exclusive_write_fence.write().await;
         Ok(())
     }
 }
