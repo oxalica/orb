@@ -1543,9 +1543,21 @@ impl DeviceParams {
 /// Aka. `struct blk_zone`.
 ///
 /// See: <https://elixir.bootlin.com/linux/v6.7/source/include/uapi/linux/blkzoned.h#L85>
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 #[repr(transparent)]
 pub struct Zone(binding::blk_zone);
+
+impl fmt::Debug for Zone {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Zone")
+            .field("start", &self.start())
+            .field("len", &self.len())
+            .field("wp", &self.wp())
+            .field("type", &self.type_())
+            .field("cond", &self.cond())
+            .finish_non_exhaustive()
+    }
+}
 
 impl Zone {
     #[must_use]
