@@ -7,6 +7,7 @@ edition = "2021"
 anyhow = "1"
 bytes = "1"
 env_logger = "0.11"
+futures-util = "0.3"
 itertools = "0.12.1"
 log = "0.4.21"
 orb-ublk = { path = "./orb-ublk" }

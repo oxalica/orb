@@ -583,6 +583,7 @@ dependencies = [
  "anyhow",
  "bytes",
  "env_logger",
+ "futures-util",
  "itertools",
  "log",
  "orb-ublk",

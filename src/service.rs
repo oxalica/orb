@@ -32,11 +32,12 @@
 //! Note: directory names above are just for demostration and are reference as `(zid, coff)`
 //! integer tuple in code.
 #![deny(clippy::await_holding_lock)]
+use std::collections::BTreeSet;
 use std::future::Future;
 use std::io;
 
 use anyhow::{ensure, Context, Result};
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use itertools::Itertools;
 use orb_ublk::{
     BlockDevice, DeviceInfo, IoFlags, ReadBuf, Sector, Stopper, WriteBuf, ZoneBuf, ZoneCond,
@@ -111,6 +112,7 @@ pub struct Frontend<B> {
     backend: B,
 
     zones: Box<[Zone]>,
+    dirty_zones: Mutex<BTreeSet<u32>>,
     /// The global write fence for exclusive write operations (RESET_ALL) or synchronization
     /// (FLUSH). All remote modification holds a read-guard of this lock.
     exclusive_write_fence: tokio::sync::RwLock<()>,
@@ -124,7 +126,41 @@ struct Zone {
     commit_lock: tokio::sync::Mutex<()>,
     cond: Mutex<ZoneCond>,
     /// The end-offset relative to this zone for each chunks, in ascending order.
+    /// The tail chunk is excluded.
     chunk_ends: Mutex<Vec<u32>>,
+    tail: Mutex<TailChunk>,
+}
+
+impl Zone {
+    fn reset(&self) {
+        let mut cond = self.cond.lock();
+        let mut chunks = self.chunk_ends.lock();
+        let mut tail = self.tail.lock();
+        *cond = ZoneCond::Empty;
+        *chunks = Vec::new();
+        *tail = TailChunk::empty();
+    }
+}
+
+#[derive(Debug)]
+enum TailChunk {
+    Buffer(BytesMut),
+    Uploading(Bytes),
+}
+
+impl TailChunk {
+    fn empty() -> Self {
+        Self::Buffer(BytesMut::new())
+    }
+}
+
+impl AsRef<[u8]> for TailChunk {
+    fn as_ref(&self) -> &[u8] {
+        match self {
+            TailChunk::Buffer(buf) => buf,
+            TailChunk::Uploading(buf) => buf,
+        }
+    }
 }
 
 impl Default for Zone {
@@ -133,35 +169,35 @@ impl Default for Zone {
             commit_lock: tokio::sync::Mutex::new(()),
             chunk_ends: Mutex::default(),
             cond: Mutex::new(ZoneCond::Empty),
+            tail: Mutex::new(TailChunk::empty()),
         }
     }
 }
 
-impl<B> Frontend<B> {
-    pub fn new(config: Config, all_chunks: &[(u64, u32)], backend: B) -> Result<Self> {
+impl<B: Backend> Frontend<B> {
+    pub fn new(config: Config, backend: B) -> Result<Self> {
         config.validate().context("invalid configuration")?;
         let nr_zones = usize::try_from(config.dev_secs / config.zone_secs).unwrap();
         let zones = std::iter::repeat_with(Zone::default)
             .take(nr_zones)
             .collect::<Box<[_]>>();
-
-        let mut this = Self {
+        Ok(Self {
             config,
             backend,
 
             zones,
+            dirty_zones: Mutex::default(),
             exclusive_write_fence: tokio::sync::RwLock::new(()),
-        };
-        this.init_chunks(all_chunks)
-            .context("failed to initialize chunks")?;
-        Ok(this)
+        })
     }
 
-    fn init_chunks(&mut self, all_chunks: &[(u64, u32)]) -> Result<()> {
+    pub async fn init_chunks(&mut self, all_chunks: &[(u64, u32)]) -> Result<()> {
         ensure!(
             all_chunks.windows(2).all(|w| w[0].0 < w[1].0),
             "chunks are not sorted",
         );
+
+        let mut download_tail_futs = Vec::new();
 
         let zone_size = self.config.zone_secs.bytes();
         for (zid, mut zone_chunks) in &all_chunks
@@ -178,7 +214,7 @@ impl<B> Frontend<B> {
             let zone = &mut self.zones[zid as usize];
             let zone_start = zid * zone_size;
             let mut is_zone_finished = false;
-            let chunk_ends = zone_chunks
+            let mut chunk_ends = zone_chunks
                 .scan(0u32, |coff, (global_off, len)| {
                     let ret = (|| {
                         let expect_global_off = zone_start + *coff as u64;
@@ -216,9 +252,44 @@ impl<B> Frontend<B> {
             } else {
                 ZoneCond::Closed
             };
+
+            let (tail_coff, tail_len) = match *chunk_ends {
+                [] => (0, 0),
+                [end] => (0, end as usize),
+                [.., start, end] => (start, (end - start) as usize),
+            };
+            if tail_len != 0 && tail_len > self.config.min_chunk_size {
+                // Exclude the tail chunk.
+                chunk_ends.pop();
+                let fut = self
+                    .backend
+                    .download_chunk(zid as u32, tail_coff, 0, tail_len);
+                download_tail_futs.push(async move { (zid, tail_coff, tail_len, fut.await) });
+            }
+
             *zone.chunk_ends.get_mut() = chunk_ends;
         }
-        Ok(())
+
+        let mut ret = Ok(());
+        for (zid, coff, len, download_ret) in
+            futures_util::future::join_all(download_tail_futs).await
+        {
+            match download_ret {
+                Ok(data) => {
+                    assert_eq!(data.len(), len);
+                    *self.zones[zid as usize].tail.get_mut() =
+                        TailChunk::Buffer(BytesMut::from(&data[..]));
+                }
+                Err(err) => {
+                    let err = err.context(format!(
+                        "failed to download tail chunk at zid={zid} tail_coff={coff} len={len}"
+                    ));
+                    log::debug!("{err}");
+                    ret = ret.and(Err(err));
+                }
+            }
+        }
+        ret
     }
 
     pub fn backend(&self) -> &B {
@@ -253,6 +324,93 @@ impl<B> Frontend<B> {
             Errno::INVAL
         })
     }
+
+    async fn zone_append_impl(
+        &self,
+        zid: usize,
+        coff: Option<u32>,
+        buf: &WriteBuf<'_>,
+    ) -> Result<u32, Errno> {
+        let zone = &self.zones[zid];
+        let _fence = self.exclusive_write_fence.read().await;
+        let _zone_guard = zone.commit_lock.lock().await;
+
+        let (tail_coff, data, prev_wp) = {
+            let mut cond = zone.cond.lock();
+            if *cond == ZoneCond::Full {
+                return Err(Errno::IO);
+            }
+
+            let chunks = zone.chunk_ends.lock();
+            let tail_coff = chunks.last().copied().unwrap_or(0);
+            let mut tail = zone.tail.lock();
+            drop(chunks);
+            let prev_wp = tail_coff + tail.as_ref().len() as u32;
+            if let Some(coff) = coff {
+                if coff != prev_wp {
+                    log::warn!(
+                        "nonsequential write: zid={zid} rel_wp={prev_wp} coff={coff} len={}",
+                        buf.len()
+                    );
+                    return Err(Errno::IO);
+                }
+            }
+
+            let TailChunk::Buffer(tail_buf) = &mut *tail else {
+                // Zone poisoned.
+                return Err(Errno::IO);
+            };
+
+            tail_buf.reserve(buf.len());
+            buf.copy_to_uninitialized(&mut tail_buf.spare_capacity_mut()[..buf.len()])?;
+            // SAFETY: Initialied.
+            unsafe { tail_buf.set_len(tail_buf.len() + buf.len()) };
+
+            let new_wp = tail_coff + tail_buf.len() as u32;
+            if new_wp as u64 == self.config.zone_secs.bytes() {
+                // If this write makes the zone full, update `cond` and commit inline.
+                *cond = ZoneCond::Full;
+            } else {
+                if matches!(*cond, ZoneCond::Empty | ZoneCond::Closed) {
+                    *cond = ZoneCond::ImpOpen;
+                }
+                if tail_buf.len() < self.config.max_chunk_size {
+                    // Buffer small writes.
+                    drop(tail);
+                    self.dirty_zones.lock().insert(zid as u32);
+                    return Ok(prev_wp);
+                }
+            }
+
+            let data = tail_buf.split().freeze();
+            *tail = TailChunk::Uploading(data.clone());
+            (tail_coff, data, prev_wp)
+        };
+
+        self.commit_tail_chunk(zid as u32, tail_coff, data).await?;
+        Ok(prev_wp)
+    }
+
+    async fn commit_tail_chunk(&self, zid: u32, coff: u32, data: Bytes) -> Result<(), Errno> {
+        let zone = &self.zones[zid as usize];
+        let len = data.len();
+        if let Err(err) = self.backend.upload_chunk(zid, coff, data).await {
+            log::error!("failed to upload chunk at zid={zid} coff={coff} len={len}: {err}");
+            // NB. Intentionally keep it in `TailChunk::Commiting` state,
+            // poison all following writes.
+            return Err(Errno::IO);
+        }
+
+        {
+            let mut chunks = zone.chunk_ends.lock();
+            let mut tail = zone.tail.lock();
+            chunks.push(coff + len as u32);
+            *tail = TailChunk::empty();
+        }
+        self.dirty_zones.lock().remove(&zid);
+
+        Ok(())
+    }
 }
 
 impl<B: Backend> BlockDevice for Frontend<B> {
@@ -270,14 +428,26 @@ impl<B: Backend> BlockDevice for Frontend<B> {
         while buf.remaining() != 0 {
             let (chunk_start, chunk_end) = {
                 let chunks = zone.chunk_ends.lock();
+                let tail_start = chunks.last().copied().unwrap_or(0);
+                if tail_start <= read_start {
+                    // Read from tail, or zeros beyond the write pointer.
+                    {
+                        let tail = zone.tail.lock();
+                        drop(chunks);
+                        let len = Ord::min(tail.as_ref().len(), buf.remaining());
+                        if len != 0 {
+                            buf.put_slice(&tail.as_ref()[..len])?;
+                        }
+                    }
+                    if buf.remaining() != 0 {
+                        buf.put_slice(&ZEROES[..buf.remaining()])?;
+                    }
+                    return Ok(());
+                }
+
                 // The first chunks whose end > `read_end`, covering the first byte to read.
                 let idx = chunks.partition_point(|&end| end <= read_start);
-                if idx == chunks.len() {
-                    // Read beyond write pointer. Return zeroes.
-                    drop(chunks);
-                    buf.put_slice(&ZEROES[..buf.remaining()])?;
-                    break;
-                }
+                assert!(idx < chunks.len());
                 (if idx > 0 { chunks[idx - 1] } else { 0 }, chunks[idx])
             };
 
@@ -306,14 +476,22 @@ impl<B: Backend> BlockDevice for Frontend<B> {
         Ok(())
     }
 
-    async fn write(
+    async fn write(&self, off: Sector, buf: WriteBuf<'_>, _flags: IoFlags) -> Result<usize, Errno> {
+        let (zid, coff) = self.check_zone_and_range(off, buf.len())?;
+        self.zone_append_impl(zid, Some(coff), &buf).await?;
+        Ok(buf.len())
+    }
+
+    async fn zone_append(
         &self,
-        _off: Sector,
-        _buf: WriteBuf<'_>,
+        off: Sector,
+        buf: WriteBuf<'_>,
         _flags: IoFlags,
-    ) -> Result<usize, Errno> {
-        // TODO
-        Err(Errno::PERM)
+    ) -> Result<Sector, Errno> {
+        let zid = self.to_zone_id(off)?;
+        let prev_wp = self.zone_append_impl(zid, None, &buf).await?;
+        let prev_abs_wp = self.config.zone_secs * zid as u64 + Sector::from_bytes(prev_wp.into());
+        Ok(prev_abs_wp)
     }
 
     async fn report_zones(
@@ -333,9 +511,12 @@ impl<B: Backend> BlockDevice for Frontend<B> {
                 let rel_wp = match *cond {
                     ZoneCond::Empty => Sector(0),
                     ZoneCond::Full => self.config.zone_secs,
-                    _ => Sector::from_bytes(
-                        zone.chunk_ends.lock().last().copied().unwrap_or(0).into(),
-                    ),
+                    _ => {
+                        let chunks = zone.chunk_ends.lock();
+                        let tail_coff = chunks.last().copied().unwrap_or(0);
+                        let tail_len = zone.tail.lock().as_ref().len() as u32;
+                        Sector::from_bytes((tail_coff + tail_len).into())
+                    }
                 };
                 let zone_start = self.config.zone_secs * zid as u64;
                 orb_ublk::Zone::new(
@@ -393,7 +574,8 @@ impl<B: Backend> BlockDevice for Frontend<B> {
         {
             let mut cond = zone.cond.lock();
             let chunks = zone.chunk_ends.lock();
-            if chunks.is_empty() {
+            let tail = zone.tail.lock();
+            if chunks.is_empty() && tail.as_ref().is_empty() {
                 *cond = ZoneCond::Empty;
                 return Ok(());
             }
@@ -404,10 +586,8 @@ impl<B: Backend> BlockDevice for Frontend<B> {
             return Err(Errno::IO);
         }
 
-        let mut cond = zone.cond.lock();
-        let mut chunks = zone.chunk_ends.lock();
-        *chunks = Vec::new();
-        *cond = ZoneCond::Empty;
+        zone.reset();
+        self.dirty_zones.lock().remove(&(zid as u32));
 
         Ok(())
     }
@@ -420,16 +600,55 @@ impl<B: Backend> BlockDevice for Frontend<B> {
             return Err(Errno::IO);
         }
         for zone in self.zones.iter() {
-            let mut cond = zone.cond.lock();
-            *cond = ZoneCond::Empty;
-            *zone.chunk_ends.lock() = Vec::new();
+            zone.reset();
         }
+        self.dirty_zones.lock().clear();
         Ok(())
     }
 
     async fn flush(&self, _flags: IoFlags) -> Result<(), Errno> {
         // Wait for all committing tasks to complete.
         let _fence = self.exclusive_write_fence.write().await;
-        Ok(())
+
+        let mut ret = Ok(());
+
+        let commit_futs = self
+            .dirty_zones
+            .lock()
+            .iter()
+            .filter_map(|&zid| {
+                let zone = &self.zones[zid as usize];
+                let zone_guard = zone
+                    .commit_lock
+                    .try_lock()
+                    .expect("holding exclusive write lock");
+
+                let chunks = zone.chunk_ends.lock();
+                let mut tail = zone.tail.lock();
+                let tail_coff = chunks.last().copied().unwrap_or(0);
+                drop(chunks);
+                let TailChunk::Buffer(tail_buf) = &mut *tail else {
+                    log::error!("zone {zid} poisoned");
+                    ret = Err(Errno::IO);
+                    return None;
+                };
+                assert!(!tail_buf.is_empty());
+                let data = tail_buf.split().freeze();
+                *tail = TailChunk::Uploading(data.clone());
+                Some(async move {
+                    let _zone_guard = zone_guard;
+                    self.commit_tail_chunk(zid, tail_coff, data).await
+                })
+            })
+            .collect::<Vec<_>>();
+
+        // XXX: Can we release the write fence here?
+
+        let commit_ret = futures_util::future::join_all(commit_futs)
+            .await
+            .into_iter()
+            .collect();
+
+        ret.and(commit_ret)
     }
 }

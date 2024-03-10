@@ -119,6 +119,14 @@ trait TestFrontend: BlockDevice {
         Ok(())
     }
 
+    async fn test_zone_append_all(&self, off: Sector, buf: &mut [u8]) -> Result<Sector, Errno> {
+        assert!(!buf.is_empty());
+        assert_eq!(buf.len() % Sector::SIZE as usize, 0);
+        let buf = WriteBuf::from_raw(buf);
+        let pos = self.zone_append(off, buf, IoFlags::empty()).await?;
+        Ok(pos)
+    }
+
     async fn test_report_zones(&self, off: Sector, zone_cnt: usize) -> Result<Vec<Zone>> {
         assert_ne!(zone_cnt, 0);
         let memfd =
@@ -159,7 +167,7 @@ const CONFIG: Config = Config {
     max_chunk_size: 2 << 10,
 };
 
-fn new_dev(chunks: &[(usize, u32, Vec<u8>)]) -> Frontend<TestBackend> {
+async fn new_dev(chunks: &[(usize, u32, Vec<u8>)]) -> Frontend<TestBackend> {
     let backend = TestBackend::new_with_chunks(NR_ZONES, chunks.iter().cloned());
     let chunk_meta = chunks
         .iter()
@@ -168,7 +176,9 @@ fn new_dev(chunks: &[(usize, u32, Vec<u8>)]) -> Frontend<TestBackend> {
             (global_off, data.len() as u32)
         })
         .collect::<Vec<_>>();
-    Frontend::new(CONFIG, &chunk_meta, backend).unwrap()
+    let mut dev = Frontend::new(CONFIG, backend).unwrap();
+    dev.init_chunks(&chunk_meta).await.unwrap();
+    dev
 }
 
 fn zone(i: u64, rel_wp: Sector, cond: ZoneCond) -> Zone {
@@ -183,7 +193,7 @@ fn zone(i: u64, rel_wp: Sector, cond: ZoneCond) -> Zone {
 
 #[tokio::test]
 async fn report_zones() {
-    let dev = new_dev(&[]);
+    let dev = new_dev(&[]).await;
     let got_zones = dev.test_report_zones(Sector(0), 8).await.unwrap();
     let expect_zones = (0..NR_ZONES as u64)
         .map(|i| zone(i, Sector(0), ZoneCond::Empty))
@@ -198,7 +208,8 @@ async fn init_chunks() {
         (0, 0, vec![1u8; 1024]),
         (0, 1024, vec![2u8; 512]),
         (1, 0, vec![3u8; 512 + 1]),
-    ]);
+    ])
+    .await;
 
     let got = dev.test_read(Sector(0), CONFIG.zone_secs).await.unwrap();
     let expect = [&[1u8; 1024][..], &[2u8; 512], &[0u8; 4096 - 1024 - 512]].concat();
@@ -228,7 +239,7 @@ async fn init_chunks() {
 
 #[tokio::test]
 async fn zone_state_transition() {
-    let dev = new_dev(&[(0, 0, vec![1u8; 512]), (2, 0, vec![2u8; 512])]);
+    let dev = new_dev(&[(0, 0, vec![1u8; 512]), (2, 0, vec![2u8; 512])]).await;
 
     let got = dev.test_report_zones(Sector(0), 4).await.unwrap();
     let expect_init = vec![
@@ -267,7 +278,7 @@ async fn zone_state_transition() {
 
 #[tokio::test]
 async fn reset_zone() {
-    let dev = new_dev(&[(0, 0, vec![1u8; 512]), (2, 0, vec![2u8; 512])]);
+    let dev = new_dev(&[(0, 0, vec![1u8; 512]), (2, 0, vec![2u8; 512])]).await;
     for off in [Sector(0), CONFIG.zone_secs] {
         dev.zone_open(off, IoFlags::empty()).await.unwrap();
     }
@@ -302,7 +313,7 @@ async fn reset_zone() {
 
 #[tokio::test]
 async fn reset_all_zone() {
-    let dev = new_dev(&[(0, 0, vec![1u8; 512]), (2, 0, vec![2u8; 512])]);
+    let dev = new_dev(&[(0, 0, vec![1u8; 512]), (2, 0, vec![2u8; 512])]).await;
     dev.zone_reset_all(IoFlags::empty()).await.unwrap();
     let got = dev.test_report_zones(Sector(0), 4).await.unwrap();
     let expect = vec![
@@ -313,4 +324,116 @@ async fn reset_all_zone() {
     ];
     assert_eq!(got, expect);
     assert_eq!(dev.backend().drain_log(), "delete_all_zones();");
+}
+
+#[tokio::test]
+async fn bufferred_read_write() {
+    let dev = new_dev(&[]).await;
+
+    let got = dev.test_read(Sector(0), CONFIG.zone_secs).await.unwrap();
+    let mut expect = [0u8; CONFIG.zone_secs.bytes() as usize];
+    assert_eq!(got, expect);
+
+    dev.test_write_all(Sector(0), &mut [42u8; Sector::SIZE as usize])
+        .await
+        .unwrap();
+    let got = dev.test_read(Sector(0), CONFIG.zone_secs).await.unwrap();
+    expect[..Sector::SIZE as usize].fill(42u8);
+    assert_eq!(got, expect);
+    assert_eq!(
+        dev.test_report_zones(Sector(0), 1).await.unwrap()[0],
+        zone(0, Sector(1), ZoneCond::ImpOpen),
+    );
+
+    // No commit before `FLUSH`.
+    assert_eq!(dev.backend().drain_log(), "");
+
+    dev.flush(IoFlags::empty()).await.unwrap();
+    assert_eq!(dev.backend().drain_log(), "upload(0, 0, 512);");
+
+    // `FLUSH` is idempotent and does no redundant work.
+    dev.flush(IoFlags::empty()).await.unwrap();
+    assert_eq!(dev.backend().drain_log(), "");
+}
+
+#[tokio::test]
+async fn reset_discard_buffer() {
+    let dev = new_dev(&[]).await;
+
+    dev.test_write_all(Sector(0), &mut [42u8; Sector(1).bytes() as _])
+        .await
+        .unwrap();
+    dev.zone_reset(Sector(0), IoFlags::empty()).await.unwrap();
+    dev.flush(IoFlags::empty()).await.unwrap();
+    assert_eq!(dev.backend().drain_log(), "delete_zone(0);");
+
+    let got = dev.test_read(Sector(0), CONFIG.zone_secs).await.unwrap();
+    assert_eq!(got, [0u8; CONFIG.zone_secs.bytes() as _]);
+
+    dev.test_write_all(Sector(0), &mut [42u8; Sector(1).bytes() as _])
+        .await
+        .unwrap();
+    dev.zone_reset_all(IoFlags::empty()).await.unwrap();
+    dev.flush(IoFlags::empty()).await.unwrap();
+    assert_eq!(dev.backend().drain_log(), "delete_all_zones();");
+}
+
+#[tokio::test]
+async fn inline_commit() {
+    let dev = new_dev(&[]).await;
+    let mut off = Sector(0);
+
+    // Immediate inline commit.
+    let mut data1 = [3u8; CONFIG.max_chunk_size];
+    dev.test_write_all(off, &mut data1).await.unwrap();
+    off += Sector::from_bytes(data1.len() as _);
+    assert_eq!(dev.backend().drain_log(), "upload(0, 0, 2048);");
+    assert_eq!(
+        dev.test_report_zones(Sector(0), 1).await.unwrap()[0],
+        zone(0, Sector(4), ZoneCond::ImpOpen),
+    );
+
+    // No effect. Chunks are already committed,
+    dev.flush(IoFlags::empty()).await.unwrap();
+    assert_eq!(dev.backend().drain_log(), "");
+
+    // Buffered.
+    let mut data2 = [1u8; Sector::SIZE as usize];
+    dev.test_write_all(off, &mut data2).await.unwrap();
+    off += Sector::from_bytes(data2.len() as _);
+    assert_eq!(dev.backend().drain_log(), "");
+
+    // Append until full, thus trigger another inline commit.
+    let mut data3 = vec![2u8; (CONFIG.zone_secs - off).bytes() as _];
+    dev.test_write_all(off, &mut data3).await.unwrap();
+    off += Sector::from_bytes(data3.len() as _);
+    assert_eq!(dev.backend().drain_log(), "upload(0, 2048, 2048);");
+    assert_eq!(
+        dev.test_report_zones(Sector(0), 1).await.unwrap()[0],
+        zone(0, Sector(8), ZoneCond::Full),
+    );
+
+    // Validate written data.
+    let got = dev.test_read(Sector(0), CONFIG.zone_secs).await.unwrap();
+    let expect = [&data1[..], &data2, &data3].concat();
+    assert_eq!(got, expect);
+}
+
+#[tokio::test]
+async fn zone_append() {
+    let dev = new_dev(&[]).await;
+
+    let off = Sector(0);
+    let mut data1 = [1u8; Sector(2).bytes() as _];
+    let pos1 = dev.test_zone_append_all(off, &mut data1).await.unwrap();
+    assert_eq!(pos1, Sector(0));
+
+    let mut data2 = [2u8; Sector(1).bytes() as _];
+    let pos2 = dev.test_zone_append_all(off, &mut data2).await.unwrap();
+    assert_eq!(pos2, Sector(2));
+
+    assert_eq!(
+        dev.test_report_zones(Sector(0), 1).await.unwrap()[0],
+        zone(0, Sector(3), ZoneCond::ImpOpen),
+    );
 }
