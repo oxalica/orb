@@ -3,6 +3,20 @@ name = "orb"
 version = "0.1.0"
 edition = "2021"
 
+[dependencies]
+anyhow = "1"
+bytes = "1"
+env_logger = "0.11"
+itertools = "0.12.1"
+log = "0.4.21"
+orb-ublk = { path = "./orb-ublk" }
+parking_lot = "0.12"
+rustix = "0.38"
+tokio = { version = "1", features = ["macros", "sync", "time"] }
+
+[dev-dependencies]
+rustix = { version = "0.38", features = ["fs"] }
+
 [workspace]
 resolver = "2"
 members = ["orb-ublk"]
