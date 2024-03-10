@@ -1612,7 +1612,7 @@ impl Zone {
 
     #[must_use]
     pub fn cond(&self) -> ZoneCond {
-        ZoneCond::from_repr(self.0.type_).expect("invalid cond")
+        ZoneCond::from_repr(self.0.cond).expect("invalid cond")
     }
 }
 
