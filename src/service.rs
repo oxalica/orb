@@ -37,7 +37,7 @@ use std::future::Future;
 use std::io;
 
 use anyhow::{ensure, Context, Result};
-use bytes::{Bytes, BytesMut};
+use bytes::{BufMut, Bytes, BytesMut};
 use itertools::Itertools;
 use orb_ublk::{
     BlockDevice, DeviceInfo, IoFlags, ReadBuf, Sector, Stopper, WriteBuf, ZoneBuf, ZoneCond,
@@ -492,6 +492,41 @@ impl<B: Backend> BlockDevice for Frontend<B> {
         let prev_wp = self.zone_append_impl(zid, None, &buf).await?;
         let prev_abs_wp = self.config.zone_secs * zid as u64 + Sector::from_bytes(prev_wp.into());
         Ok(prev_abs_wp)
+    }
+
+    async fn zone_finish(&self, off: Sector, _flags: IoFlags) -> Result<(), Errno> {
+        let zid = self.to_zone_id(off)?;
+        let zone = &self.zones[zid];
+        let _fence = self.exclusive_write_fence.read().await;
+        let _zone_guard = zone.commit_lock.lock().await;
+
+        let (tail_coff, data) = {
+            let mut cond = zone.cond.lock();
+            match *cond {
+                ZoneCond::Empty | ZoneCond::ImpOpen | ZoneCond::ExpOpen | ZoneCond::Closed => {}
+                ZoneCond::Full => return Ok(()),
+                _ => unreachable!(),
+            }
+            let chunks = zone.chunk_ends.lock();
+            let tail_coff = chunks.last().copied().unwrap_or(0);
+            let mut tail = zone.tail.lock();
+
+            let TailChunk::Buffer(tail_buf) = &mut *tail else {
+                // Zone poisoned.
+                return Err(Errno::IO);
+            };
+
+            // Mark zone finished.
+            tail_buf.put_u8(0u8);
+
+            let data = tail_buf.split().freeze();
+            *tail = TailChunk::Uploading(data.clone());
+            *cond = ZoneCond::Full;
+            (tail_coff, data)
+        };
+
+        self.commit_tail_chunk(zid as u32, tail_coff, data).await?;
+        Ok(())
     }
 
     async fn report_zones(

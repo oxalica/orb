@@ -437,3 +437,26 @@ async fn zone_append() {
         zone(0, Sector(3), ZoneCond::ImpOpen),
     );
 }
+
+#[tokio::test]
+async fn zone_finish() {
+    let dev = new_dev(&[]).await;
+
+    dev.zone_finish(Sector(0), IoFlags::empty()).await.unwrap();
+    assert_eq!(dev.backend().drain_log(), "upload(0, 0, 1);");
+    assert_eq!(
+        dev.test_report_zones(Sector(0), 1).await.unwrap()[0],
+        zone(0, CONFIG.zone_secs, ZoneCond::Full),
+    );
+
+    let off = CONFIG.zone_secs;
+    dev.test_write_all(off, &mut [0u8; Sector(1).bytes() as _])
+        .await
+        .unwrap();
+    dev.zone_finish(off, IoFlags::empty()).await.unwrap();
+    assert_eq!(dev.backend().drain_log(), "upload(1, 0, 513);");
+    assert_eq!(
+        dev.test_report_zones(off, 1).await.unwrap()[0],
+        zone(1, CONFIG.zone_secs, ZoneCond::Full),
+    );
+}
