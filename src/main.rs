@@ -10,6 +10,7 @@ use serde::Deserialize;
 #[derive(Debug, clap::Parser)]
 enum Cli {
     Serve(ServeCmd),
+    Stop(StopCmd),
 }
 
 fn main() -> Result<()> {
@@ -17,6 +18,7 @@ fn main() -> Result<()> {
     let cli = <Cli as clap::Parser>::parse();
     match cli {
         Cli::Serve(cmd) => serve_main(cmd),
+        Cli::Stop(cmd) => stop_cmd(cmd),
     }
 }
 
@@ -24,8 +26,10 @@ fn main() -> Result<()> {
 ///
 /// The block device will be ready on `/dev/ublkbX` where X is the next unused integer starting at
 /// 0 . Service configurations are passed via the config file. The service will run until it is
-/// signaled to exit via SIGINT (Ctrl-C) or SIGTERM. The block device and the control device are
-/// cleaned up when the process is exiting.
+/// signaled to exit via SIGINT (Ctrl-C) or SIGTERM, or the device gets deleted by manual `orb
+/// stop`. The block device and the control device are cleaned up when the process is exiting.
+/// If it somehow failed to correctly clean up, `orb stop` can also be used to release stall
+/// control devices.
 #[derive(Debug, clap::Args)]
 struct ServeCmd {
     #[clap(long, short)]
@@ -98,6 +102,46 @@ fn serve_main(cmd: ServeCmd) -> Result<()> {
         .serve(&TokioRuntimeBuilder, &dev_params, &frontend)
         .context("service failed")?;
 
+    Ok(())
+}
+
+/// Stop and clean up ublk control and block devices `/dev/ublk{c,b}*`.
+///
+/// This can be either used to stop a running service, or release resources when the service
+/// aborted unexpectedly without a correct clean up.
+///
+/// If the coresponding devices are created by privileged process, this command also requires
+/// root privilege to clean them up.
+#[derive(Debug, clap::Args)]
+struct StopCmd {
+    /// Clean all existing `ublk` devices.
+    #[clap(long, exclusive = true)]
+    all: bool,
+    /// The integer device ids to clean up, ie. the number in the tail of `/dev/ublk{b,c}*`.
+    #[clap(required = true)]
+    dev_ids: Vec<u32>,
+}
+
+fn stop_cmd(cmd: StopCmd) -> Result<()> {
+    let ctl = open_ctl_dev()?;
+    if cmd.all {
+        for ent in fs::read_dir("/dev").context("failed to read /dev")? {
+            if let Some(dev_id) = (|| {
+                ent.ok()?
+                    .file_name()
+                    .to_str()?
+                    .strip_prefix("ublkc")?
+                    .parse::<u32>()
+                    .ok()
+            })() {
+                ctl.delete_device(dev_id)?;
+            }
+        }
+    } else {
+        for &id in &cmd.dev_ids {
+            ctl.delete_device(id)?;
+        }
+    }
     Ok(())
 }
 
