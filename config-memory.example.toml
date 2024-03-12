@@ -26,6 +26,10 @@ max_chunk_size = "128MiB"
 
 # ublk device and queue configurations.
 [ublk]
+# The device id, ie. the integer part in `/dev/ublk{b,c}X`, to use.
+# A negative id indicates auto-allocation.
+#id = -1
+
 # Create an unprivileged block device, this requires a custom udev rules to
 # change permission automatically. An unprivileged device also have a hard
 # limit 10 seconds to complete any requests, or the service process will be

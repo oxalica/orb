@@ -46,6 +46,8 @@ struct Config {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct UblkConfig {
+    #[serde(default = "default_id")]
+    id: i32,
     #[serde(default)]
     unprivileged: bool,
     // TODO: Validate these.
@@ -53,6 +55,10 @@ struct UblkConfig {
     queues: u16,
     #[serde(default = "default_queue_depth")]
     queue_depth: NonZeroU16,
+}
+
+fn default_id() -> i32 {
+    -1
 }
 
 fn default_queues() -> u16 {
@@ -92,6 +98,9 @@ fn serve_main(cmd: ServeCmd) -> Result<()> {
 
     let mut builder = DeviceBuilder::new();
     let mut dev_params = frontend.dev_params();
+    if let Ok(id) = u32::try_from(config.ublk.id) {
+        builder.id(id);
+    }
     if config.ublk.unprivileged {
         builder.unprivileged();
     } else {
