@@ -27,3 +27,6 @@ rustix = { version = "0.38", features = ["fs"] }
 [workspace]
 resolver = "2"
 members = ["orb-ublk"]
+
+[profile.bench]
+debug = "full"
