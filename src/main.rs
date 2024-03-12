@@ -4,7 +4,7 @@ use std::{fs, io};
 
 use anyhow::{bail, Context, Result};
 use orb_ublk::runtime::TokioRuntimeBuilder;
-use orb_ublk::{ControlDevice, DeviceBuilder};
+use orb_ublk::{ControlDevice, DeviceBuilder, DeviceInfo};
 use serde::Deserialize;
 
 #[derive(Debug, clap::Parser)]
@@ -76,8 +76,19 @@ fn serve_main(cmd: ServeCmd) -> Result<()> {
     let zone_cnt = config.device.dev_secs / config.device.zone_secs;
     let backend =
         orb::memory_backend::Memory::new(zone_cnt.try_into().context("zone count overflow")?);
+    let on_ready = |dev_info: &DeviceInfo, stopper: orb_ublk::Stopper| {
+        ctrlc::set_handler(move || {
+            let _ = sd_notify::notify(true, &[sd_notify::NotifyState::Stopping]);
+            log::info!("Signaled to stop, exiting");
+            stopper.stop();
+        })
+        .map_err(|err| io::Error::other(format!("failed to setup signal handler: {err}")))?;
+        log::info!("Block device ready at /dev/ublkb{}", dev_info.dev_id());
+        let _ = sd_notify::notify(true, &[sd_notify::NotifyState::Ready]);
+        Ok(())
+    };
     let frontend =
-        orb::service::Frontend::new(config.device, backend).expect("config is validated");
+        orb::service::Frontend::new(config.device, backend, on_ready).expect("config is validated");
 
     let mut builder = DeviceBuilder::new();
     let mut dev_params = frontend.dev_params();

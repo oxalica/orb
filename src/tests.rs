@@ -168,7 +168,7 @@ async fn new_dev(chunks: &[(usize, u32, Vec<u8>)]) -> Frontend<TestBackend> {
             (global_off, data.len() as u32)
         })
         .collect::<Vec<_>>();
-    let mut dev = Frontend::new(CONFIG, backend).unwrap();
+    let mut dev = Frontend::new(CONFIG, backend, |_, _| Ok(())).unwrap();
     dev.init_chunks(&chunk_meta).await.unwrap();
     dev
 }

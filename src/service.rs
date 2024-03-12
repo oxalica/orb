@@ -136,10 +136,13 @@ impl Config {
     }
 }
 
+type OnReady = Box<dyn FnOnce(&DeviceInfo, Stopper) -> io::Result<()> + Send + Sync>;
+
 /// TODO: Improve concurrency.
 pub struct Frontend<B> {
     config: Config,
     backend: B,
+    on_ready: Mutex<Option<OnReady>>,
 
     zones: Box<[Zone]>,
     dirty_zones: Mutex<BTreeSet<u32>>,
@@ -205,7 +208,12 @@ impl Default for Zone {
 }
 
 impl<B: Backend> Frontend<B> {
-    pub fn new(config: Config, backend: B) -> Result<Self> {
+    pub fn new(
+        config: Config,
+        backend: B,
+        // XXX: Sync should not be required.
+        on_ready: impl FnOnce(&DeviceInfo, Stopper) -> io::Result<()> + Send + Sync + 'static,
+    ) -> Result<Self> {
         config.validate().context("invalid configuration")?;
         let nr_zones = usize::try_from(config.dev_secs / config.zone_secs).unwrap();
         let zones = std::iter::repeat_with(Zone::default)
@@ -214,6 +222,7 @@ impl<B: Backend> Frontend<B> {
         Ok(Self {
             config,
             backend,
+            on_ready: Mutex::new(Some(Box::new(on_ready) as _)),
 
             zones,
             dirty_zones: Mutex::default(),
@@ -465,10 +474,8 @@ impl<B: Backend> Frontend<B> {
 }
 
 impl<B: Backend> BlockDevice for Frontend<B> {
-    fn ready(&self, dev_info: &DeviceInfo, _stop: Stopper) -> io::Result<()> {
-        // TODO: Notification.
-        log::info!("device ready at /dev/ublkb{}", dev_info.dev_id());
-        Ok(())
+    fn ready(&self, dev_info: &DeviceInfo, stop: Stopper) -> io::Result<()> {
+        self.on_ready.lock().take().unwrap()(dev_info, stop)
     }
 
     async fn read(&self, off: Sector, buf: &mut ReadBuf<'_>, _flags: IoFlags) -> Result<(), Errno> {
