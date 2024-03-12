@@ -1,0 +1,47 @@
+# This is an example configuration for a virtual block device in memory,
+# which is mainly for testing and benchmarking.
+#
+# Commented options are not required and have default values as in the comment.
+# Uncommented options are required and values are given as examples.
+
+# Device parameters and geometry.
+# Sizes below can be written as integers for byte unit, or a string with usual
+# SI-units. They must be multiples of logical sectors (512B).
+[device]
+# Total device size, must be a multiple of `zone_size`.
+dev_size = "4GiB"
+# The size of a zone, the minimal reset (delete) unit. It cannot be changed
+# without losing all the data. Some filesystems have requirement on it, eg.
+# BTRFS requires it to be `4MiB..=4GiB`.
+zone_size = "256MiB"
+# The minimal size for a standalone chunk to minimize fragmentation, must be
+# less than `max_chunk_size`. Chunks smaller than it will be fully rewritten on
+# committing until they grow larger than this limit.
+min_chunk_size = "1MiB"
+# The maximum size a chunk can be, also the maximum buffer size for each zone,
+# must be less than `zone_size`. When a trailing chunk in a zone is grown
+# exceeding this size, following write requests will wait the chunk to be
+# committed to backend before continue.
+max_chunk_size = "128MiB"
+
+# ublk device and queue configurations.
+[ublk]
+# Create an unprivileged block device, this requires a custom udev rules to
+# change permission automatically. An unprivileged device also have a hard
+# limit 10 seconds to complete any requests, or the service process will be
+# killed by the ublk_drv driver. Using unprivileged block device also disables
+# IO_FLUSHER state setting (see prctl(2)), which can potentially cause kernel
+# deadlock under memory pressure.
+#
+# See:
+# https://github.com/ublk-org/ublksrv?tab=readme-ov-file#use-unprivileged-ublk-in-docker
+# https://man7.org/linux/man-pages/man2/prctl.2.html
+#unprivileged = false
+
+# The number of queues to process requests in parallel. When set to zero, it
+# uses the logical core numbers available on the system.
+# Setting it to other than 1 is usually an overkill when the backend is slow.
+#queues = 1
+
+# The max concurrency of each queue.
+#queue_depth = 64

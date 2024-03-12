@@ -40,11 +40,12 @@ use anyhow::{ensure, Context, Result};
 use bytes::{BufMut, Bytes, BytesMut};
 use itertools::Itertools;
 use orb_ublk::{
-    BlockDevice, DeviceInfo, IoFlags, ReadBuf, Sector, Stopper, WriteBuf, ZoneBuf, ZoneCond,
-    ZoneType,
+    BlockDevice, DeviceAttrs, DeviceInfo, DeviceParams, IoFlags, ReadBuf, Sector, Stopper,
+    WriteBuf, ZoneBuf, ZoneCond, ZoneType, ZonedParams,
 };
 use parking_lot::Mutex;
 use rustix::io::Errno;
+use serde::{Deserialize, Serialize};
 
 // TODO: Configurable.
 const LOGICAL_BLOCK_SECS: Sector = Sector(1);
@@ -70,16 +71,45 @@ pub trait Backend: Send + Sync + 'static {
     fn delete_all_zones(&self) -> impl Future<Output = Result<()>> + Send + 'static;
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct Config {
+    #[serde(rename = "dev_size", with = "serde_sector")]
     pub dev_secs: Sector,
+    #[serde(rename = "zone_size", with = "serde_sector")]
     pub zone_secs: Sector,
+    #[serde(deserialize_with = "de_size")]
     pub min_chunk_size: usize,
+    #[serde(deserialize_with = "de_size")]
     pub max_chunk_size: usize,
 }
 
+mod serde_sector {
+    use orb_ublk::Sector;
+    use serde::de::{Deserialize, Deserializer, Error};
+    use serde::Serializer;
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(de: D) -> Result<Sector, D::Error> {
+        let n = bytesize::ByteSize::deserialize(de)?;
+        Sector::try_from_bytes(n.0)
+            .ok_or_else(|| D::Error::custom(format_args!("not aligned to 512B sectors: {}", n.0)))
+    }
+
+    pub fn serialize<S: Serializer>(n: &Sector, ser: S) -> Result<S::Ok, S::Error> {
+        ser.serialize_u64(n.bytes())
+    }
+}
+
+fn de_size<'de, D: serde::de::Deserializer<'de>>(de: D) -> Result<usize, D::Error> {
+    use serde::de::Error;
+
+    let n = bytesize::ByteSize::deserialize(de)?;
+    n.0.try_into()
+        .map_err(|_| D::Error::custom(format_args!("overflow: {}", n.0)))
+}
+
 impl Config {
-    fn validate(&self) -> Result<()> {
+    pub fn validate(&self) -> Result<()> {
         ensure!(
             self.zone_secs.0.is_power_of_two()
                 && self.zone_secs.0.trailing_zeros() + Sector::SHIFT < 31,
@@ -294,6 +324,27 @@ impl<B: Backend> Frontend<B> {
 
     pub fn backend(&self) -> &B {
         &self.backend
+    }
+
+    pub fn dev_params(&self) -> DeviceParams {
+        let mut params = DeviceParams::new();
+        params
+            .dev_sectors(self.config.dev_secs)
+            .logical_block_size(LOGICAL_BLOCK_SECS.bytes())
+            // XXX: Chunks should have a 2^k alignment.
+            // .physical_block_size(self.config.min_chunk_size.bytes())
+            // .io_min_size(self.config.min_chunk_size.bytes())
+            // .io_opt_size(self.config.min_chunk_size.bytes())
+            .chunk_sectors(self.config.zone_secs)
+            // Simulate a rotational device to minimize random I/O (seeks).
+            .attrs(DeviceAttrs::Rotational | DeviceAttrs::VolatileCache)
+            .zoned(ZonedParams {
+                // TODO: Limit open or active zones.
+                max_open_zones: 0,
+                max_active_zones: 0,
+                max_zone_append_size: Sector::from_bytes(self.config.max_chunk_size as u64),
+            });
+        params
     }
 
     fn to_zone_id(&self, off: Sector) -> Result<usize, Errno> {

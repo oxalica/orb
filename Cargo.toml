@@ -6,6 +6,8 @@ edition = "2021"
 [dependencies]
 anyhow = "1"
 bytes = "1"
+bytesize = { version = "1", features = ["serde"] }
+clap = { version = "4", features = ["derive"] }
 env_logger = "0.11"
 futures-util = "0.3"
 itertools = "0.12.1"
@@ -13,7 +15,9 @@ log = "0.4.21"
 orb-ublk = { path = "./orb-ublk" }
 parking_lot = "0.12"
 rustix = "0.38"
+serde = { version = "1", features = ["derive"] }
 tokio = { version = "1", features = ["macros", "sync", "time"] }
+toml = "0.8"
 
 [dev-dependencies]
 rustix = { version = "0.38", features = ["fs"] }

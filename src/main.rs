@@ -1,1 +1,116 @@
-fn main() {}
+use std::num::NonZeroU16;
+use std::path::PathBuf;
+use std::{fs, io};
+
+use anyhow::{bail, Context, Result};
+use orb_ublk::runtime::TokioRuntimeBuilder;
+use orb_ublk::{ControlDevice, DeviceBuilder};
+use serde::Deserialize;
+
+#[derive(Debug, clap::Parser)]
+enum Cli {
+    Serve(ServeCmd),
+}
+
+fn main() -> Result<()> {
+    env_logger::init();
+    let cli = <Cli as clap::Parser>::parse();
+    match cli {
+        Cli::Serve(cmd) => serve_main(cmd),
+    }
+}
+
+/// Start and run the service in the foreground.
+///
+/// The block device will be ready on `/dev/ublkbX` where X is the next unused integer starting at
+/// 0 . Service configurations are passed via the config file. The service will run until it is
+/// signaled to exit via SIGINT (Ctrl-C) or SIGTERM. The block device and the control device are
+/// cleaned up when the process is exiting.
+#[derive(Debug, clap::Args)]
+struct ServeCmd {
+    #[clap(long, short)]
+    config_file: PathBuf,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Config {
+    ublk: UblkConfig,
+    device: orb::service::Config,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UblkConfig {
+    #[serde(default)]
+    unprivileged: bool,
+    // TODO: Validate these.
+    #[serde(default = "default_queues")]
+    queues: u16,
+    #[serde(default = "default_queue_depth")]
+    queue_depth: NonZeroU16,
+}
+
+fn default_queues() -> u16 {
+    1
+}
+
+fn default_queue_depth() -> NonZeroU16 {
+    NonZeroU16::new(64).unwrap()
+}
+
+fn serve_main(cmd: ServeCmd) -> Result<()> {
+    let config = {
+        let buf = fs::read_to_string(cmd.config_file).context("failed to read config file")?;
+        toml::from_str::<Config>(&buf).context("failed to parse config file")?
+    };
+
+    // Fail fast.
+    config.device.validate().context("invalid device config")?;
+    let ctl = open_ctl_dev()?;
+
+    let zone_cnt = config.device.dev_secs / config.device.zone_secs;
+    let backend =
+        orb::memory_backend::Memory::new(zone_cnt.try_into().context("zone count overflow")?);
+    let frontend =
+        orb::service::Frontend::new(config.device, backend).expect("config is validated");
+
+    let mut builder = DeviceBuilder::new();
+    let mut dev_params = frontend.dev_params();
+    if config.ublk.unprivileged {
+        builder.unprivileged();
+    } else {
+        dev_params.set_io_flusher(true);
+    }
+    let queues = if config.ublk.queues != 0 {
+        config.ublk.queues
+    } else {
+        let n = std::thread::available_parallelism().context("failed to available parallelism")?;
+        u16::try_from(n.get()).unwrap_or(u16::MAX)
+    };
+    builder
+        .name("orb-memory")
+        .queues(queues)
+        .queue_depth(config.ublk.queue_depth.get())
+        .zoned()
+        .create_service(&ctl)
+        .context("failed to create ublk device")?
+        .serve(&TokioRuntimeBuilder, &dev_params, &frontend)
+        .context("service failed")?;
+
+    Ok(())
+}
+
+fn open_ctl_dev() -> Result<ControlDevice> {
+    match ControlDevice::open() {
+        Ok(ctl) => Ok(ctl),
+        Err(err) => {
+            let help = if err.kind() == io::ErrorKind::NotFound {
+                ", try loading kernel module via 'modprobe ublk_drv'?"
+            } else {
+                ""
+            };
+            bail!("failed to open {}{}", ControlDevice::PATH, help);
+        }
+    }
+}
