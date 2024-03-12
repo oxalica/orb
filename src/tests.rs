@@ -1,7 +1,6 @@
-use std::collections::BTreeMap;
 use std::fmt::Write;
 use std::fs::File;
-use std::future::{ready, Future};
+use std::future::Future;
 use std::io::Read;
 use std::{mem, ptr, slice};
 
@@ -14,18 +13,19 @@ use parking_lot::Mutex;
 use rustix::fd::AsFd;
 use rustix::io::Errno;
 
+use crate::memory_backend::Memory;
 use crate::service::{Backend, Config, Frontend};
 
 #[derive(Debug)]
 pub struct TestBackend {
-    chunks: Mutex<Vec<BTreeMap<u32, Bytes>>>,
+    inner: Memory,
     log: Mutex<String>,
 }
 
 impl TestBackend {
-    pub fn new_empty(nr_zones: usize) -> Self {
+    pub fn new_empty(zone_cnt: usize) -> Self {
         Self {
-            chunks: vec![BTreeMap::new(); nr_zones].into(),
+            inner: Memory::new(zone_cnt),
             log: Mutex::default(),
         }
     }
@@ -37,7 +37,7 @@ impl TestBackend {
     ) -> Self {
         let mut this = Self::new_empty(nr_zones);
         for (zid, coff, data) in chunks {
-            let prev = this.chunks.get_mut()[zid].insert(coff, data.into());
+            let prev = this.inner.zones[zid].get_mut().insert(coff, data.into());
             assert!(prev.is_none());
         }
         this
@@ -62,10 +62,8 @@ impl Backend for TestBackend {
         read_offset: u64,
         len: usize,
     ) -> impl Future<Output = Result<Bytes>> + Send + 'static {
-        let data = self.chunks.lock()[zid as usize][&coff].clone();
-        let data = data.slice(read_offset as usize..).slice(..len);
         act!(self, "download({zid}, {coff}, {read_offset}, {len})");
-        ready(Ok(data))
+        self.inner.download_chunk(zid, coff, read_offset, len)
     }
 
     fn upload_chunk(
@@ -74,24 +72,18 @@ impl Backend for TestBackend {
         coff: u32,
         data: Bytes,
     ) -> impl Future<Output = Result<()>> + Send + 'static {
-        let len = data.len();
-        self.chunks.lock()[zid as usize].insert(coff, data);
-        act!(self, "upload({zid}, {coff}, {len})");
-        ready(Ok(()))
+        act!(self, "upload({zid}, {coff}, {})", data.len());
+        self.inner.upload_chunk(zid, coff, data)
     }
 
     fn delete_zone(&self, zid: u64) -> impl Future<Output = Result<()>> + Send + 'static {
-        self.chunks.lock()[zid as usize].clear();
         act!(self, "delete_zone({zid})");
-        ready(Ok(()))
+        self.inner.delete_zone(zid)
     }
 
     fn delete_all_zones(&self) -> impl Future<Output = Result<()>> + Send + 'static {
-        for zone in &mut *self.chunks.lock() {
-            zone.clear()
-        }
         act!(self, "delete_all_zones()");
-        ready(Ok(()))
+        self.inner.delete_all_zones()
     }
 }
 
