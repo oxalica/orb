@@ -60,15 +60,15 @@ pub trait Backend: Send + Sync + 'static {
         coff: u32,
         read_offset: u64,
         len: usize,
-    ) -> impl Future<Output = Result<Bytes>> + Send + 'static;
+    ) -> impl Future<Output = Result<Bytes>> + Send + '_;
     fn upload_chunk(
         &self,
         zid: u32,
         coff: u32,
         data: Bytes,
-    ) -> impl Future<Output = Result<()>> + Send + 'static;
-    fn delete_zone(&self, zid: u64) -> impl Future<Output = Result<()>> + Send + 'static;
-    fn delete_all_zones(&self) -> impl Future<Output = Result<()>> + Send + 'static;
+    ) -> impl Future<Output = Result<()>> + Send + '_;
+    fn delete_zone(&self, zid: u64) -> impl Future<Output = Result<()>> + Send + '_;
+    fn delete_all_zones(&self) -> impl Future<Output = Result<()>> + Send + '_;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]

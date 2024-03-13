@@ -61,7 +61,7 @@ impl Backend for TestBackend {
         coff: u32,
         read_offset: u64,
         len: usize,
-    ) -> impl Future<Output = Result<Bytes>> + Send + 'static {
+    ) -> impl Future<Output = Result<Bytes>> + Send + '_ {
         act!(self, "download({zid}, {coff}, {read_offset}, {len})");
         self.inner.download_chunk(zid, coff, read_offset, len)
     }
@@ -71,17 +71,17 @@ impl Backend for TestBackend {
         zid: u32,
         coff: u32,
         data: Bytes,
-    ) -> impl Future<Output = Result<()>> + Send + 'static {
+    ) -> impl Future<Output = Result<()>> + Send + '_ {
         act!(self, "upload({zid}, {coff}, {})", data.len());
         self.inner.upload_chunk(zid, coff, data)
     }
 
-    fn delete_zone(&self, zid: u64) -> impl Future<Output = Result<()>> + Send + 'static {
+    fn delete_zone(&self, zid: u64) -> impl Future<Output = Result<()>> + Send + '_ {
         act!(self, "delete_zone({zid})");
         self.inner.delete_zone(zid)
     }
 
-    fn delete_all_zones(&self) -> impl Future<Output = Result<()>> + Send + 'static {
+    fn delete_all_zones(&self) -> impl Future<Output = Result<()>> + Send + '_ {
         act!(self, "delete_all_zones()");
         self.inner.delete_all_zones()
     }

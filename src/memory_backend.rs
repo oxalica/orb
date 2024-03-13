@@ -26,7 +26,7 @@ impl Backend for Memory {
         coff: u32,
         read_offset: u64,
         len: usize,
-    ) -> impl Future<Output = Result<Bytes>> + Send + 'static {
+    ) -> impl Future<Output = Result<Bytes>> + Send + '_ {
         let ret = match self.zones[zid as usize].read().get(&coff) {
             Some(data) => {
                 let start = read_offset as usize;
@@ -43,17 +43,17 @@ impl Backend for Memory {
         zid: u32,
         coff: u32,
         data: Bytes,
-    ) -> impl Future<Output = Result<()>> + Send + 'static {
+    ) -> impl Future<Output = Result<()>> + Send + '_ {
         self.zones[zid as usize].write().insert(coff, data);
         ready(Ok(()))
     }
 
-    fn delete_zone(&self, zid: u64) -> impl Future<Output = Result<()>> + Send + 'static {
+    fn delete_zone(&self, zid: u64) -> impl Future<Output = Result<()>> + Send + '_ {
         self.zones[zid as usize].write().clear();
         ready(Ok(()))
     }
 
-    fn delete_all_zones(&self) -> impl Future<Output = Result<()>> + Send + 'static {
+    fn delete_all_zones(&self) -> impl Future<Output = Result<()>> + Send + '_ {
         for zone in self.zones.iter() {
             zone.write().clear();
         }
