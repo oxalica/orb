@@ -24,6 +24,9 @@ min_chunk_size = "1MiB"
 # committed to backend before continue.
 max_chunk_size = "128MiB"
 
+# The maximum number of concurrenct download streams.
+#max_concurrent_streams = 16
+
 # ublk device and queue configurations.
 [ublk]
 # The device id, ie. the integer part in `/dev/ublk{b,c}X`, to use.

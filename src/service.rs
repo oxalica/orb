@@ -35,10 +35,14 @@
 use std::collections::BTreeSet;
 use std::future::Future;
 use std::io;
+use std::num::NonZeroUsize;
+use std::pin::Pin;
 
 use anyhow::{ensure, Context, Result};
 use bytes::{BufMut, Bytes, BytesMut};
+use futures_util::{AsyncBufRead, AsyncBufReadExt, Stream, TryStreamExt};
 use itertools::Itertools;
+use lru::LruCache;
 use orb_ublk::{
     BlockDevice, DeviceAttrs, DeviceInfo, DeviceParams, IoFlags, ReadBuf, Sector, Stopper,
     WriteBuf, ZoneBuf, ZoneCond, ZoneType, ZonedParams,
@@ -59,8 +63,7 @@ pub trait Backend: Send + Sync + 'static {
         zid: u32,
         coff: u32,
         read_offset: u64,
-        len: usize,
-    ) -> impl Future<Output = Result<Bytes>> + Send + '_;
+    ) -> impl Stream<Item = Result<Bytes>> + Send + 'static;
     fn upload_chunk(
         &self,
         zid: u32,
@@ -82,6 +85,13 @@ pub struct Config {
     pub min_chunk_size: usize,
     #[serde(deserialize_with = "de_size")]
     pub max_chunk_size: usize,
+
+    #[serde(default = "default_concurrent_streams")]
+    pub max_concurrent_streams: NonZeroUsize,
+}
+
+fn default_concurrent_streams() -> NonZeroUsize {
+    NonZeroUsize::new(16).unwrap()
 }
 
 mod serde_sector {
@@ -144,11 +154,18 @@ pub struct Frontend<B> {
     backend: B,
     on_ready: Mutex<Option<OnReady>>,
 
+    stream_cache: Mutex<LruCache<u64, DownloadStream>>,
     zones: Box<[Zone]>,
     dirty_zones: Mutex<BTreeSet<u32>>,
     /// The global write fence for exclusive write operations (RESET_ALL) or synchronization
     /// (FLUSH). All remote modification holds a read-guard of this lock.
     exclusive_write_fence: tokio::sync::RwLock<()>,
+}
+
+struct DownloadStream {
+    coff: u32,
+    len: u32,
+    stream: Pin<Box<dyn AsyncBufRead + Send>>,
 }
 
 // `Mutex`es are locked in definition order.
@@ -220,13 +237,15 @@ impl<B: Backend> Frontend<B> {
             .take(nr_zones)
             .collect::<Box<[_]>>();
         Ok(Self {
-            config,
             backend,
             on_ready: Mutex::new(Some(Box::new(on_ready) as _)),
 
+            stream_cache: Mutex::new(LruCache::new(config.max_concurrent_streams)),
             zones,
             dirty_zones: Mutex::default(),
             exclusive_write_fence: tokio::sync::RwLock::new(()),
+
+            config,
         })
     }
 
@@ -304,7 +323,8 @@ impl<B: Backend> Frontend<B> {
                 chunk_ends.pop();
                 let fut = self
                     .backend
-                    .download_chunk(zid as u32, tail_coff, 0, tail_len);
+                    .download_chunk(zid as u32, tail_coff, 0)
+                    .try_collect::<BytesMut>();
                 download_tail_futs.push(async move { (zid, tail_coff, tail_len, fut.await) });
             }
 
@@ -486,51 +506,83 @@ impl<B: Backend> BlockDevice for Frontend<B> {
 
         // It's rare to read across chunks which are typically >1MiB. Simply loop for that case.
         while buf.remaining() != 0 {
-            let (chunk_start, chunk_end) = {
-                let chunks = zone.chunk_ends.lock();
-                let tail_start = chunks.last().copied().unwrap_or(0);
-                if tail_start <= read_start {
-                    // Read from tail, or zeros beyond the write pointer.
-                    {
-                        let tail = zone.tail.lock();
-                        drop(chunks);
-                        let len = Ord::min(tail.as_ref().len(), buf.remaining());
-                        if len != 0 {
-                            buf.put_slice(&tail.as_ref()[..len])?;
-                        }
-                    }
-                    if buf.remaining() != 0 {
-                        buf.put_slice(&ZEROES[..buf.remaining()])?;
-                    }
-                    return Ok(());
-                }
+            let global_offset = self.config.zone_secs.bytes() * zid as u64 + read_start as u64;
 
-                // The first chunks whose end > `read_end`, covering the first byte to read.
-                let idx = chunks.partition_point(|&end| end <= read_start);
-                assert!(idx < chunks.len());
-                (if idx > 0 { chunks[idx - 1] } else { 0 }, chunks[idx])
+            let stream = self.stream_cache.lock().pop(&global_offset);
+            let mut stream = match stream {
+                Some(stream) => stream,
+                None => {
+                    let chunks = zone.chunk_ends.lock();
+                    let tail_start = chunks.last().copied().unwrap_or(0);
+                    if tail_start <= read_start {
+                        // Read from tail, or zeros beyond the write pointer.
+                        {
+                            let tail = zone.tail.lock();
+                            drop(chunks);
+                            let len = Ord::min(tail.as_ref().len(), buf.remaining());
+                            if len != 0 {
+                                buf.put_slice(&tail.as_ref()[..len])?;
+                            }
+                        }
+                        if buf.remaining() != 0 {
+                            buf.put_slice(&ZEROES[..buf.remaining()])?;
+                        }
+                        return Ok(());
+                    }
+
+                    // The first chunks whose end > `read_end`, covering the first byte to read.
+                    let idx = chunks.partition_point(|&end| end <= read_start);
+                    assert!(idx < chunks.len());
+                    let chunk_start = if idx > 0 { chunks[idx - 1] } else { 0 };
+                    let chunk_end = chunks[idx];
+                    let offset_in_chunk = read_start - chunk_start;
+                    let stream_len = chunk_end - read_start;
+                    let stream = self
+                        .backend
+                        .download_chunk(zid as u32, chunk_start, offset_in_chunk as u64)
+                        .map_err(io::Error::other)
+                        .into_async_read();
+                    DownloadStream {
+                        coff: chunk_start,
+                        len: stream_len,
+                        stream: Box::pin(stream) as _,
+                    }
+                }
             };
 
-            let offset_in_chunk = read_start - chunk_start;
-            let read_len = Ord::min((chunk_end - read_start) as usize, buf.remaining());
-            assert_ne!(read_len, 0);
-
-            // TODO: Stream reuse.
-            let ret = self
-                .backend
-                .download_chunk(zid as u32, chunk_start, offset_in_chunk.into(), read_len)
-                .await;
-            let data = ret.map_err(|err| {
-                log::error!(
-                    "failed to download chunk at \
-                    zone={zid} chunk={chunk_start} offset={offset_in_chunk} length={read_len}: \
-                    {err}"
+            while buf.remaining() != 0 && stream.len != 0 {
+                let data = match stream.stream.fill_buf().await {
+                    Ok(data) => data,
+                    Err(err) => {
+                        // TODO: Retry on connection lost.
+                        log::error!(
+                            "failed to download chunk at zone={zid} coff={coff}: {err}",
+                            coff = stream.coff
+                        );
+                        return Err(Errno::IO);
+                    }
+                };
+                assert!(
+                    !data.is_empty(),
+                    "stream ended early while expecting {}B more",
+                    stream.len,
                 );
-                Errno::IO
-            })?;
-            assert_eq!(data.len(), read_len);
-            buf.put_slice(&data)?;
-            read_start += read_len as u32;
+                // NB. Clamp by expected `stream.len`. This is necessary to handle finilizing
+                // chunks which have 1byte more than `stream.len`. The trailing byte is ignored,
+                // and the stream will be closed due to `stream.len == 0` without errors.
+                let len = data.len().min(buf.remaining()).min(stream.len as usize);
+                buf.put_slice(&data[..len])?;
+
+                stream.stream.consume_unpin(len);
+                stream.len -= len as u32;
+                read_start += len as u32;
+            }
+
+            if stream.len != 0 {
+                let new_global_offset =
+                    self.config.zone_secs.bytes() * zid as u64 + read_start as u64;
+                self.stream_cache.lock().push(new_global_offset, stream);
+            }
         }
 
         Ok(())

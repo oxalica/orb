@@ -3,6 +3,7 @@ use std::future::{ready, Future};
 
 use anyhow::{anyhow, Result};
 use bytes::Bytes;
+use futures_util::{stream, Stream};
 use parking_lot::RwLock;
 
 use crate::service::Backend;
@@ -25,17 +26,12 @@ impl Backend for Memory {
         zid: u32,
         coff: u32,
         read_offset: u64,
-        len: usize,
-    ) -> impl Future<Output = Result<Bytes>> + Send + '_ {
+    ) -> impl Stream<Item = Result<Bytes>> + Send + 'static {
         let ret = match self.zones[zid as usize].read().get(&coff) {
-            Some(data) => {
-                let start = read_offset as usize;
-                let end = start + len;
-                Ok(data.slice(start..end))
-            }
+            Some(data) => Ok(data.slice(read_offset as usize..)),
             None => Err(anyhow!("chunk not found: zid={zid} coff={coff}")),
         };
-        ready(ret)
+        stream::iter(Some(ret))
     }
 
     fn upload_chunk(

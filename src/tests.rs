@@ -2,10 +2,12 @@ use std::fmt::Write;
 use std::fs::File;
 use std::future::Future;
 use std::io::Read;
+use std::num::NonZeroUsize;
 use std::{mem, ptr, slice};
 
 use anyhow::Result;
 use bytes::Bytes;
+use futures_util::Stream;
 use orb_ublk::{
     BlockDevice, IoFlags, ReadBuf, Sector, WriteBuf, Zone, ZoneBuf, ZoneCond, ZoneType,
 };
@@ -60,10 +62,9 @@ impl Backend for TestBackend {
         zid: u32,
         coff: u32,
         read_offset: u64,
-        len: usize,
-    ) -> impl Future<Output = Result<Bytes>> + Send + '_ {
-        act!(self, "download({zid}, {coff}, {read_offset}, {len})");
-        self.inner.download_chunk(zid, coff, read_offset, len)
+    ) -> impl Stream<Item = Result<Bytes>> + Send + 'static {
+        act!(self, "download({zid}, {coff}, {read_offset})");
+        self.inner.download_chunk(zid, coff, read_offset)
     }
 
     fn upload_chunk(
@@ -157,6 +158,11 @@ const CONFIG: Config = Config {
     zone_secs: Sector(8),
     min_chunk_size: 1 << 10,
     max_chunk_size: 2 << 10,
+    // Workaround: `Option::unwrap` is not const stable yet.
+    max_concurrent_streams: match NonZeroUsize::new(8) {
+        Some(n) => n,
+        None => unreachable!(),
+    },
 };
 
 async fn new_dev(chunks: &[(usize, u32, Vec<u8>)]) -> Frontend<TestBackend> {
@@ -208,7 +214,7 @@ async fn init_chunks() {
         (3, 0, vec![5u8; CONFIG.zone_secs.bytes() as _]),
     ])
     .await;
-    assert_eq!(dev.backend().drain_log(), "download(0, 1024, 0, 512);");
+    assert_eq!(dev.backend().drain_log(), "download(0, 1024, 0);");
 
     let got = dev.test_report_zones(Sector(0), 4).await.unwrap();
     let expect = vec![
@@ -223,7 +229,7 @@ async fn init_chunks() {
     let expect = [&[1u8; 1024][..], &[2u8; 512], &[0u8; 4096 - 1024 - 512]].concat();
     assert_eq!(got, expect);
     // Only the first chunk is downloaded. The second chunk is prefetched before.
-    assert_eq!(dev.backend().drain_log(), "download(0, 0, 0, 1024);");
+    assert_eq!(dev.backend().drain_log(), "download(0, 0, 0);");
 
     let got = dev
         .test_read(CONFIG.zone_secs, CONFIG.zone_secs)
@@ -232,7 +238,46 @@ async fn init_chunks() {
     // NB. The finish-marker byte will be not read, thus only first 512bytes are non-zero.
     let expect = [&[3u8; 512][..], &[0u8; 4096 - 512]].concat();
     assert_eq!(got, expect);
-    assert_eq!(dev.backend().drain_log(), "download(1, 0, 0, 512);");
+    assert_eq!(dev.backend().drain_log(), "download(1, 0, 0);");
+}
+
+#[tokio::test]
+async fn read_stream_reuse() {
+    let dev = new_dev(&[
+        // [0, 4s)
+        (0, 0, vec![1u8; Sector(4).bytes() as _]),
+        // [4, 8s)
+        (0, 2048, vec![1u8; Sector(4).bytes() as usize]),
+    ])
+    .await;
+    // The first zone is full, thus no initial download.
+    assert_eq!(dev.backend().drain_log(), "");
+
+    // Read [0s, 1s), stream pos at 2s.
+    let got = dev.test_read(Sector(0), Sector(2)).await.unwrap();
+    let expect = [1u8; Sector(2).bytes() as _];
+    assert_eq!(got, expect);
+    assert_eq!(dev.backend().drain_log(), "download(0, 0, 0);");
+
+    // Read [2s, 6s), drain the first stream, and start another one.
+    let got = dev.test_read(Sector(2), Sector(4)).await.unwrap();
+    assert_eq!(got, [1u8; Sector(4).bytes() as _]);
+    assert_eq!(dev.backend().drain_log(), "download(0, 2048, 0);");
+
+    // Read [6s, 8s), drain the second one.
+    let got = dev.test_read(Sector(6), Sector(2)).await.unwrap();
+    assert_eq!(got, expect);
+    assert_eq!(dev.backend().drain_log(), "");
+
+    // Read [1s, 2s), start at middle.
+    let got = dev.test_read(Sector(1), Sector(1)).await.unwrap();
+    assert_eq!(got, [1u8; Sector(1).bytes() as _]);
+    assert_eq!(dev.backend().drain_log(), "download(0, 0, 512);");
+
+    // Read [2s, 3s), reuse.
+    let got = dev.test_read(Sector(2), Sector(1)).await.unwrap();
+    assert_eq!(got, [1u8; Sector(1).bytes() as _]);
+    assert_eq!(dev.backend().drain_log(), "");
 }
 
 #[tokio::test]
@@ -242,7 +287,7 @@ async fn zone_open_close() {
         (2, 0, vec![2u8; 1024]), // Without tail.
     ])
     .await;
-    assert_eq!(dev.backend().drain_log(), "download(0, 0, 0, 512);");
+    assert_eq!(dev.backend().drain_log(), "download(0, 0, 0);");
 
     let got = dev.test_report_zones(Sector(0), 4).await.unwrap();
     let expect_init = vec![
@@ -286,7 +331,7 @@ async fn reset_zone() {
         (2, 0, vec![2u8; 1024]), // Without tail.
     ])
     .await;
-    assert_eq!(dev.backend().drain_log(), "download(0, 0, 0, 512);");
+    assert_eq!(dev.backend().drain_log(), "download(0, 0, 0);");
 
     for off in [Sector(0), CONFIG.zone_secs] {
         dev.zone_open(off, IoFlags::empty()).await.unwrap();
@@ -327,7 +372,7 @@ async fn reset_all_zone() {
         (2, 0, vec![2u8; 512 + 1]), // Full.
     ])
     .await;
-    assert_eq!(dev.backend().drain_log(), "download(0, 0, 0, 512);");
+    assert_eq!(dev.backend().drain_log(), "download(0, 0, 0);");
 
     dev.zone_reset_all(IoFlags::empty()).await.unwrap();
     let got = dev.test_report_zones(Sector(0), 4).await.unwrap();
