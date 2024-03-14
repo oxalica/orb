@@ -274,6 +274,8 @@ impl<B: Backend> Frontend<B> {
                             *coff -= 1;
                             ensure!(!is_zone_finished, "multiple zone finish markers");
                             is_zone_finished = true;
+                        } else if *coff as u64 == zone_size {
+                            is_zone_finished = true;
                         }
                         Ok(*coff)
                     })()
@@ -297,7 +299,7 @@ impl<B: Backend> Frontend<B> {
                 [end] => (0, end as usize),
                 [.., start, end] => (start, (end - start) as usize),
             };
-            if tail_len != 0 && tail_len > self.config.min_chunk_size {
+            if !is_zone_finished && tail_len != 0 && tail_len < self.config.min_chunk_size {
                 // Exclude the tail chunk.
                 chunk_ends.pop();
                 let fut = self
@@ -649,7 +651,9 @@ impl<B: Backend> BlockDevice for Frontend<B> {
             ZoneCond::Full => return Err(Errno::IO),
             _ => unreachable!(),
         }
-        *cond = if zone.chunk_ends.lock().is_empty() {
+        let chunks = zone.chunk_ends.lock();
+        let tail = zone.tail.lock();
+        *cond = if chunks.is_empty() && tail.as_ref().is_empty() {
             ZoneCond::Empty
         } else {
             ZoneCond::Closed

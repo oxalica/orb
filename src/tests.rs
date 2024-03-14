@@ -198,18 +198,32 @@ async fn report_zones() {
 async fn init_chunks() {
     let dev = new_dev(&[
         (0, 0, vec![1u8; 1024]),
+        // Partial tail. Need download.
         (0, 1024, vec![2u8; 512]),
+        // Manually finished.
         (1, 0, vec![3u8; 512 + 1]),
+        // Large enough chunk.
+        (2, 0, vec![4u8; 1024]),
+        // Full of data.
+        (3, 0, vec![5u8; CONFIG.zone_secs.bytes() as _]),
     ])
     .await;
+    assert_eq!(dev.backend().drain_log(), "download(0, 1024, 0, 512);");
+
+    let got = dev.test_report_zones(Sector(0), 4).await.unwrap();
+    let expect = vec![
+        zone(0, Sector(3), ZoneCond::Closed),
+        zone(1, CONFIG.zone_secs, ZoneCond::Full),
+        zone(2, Sector(2), ZoneCond::Closed),
+        zone(3, CONFIG.zone_secs, ZoneCond::Full),
+    ];
+    assert_eq!(got, expect);
 
     let got = dev.test_read(Sector(0), CONFIG.zone_secs).await.unwrap();
     let expect = [&[1u8; 1024][..], &[2u8; 512], &[0u8; 4096 - 1024 - 512]].concat();
     assert_eq!(got, expect);
-    assert_eq!(
-        dev.backend().drain_log(),
-        "download(0, 0, 0, 1024);download(0, 1024, 0, 512);"
-    );
+    // Only the first chunk is downloaded. The second chunk is prefetched before.
+    assert_eq!(dev.backend().drain_log(), "download(0, 0, 0, 1024);");
 
     let got = dev
         .test_read(CONFIG.zone_secs, CONFIG.zone_secs)
@@ -219,25 +233,22 @@ async fn init_chunks() {
     let expect = [&[3u8; 512][..], &[0u8; 4096 - 512]].concat();
     assert_eq!(got, expect);
     assert_eq!(dev.backend().drain_log(), "download(1, 0, 0, 512);");
-
-    let got = dev.test_report_zones(Sector(0), 3).await.unwrap();
-    let expect = vec![
-        zone(0, Sector(3), ZoneCond::Closed),
-        zone(1, CONFIG.zone_secs, ZoneCond::Full),
-        zone(2, Sector(0), ZoneCond::Empty),
-    ];
-    assert_eq!(got, expect);
 }
 
 #[tokio::test]
-async fn zone_state_transition() {
-    let dev = new_dev(&[(0, 0, vec![1u8; 512]), (2, 0, vec![2u8; 512])]).await;
+async fn zone_open_close() {
+    let dev = new_dev(&[
+        (0, 0, vec![1u8; 512]),  // With tail.
+        (2, 0, vec![2u8; 1024]), // Without tail.
+    ])
+    .await;
+    assert_eq!(dev.backend().drain_log(), "download(0, 0, 0, 512);");
 
     let got = dev.test_report_zones(Sector(0), 4).await.unwrap();
     let expect_init = vec![
         zone(0, Sector(1), ZoneCond::Closed),
         zone(1, Sector(0), ZoneCond::Empty),
-        zone(2, Sector(1), ZoneCond::Closed),
+        zone(2, Sector(2), ZoneCond::Closed),
         zone(3, Sector(0), ZoneCond::Empty),
     ];
     assert_eq!(got, expect_init);
@@ -253,7 +264,7 @@ async fn zone_state_transition() {
     let expect_opened = vec![
         zone(0, Sector(1), ZoneCond::ExpOpen),
         zone(1, Sector(0), ZoneCond::ExpOpen),
-        zone(2, Sector(1), ZoneCond::Closed),
+        zone(2, Sector(2), ZoneCond::Closed),
         zone(3, Sector(0), ZoneCond::Empty),
     ];
     assert_eq!(got, expect_opened);
@@ -270,7 +281,13 @@ async fn zone_state_transition() {
 
 #[tokio::test]
 async fn reset_zone() {
-    let dev = new_dev(&[(0, 0, vec![1u8; 512]), (2, 0, vec![2u8; 512])]).await;
+    let dev = new_dev(&[
+        (0, 0, vec![1u8; 512]),  // With tail.
+        (2, 0, vec![2u8; 1024]), // Without tail.
+    ])
+    .await;
+    assert_eq!(dev.backend().drain_log(), "download(0, 0, 0, 512);");
+
     for off in [Sector(0), CONFIG.zone_secs] {
         dev.zone_open(off, IoFlags::empty()).await.unwrap();
     }
@@ -279,7 +296,7 @@ async fn reset_zone() {
     let expect = vec![
         zone(0, Sector(1), ZoneCond::ExpOpen),
         zone(1, Sector(0), ZoneCond::ExpOpen),
-        zone(2, Sector(1), ZoneCond::Closed),
+        zone(2, Sector(2), ZoneCond::Closed),
         zone(3, Sector(0), ZoneCond::Empty),
     ];
     assert_eq!(got, expect);
@@ -305,7 +322,13 @@ async fn reset_zone() {
 
 #[tokio::test]
 async fn reset_all_zone() {
-    let dev = new_dev(&[(0, 0, vec![1u8; 512]), (2, 0, vec![2u8; 512])]).await;
+    let dev = new_dev(&[
+        (0, 0, vec![1u8; 512]),     // With tail.
+        (2, 0, vec![2u8; 512 + 1]), // Full.
+    ])
+    .await;
+    assert_eq!(dev.backend().drain_log(), "download(0, 0, 0, 512);");
+
     dev.zone_reset_all(IoFlags::empty()).await.unwrap();
     let got = dev.test_report_zones(Sector(0), 4).await.unwrap();
     let expect = vec![
