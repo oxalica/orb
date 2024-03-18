@@ -522,14 +522,15 @@ impl<B: Backend> BlockDevice for Frontend<B> {
                 None => {
                     let chunks = zone.chunk_ends.lock();
                     let tail_start = chunks.last().copied().unwrap_or(0);
-                    if tail_start <= read_start {
+                    if let Some(offset_in_tail) = read_start.checked_sub(tail_start) {
                         // Read from tail, or zeros beyond the write pointer.
                         {
                             let tail = zone.tail.lock();
                             drop(chunks);
-                            let len = Ord::min(tail.as_ref().len(), buf.remaining());
-                            if len != 0 {
-                                buf.put_slice(&tail.as_ref()[..len])?;
+                            if (offset_in_tail as usize) < tail.as_ref().len() {
+                                let data = &tail.as_ref()[offset_in_tail as usize..];
+                                let len = Ord::min(data.len(), buf.remaining());
+                                buf.put_slice(&data[..len])?;
                             }
                         }
                         if buf.remaining() != 0 {

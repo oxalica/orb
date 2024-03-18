@@ -417,6 +417,39 @@ async fn bufferred_read_write() {
 }
 
 #[tokio::test]
+async fn read_tail() {
+    let dev = new_dev(&[]).await;
+
+    let mut buf = [1u8; Sector(2).bytes() as _];
+    buf[Sector(1).bytes() as _..].fill(2u8);
+
+    // Delayed tail.
+    dev.test_write_all(Sector(0), &mut buf).await.unwrap();
+    assert_eq!(dev.backend().drain_log(), "");
+
+    assert_eq!(
+        dev.test_read(Sector(0), Sector(1)).await.unwrap(),
+        [1u8; Sector(1).bytes() as _],
+    );
+    assert_eq!(
+        dev.test_read(Sector(1), Sector(1)).await.unwrap(),
+        [2u8; Sector(1).bytes() as _],
+    );
+    assert_eq!(
+        dev.test_read(Sector(2), Sector(1)).await.unwrap(),
+        [0u8; Sector(1).bytes() as _],
+    );
+
+    assert_eq!(
+        dev.test_read(Sector(0), Sector(3)).await.unwrap(),
+        [&buf[..], &[0u8; Sector(1).bytes() as _]].concat(),
+    );
+
+    // Read from cache.
+    assert_eq!(dev.backend().drain_log(), "");
+}
+
+#[tokio::test]
 async fn reset_discard_buffer() {
     let dev = new_dev(&[]).await;
 
