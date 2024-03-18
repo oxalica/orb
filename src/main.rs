@@ -41,6 +41,14 @@ struct ServeCmd {
 struct Config {
     ublk: UblkConfig,
     device: orb::service::Config,
+    backend: BackendConfig,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "snake_case")]
+enum BackendConfig {
+    Memory(orb::memory_backend::Config),
+    Onedrive(orb::onedrive_backend::Config),
 }
 
 #[derive(Debug, Deserialize)]
@@ -79,18 +87,35 @@ fn serve_main(cmd: ServeCmd) -> Result<()> {
     config.device.validate().context("invalid device config")?;
     let ctl = open_ctl_dev()?;
 
-    let zone_cnt = config.device.dev_secs / config.device.zone_secs;
-    let backend =
-        orb::memory_backend::Memory::new(zone_cnt.try_into().context("zone count overflow")?);
+    match &config.backend {
+        BackendConfig::Memory(_) => {
+            let zone_cnt = config.device.dev_secs / config.device.zone_secs;
+            let zone_cnt = zone_cnt.try_into().context("zone count overflow")?;
+            let memory = orb::memory_backend::Memory::new(zone_cnt);
+            serve(&ctl, &config, memory)
+        }
+        BackendConfig::Onedrive(backend_config) => {
+            // XXX: Is there a way to reuse this runtime?
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .context("failed to build tokio runtime")?;
+            let remote = orb::onedrive_backend::init(backend_config, &rt)?;
+            serve(&ctl, &config, remote)
+        }
+    }
+}
+
+fn serve<B: orb::service::Backend>(ctl: &ControlDevice, config: &Config, backend: B) -> Result<()> {
     let on_ready = |dev_info: &DeviceInfo, stopper: orb_ublk::Stopper| {
         ctrlc::set_handler(move || {
-            let _ = sd_notify::notify(true, &[sd_notify::NotifyState::Stopping]);
+            let _ = sd_notify::notify(false, &[sd_notify::NotifyState::Stopping]);
             log::info!("Signaled to stop, exiting");
             stopper.stop();
         })
         .map_err(|err| io::Error::other(format!("failed to setup signal handler: {err}")))?;
         log::info!("Block device ready at /dev/ublkb{}", dev_info.dev_id());
-        let _ = sd_notify::notify(true, &[sd_notify::NotifyState::Ready]);
+        let _ = sd_notify::notify(false, &[sd_notify::NotifyState::Ready]);
         Ok(())
     };
     let frontend =
@@ -113,11 +138,11 @@ fn serve_main(cmd: ServeCmd) -> Result<()> {
         u16::try_from(n.get()).unwrap_or(u16::MAX)
     };
     builder
-        .name("orb-memory")
+        .name("orb")
         .queues(queues)
         .queue_depth(config.ublk.queue_depth.get())
         .zoned()
-        .create_service(&ctl)
+        .create_service(ctl)
         .context("failed to create ublk device")?
         .serve(&TokioRuntimeBuilder, &dev_params, &frontend)
         .context("service failed")?;

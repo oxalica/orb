@@ -5,8 +5,13 @@ use anyhow::{anyhow, Result};
 use bytes::Bytes;
 use futures_util::{stream, Stream};
 use parking_lot::RwLock;
+use serde::Deserialize;
 
 use crate::service::Backend;
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Config {}
 
 #[derive(Debug)]
 pub struct Memory {

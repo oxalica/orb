@@ -74,7 +74,7 @@ pub trait Backend: Send + Sync + 'static {
     fn delete_all_zones(&self) -> impl Future<Output = Result<()>> + Send + '_;
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
     #[serde(rename = "dev_size", with = "serde_sector")]

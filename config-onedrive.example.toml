@@ -52,3 +52,26 @@ max_chunk_size = "128MiB"
 
 # The max concurrency of each queue.
 #queue_depth = 64
+
+# Use 'onedrive' backend. This backend has no sub-configurations.
+# Exact one backend must be chosen.
+[backend.onedrive]
+
+# The remote directory path for storing data. It must have no trailing slashes.
+# It must not be root, to keep this application scoped.
+remote_dir = "/orb"
+
+# The directory to store states, including credentials. It is taken verbatimly
+# if it is non-empty. Otherwise, following values are checked with environment
+# substitution:
+# 1. `$STATE_DIRECTORY`, if it is set.
+# 2. `$XDG_STATE_HOME/orb`, if `$XDG_STATE_HOME` is set.
+# 3. `$HOME/.local/state/orb`, if `$HOME` is set or can be inferred.
+# 4. Fail.
+#
+# The directory will be created recursively if not exists, and it should be
+# writable.
+#state_dir = ""
+
+# Connection timeout in seconds.
+#connect_timeout_sec = 15
