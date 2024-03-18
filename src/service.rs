@@ -470,11 +470,18 @@ impl<B: Backend> Frontend<B> {
             (tail_coff, data, prev_wp)
         };
 
-        self.commit_tail_chunk(zid as u32, tail_coff, data).await?;
+        self.commit_tail_chunk(zid as u32, tail_coff, data, true)
+            .await?;
         Ok(prev_wp)
     }
 
-    async fn commit_tail_chunk(&self, zid: u32, coff: u32, data: Bytes) -> Result<(), Errno> {
+    async fn commit_tail_chunk(
+        &self,
+        zid: u32,
+        coff: u32,
+        data: Bytes,
+        clear_tail: bool,
+    ) -> Result<(), Errno> {
         let zone = &self.zones[zid as usize];
         let len = data.len();
         if let Err(err) = self.backend.upload_chunk(zid, coff, data).await {
@@ -484,7 +491,7 @@ impl<B: Backend> Frontend<B> {
             return Err(Errno::IO);
         }
 
-        {
+        if clear_tail {
             let mut chunks = zone.chunk_ends.lock();
             let mut tail = zone.tail.lock();
             chunks.push(coff + len as u32);
@@ -638,7 +645,8 @@ impl<B: Backend> BlockDevice for Frontend<B> {
             (tail_coff, data)
         };
 
-        self.commit_tail_chunk(zid as u32, tail_coff, data).await?;
+        self.commit_tail_chunk(zid as u32, tail_coff, data, true)
+            .await?;
         Ok(())
     }
 
@@ -783,11 +791,20 @@ impl<B: Backend> BlockDevice for Frontend<B> {
                     return None;
                 };
                 assert!(!tail_buf.is_empty());
-                let data = tail_buf.split().freeze();
-                *tail = TailChunk::Uploading(data.clone());
+                let clear_tail = tail_buf.len() >= self.config.min_chunk_size;
+                let data = if clear_tail {
+                    let data = tail_buf.split().freeze();
+                    *tail = TailChunk::Uploading(data.clone());
+                    data
+                } else {
+                    // Small chunks can still grow. Do not freeze it.
+                    // This should not cause race because we are holding write locks.
+                    Bytes::copy_from_slice(&tail_buf[..])
+                };
                 Some(async move {
                     let _zone_guard = zone_guard;
-                    self.commit_tail_chunk(zid, tail_coff, data).await
+                    self.commit_tail_chunk(zid, tail_coff, data, clear_tail)
+                        .await
                 })
             })
             .collect::<Vec<_>>();

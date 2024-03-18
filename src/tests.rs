@@ -520,3 +520,36 @@ async fn zone_finish() {
         zone(1, CONFIG.zone_secs, ZoneCond::Full),
     );
 }
+
+#[tokio::test]
+async fn replace_tail() {
+    let dev = new_dev(&[]).await;
+
+    let mut data = [1u8; Sector(2).bytes() as _];
+    let (lhs, rhs) = data.split_at_mut(Sector(1).bytes() as _);
+    rhs.fill(2u8);
+
+    dev.test_zone_append_all(Sector(0), lhs).await.unwrap();
+    dev.flush(IoFlags::empty()).await.unwrap();
+    assert_eq!(dev.backend().drain_log(), "upload(0, 0, 512);");
+
+    // Should replace the first chunk.
+    dev.test_zone_append_all(Sector(0), rhs).await.unwrap();
+    dev.flush(IoFlags::empty()).await.unwrap();
+    assert_eq!(dev.backend().drain_log(), "upload(0, 0, 1024);");
+
+    let got = dev.test_read(Sector(0), Sector(2)).await.unwrap();
+    assert_eq!(got, data);
+    assert_eq!(dev.backend().drain_log(), "download(0, 0, 0);");
+
+    // Idempotent.
+    dev.flush(IoFlags::empty()).await.unwrap();
+    assert_eq!(dev.backend().drain_log(), "");
+
+    // Previous chunk size is over min_chunk_size (1KiB), so this creates a new one.
+    dev.test_zone_append_all(Sector(0), &mut [3u8; Sector(1).bytes() as _])
+        .await
+        .unwrap();
+    dev.flush(IoFlags::empty()).await.unwrap();
+    assert_eq!(dev.backend().drain_log(), "upload(0, 1024, 512);");
+}
