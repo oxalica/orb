@@ -99,19 +99,19 @@ fn serve_main(cmd: ServeCmd) -> Result<()> {
             let zone_cnt = config.device.dev_secs / config.device.zone_secs;
             let zone_cnt = zone_cnt.try_into().context("zone count overflow")?;
             let memory = orb::memory_backend::Memory::new(zone_cnt);
-            serve(&ctl, &rt, &config, memory, Vec::new())
+            serve(&ctl, rt, &config, memory, Vec::new())
         }
         BackendConfig::Onedrive(backend_config) => {
             let (remote, chunks) =
                 orb::onedrive_backend::init(backend_config, &config.device, &rt)?;
-            serve(&ctl, &rt, &config, remote, chunks)
+            serve(&ctl, rt, &config, remote, chunks)
         }
     }
 }
 
 fn serve<B: orb::service::Backend>(
     ctl: &ControlDevice,
-    rt: &Runtime,
+    rt: Runtime,
     config: &Config,
     backend: B,
     chunks: Vec<(u64, u64)>,
@@ -134,6 +134,10 @@ fn serve<B: orb::service::Backend>(
         .context("failed to initialize chunks")?;
     // Free memory.
     drop(chunks);
+    // NB. This also drops all the connection pool. Otherwise, new requests may reuse old
+    // connections and await old `Future`s, which is in the old runtime thus never polled,
+    // resulting a deadlock.
+    drop(rt);
 
     let mut builder = DeviceBuilder::new();
     let mut dev_params = frontend.dev_params();
