@@ -249,7 +249,7 @@ impl<B: Backend> Frontend<B> {
         })
     }
 
-    pub async fn init_chunks(&mut self, all_chunks: &[(u64, u32)]) -> Result<()> {
+    pub async fn init_chunks(&mut self, all_chunks: &[(u64, u64)]) -> Result<()> {
         ensure!(
             all_chunks.windows(2).all(|w| w[0].0 < w[1].0),
             "chunks are not sorted",
@@ -285,9 +285,10 @@ impl<B: Backend> Frontend<B> {
                             "offset not aligned",
                         );
                         ensure!(len != 0, "chunk is empty");
-                        *coff = coff
+                        *coff = u64::from(*coff)
                             .checked_add(len)
-                            .filter(|&new_coff| new_coff as u64 <= zone_size)
+                            .filter(|&new_coff| new_coff <= zone_size)
+                            .and_then(|coff| u32::try_from(coff).ok())
                             .context("offset overflow")?;
                         if *coff & 1 == 1 {
                             *coff -= 1;

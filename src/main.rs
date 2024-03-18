@@ -6,6 +6,7 @@ use anyhow::{bail, Context, Result};
 use orb_ublk::runtime::TokioRuntimeBuilder;
 use orb_ublk::{ControlDevice, DeviceBuilder, DeviceInfo};
 use serde::Deserialize;
+use tokio::runtime::Runtime;
 
 #[derive(Debug, clap::Parser)]
 enum Cli {
@@ -87,26 +88,34 @@ fn serve_main(cmd: ServeCmd) -> Result<()> {
     config.device.validate().context("invalid device config")?;
     let ctl = open_ctl_dev()?;
 
+    // XXX: Is there a way to reuse this runtime?
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("failed to build tokio runtime")?;
+
     match &config.backend {
         BackendConfig::Memory(_) => {
             let zone_cnt = config.device.dev_secs / config.device.zone_secs;
             let zone_cnt = zone_cnt.try_into().context("zone count overflow")?;
             let memory = orb::memory_backend::Memory::new(zone_cnt);
-            serve(&ctl, &config, memory)
+            serve(&ctl, &rt, &config, memory, Vec::new())
         }
         BackendConfig::Onedrive(backend_config) => {
-            // XXX: Is there a way to reuse this runtime?
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .context("failed to build tokio runtime")?;
-            let remote = orb::onedrive_backend::init(backend_config, &rt)?;
-            serve(&ctl, &config, remote)
+            let (remote, chunks) =
+                orb::onedrive_backend::init(backend_config, &config.device, &rt)?;
+            serve(&ctl, &rt, &config, remote, chunks)
         }
     }
 }
 
-fn serve<B: orb::service::Backend>(ctl: &ControlDevice, config: &Config, backend: B) -> Result<()> {
+fn serve<B: orb::service::Backend>(
+    ctl: &ControlDevice,
+    rt: &Runtime,
+    config: &Config,
+    backend: B,
+    chunks: Vec<(u64, u64)>,
+) -> Result<()> {
     let on_ready = |dev_info: &DeviceInfo, stopper: orb_ublk::Stopper| {
         ctrlc::set_handler(move || {
             let _ = sd_notify::notify(false, &[sd_notify::NotifyState::Stopping]);
@@ -118,8 +127,13 @@ fn serve<B: orb::service::Backend>(ctl: &ControlDevice, config: &Config, backend
         let _ = sd_notify::notify(false, &[sd_notify::NotifyState::Ready]);
         Ok(())
     };
-    let frontend =
+
+    let mut frontend =
         orb::service::Frontend::new(config.device, backend, on_ready).expect("config is validated");
+    rt.block_on(frontend.init_chunks(&chunks))
+        .context("failed to initialize chunks")?;
+    // Free memory.
+    drop(chunks);
 
     let mut builder = DeviceBuilder::new();
     let mut dev_params = frontend.dev_params();

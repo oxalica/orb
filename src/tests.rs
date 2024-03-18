@@ -171,7 +171,7 @@ async fn new_dev(chunks: &[(usize, u32, Vec<u8>)]) -> Frontend<TestBackend> {
         .iter()
         .map(|(zid, coff, data)| {
             let global_off = *zid as u64 * CONFIG.zone_secs.bytes() + *coff as u64;
-            (global_off, data.len() as u32)
+            (global_off, data.len() as u64)
         })
         .collect::<Vec<_>>();
     let mut dev = Frontend::new(CONFIG, backend, |_, _| Ok(())).unwrap();

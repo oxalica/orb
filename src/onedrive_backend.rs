@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -6,17 +7,22 @@ use std::time::Duration;
 use anyhow::{ensure, Context, Result};
 use bytes::Bytes;
 use futures_util::{Stream, TryFutureExt, TryStreamExt};
-use onedrive_api::option::ObjectOption;
+use onedrive_api::option::CollectionOption;
 use onedrive_api::resource::DriveItemField;
-use onedrive_api::{Auth, DriveLocation, FileName, ItemLocation, OneDrive, Permission};
+use onedrive_api::{Auth, DriveLocation, ItemLocation, OneDrive, Permission, TrackChangeFetcher};
 use reqwest::{header, Client, StatusCode};
 use serde::{de, Deserialize, Serialize};
 
 use crate::service::Backend;
 
+const DELTA_PAGE_SIZE: usize = 10_000;
+
 const USER_AGENT: &str = concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VERSION"));
 const XDG_STATE_DIR_NAME: &str = env!("CARGO_PKG_NAME");
 const CREDENTIAL_FILE_NAME: &str = "credential.json";
+const STATE_FILE_NAME: &str = "state.json";
+
+const GEOMETRY_FILE_NAME: &str = "geometry.json";
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -63,7 +69,105 @@ struct Credential {
     client_secret: Option<String>,
 }
 
-pub fn init(config: &Config, rt: &tokio::runtime::Runtime) -> Result<Remote> {
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Geometry {
+    dev_size: u64,
+    zone_size: u64,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ChunksState {
+    delta_url: String,
+    zones_dir_id: Option<String>,
+    zones: BTreeMap<String, RemoteZone>,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RemoteZone {
+    zid: u64,
+    chunks: BTreeMap<u64, u64>,
+}
+
+impl ChunksState {
+    const SELECT_FIELDS: &'static [DriveItemField] = &[
+        DriveItemField::id,
+        DriveItemField::name,
+        DriveItemField::size,
+        DriveItemField::parent_reference,
+        DriveItemField::file,
+        DriveItemField::folder,
+        DriveItemField::deleted,
+    ];
+
+    async fn update(
+        &mut self,
+        drive: &OneDrive,
+        fetcher: &mut TrackChangeFetcher,
+        root_dir_id: &str,
+    ) -> Result<()> {
+        while let Some(items) = fetcher.fetch_next_page(drive).await? {
+            log::info!("fetched {} items", items.len());
+            for mut item in items {
+                (|| {
+                    let id = item.id.clone().context("missing id")?.0;
+                    let name = item.name.clone().context("missing name")?;
+                    let parent_id = get_parent_id(item.parent_reference.as_deref_mut())
+                        .context("missing parent_reference")?;
+                    let is_deleted = item.deleted.is_some();
+                    let hex_off = name.get(1..).and_then(|s| u64::from_str_radix(s, 16).ok());
+                    if parent_id == root_dir_id && item.folder.is_some() && name == "zones" {
+                        self.zones_dir_id = (!is_deleted).then_some(id);
+                    } else if Some(&parent_id) == self.zones_dir_id.as_ref()
+                        && item.folder.is_some()
+                        && name.starts_with('z')
+                    {
+                        if let Some(zid) = hex_off {
+                            if is_deleted {
+                                self.zones.remove(&id);
+                            } else {
+                                self.zones.entry(id).or_default().zid = zid;
+                            }
+                        }
+                    } else if name.starts_with('c') && item.file.is_some() {
+                        if let (Some(z), Some(coff)) = (self.zones.get_mut(&parent_id), hex_off) {
+                            if is_deleted {
+                                z.chunks.remove(&coff);
+                            } else {
+                                let size = item.size.context("missing size")?.try_into()?;
+                                z.chunks.insert(coff, size);
+                            }
+                        }
+                    }
+                    anyhow::Ok(())
+                })()
+                .with_context(|| format!("failed to process item: {item:?}"))?;
+            }
+        }
+        self.delta_url = fetcher
+            .delta_url()
+            .context("missing final delta url")?
+            .to_owned();
+        Ok(())
+    }
+}
+
+fn get_parent_id(parent: Option<&mut serde_json::Value>) -> Option<String> {
+    if let Some(parent) = parent {
+        if let Some(serde_json::Value::String(s)) = parent.get_mut("id") {
+            return Some(std::mem::take(s));
+        }
+    }
+    None
+}
+
+pub fn init(
+    config: &Config,
+    dev_config: &crate::service::Config,
+    rt: &tokio::runtime::Runtime,
+) -> Result<(Remote, Vec<(u64, u64)>)> {
     fs::create_dir_all(&config.state_dir)
         .with_context(|| format!("failed to create {}", config.state_dir.display()))?;
 
@@ -104,34 +208,111 @@ pub fn init(config: &Config, rt: &tokio::runtime::Runtime) -> Result<Remote> {
     };
     let drive = OneDrive::new_with_client(client.clone(), access_token, DriveLocation::me());
 
-    // TODO: Geometry validation.
-    let remote_dir_id = rt.block_on(async {
-        match drive
-            .get_item_with_option(
-                ItemLocation::from_path(&config.remote_dir).unwrap(),
-                ObjectOption::new().select(&[DriveItemField::id]),
-            )
-            .await
-        {
-            Ok(item) => item.context("no response")?.id.context("missing id"),
-            Err(err) if err.status_code() == Some(StatusCode::NOT_FOUND) => {
-                log::info!("remote directory does not exist, creating...");
-                let pos = config.remote_dir.rfind('/').unwrap() + 1;
-                let parent = ItemLocation::from_path(&config.remote_dir[..pos]).unwrap();
-                let child = FileName::new(&config.remote_dir[pos..]).unwrap();
-                drive
-                    .create_folder(parent, child)
-                    .await
-                    .context("failed to create remote directory")?
-                    .id
-                    .context("missing id in creation response")
+    // Geometry validation.
+    let geometry = Geometry {
+        dev_size: dev_config.dev_secs.bytes(),
+        zone_size: dev_config.zone_secs.bytes(),
+    };
+    let root_dir_id = rt.block_on(async {
+        let geometry_file_path = format!("{}/{}", config.remote_dir, GEOMETRY_FILE_NAME);
+        let geometry_file_path = ItemLocation::from_path(&geometry_file_path).unwrap();
+        let new_data = || serde_json::to_vec(&geometry).expect("serialization cannot fail");
+        let mut parent = match drive.get_item(geometry_file_path).await {
+            Ok(item) => {
+                let remote_geometry = client
+                    .get(item.download_url.context("missing download url")?)
+                    .send()
+                    .await?
+                    .error_for_status()?
+                    .json::<Geometry>()
+                    .await?;
+                ensure!(
+                    geometry.zone_size == remote_geometry.zone_size
+                        && geometry.dev_size >= remote_geometry.dev_size,
+                    "geometry mismatch, remote: {remote_geometry:?}, config: {geometry:?}",
+                );
+                if geometry.dev_size > remote_geometry.dev_size {
+                    log::info!("changing device geometry from {remote_geometry:?} to {geometry:?}");
+                    drive.upload_small(geometry_file_path, new_data()).await?;
+                }
+                item.parent_reference
             }
+            Err(err) if err.status_code() == Some(StatusCode::NOT_FOUND) => {
+                log::info!("initializing remote directory...");
+                drive
+                    .upload_small(geometry_file_path, new_data())
+                    .await?
+                    .parent_reference
+            }
+            Err(err) => return Err(err.into()),
+        };
+        get_parent_id(parent.as_deref_mut()).context("missing parent id")
+    })?;
+
+    log::info!("root directory id: {root_dir_id}");
+
+    // Chunk enumeration.
+    let state_file_path = config.state_dir.join(STATE_FILE_NAME);
+    let state = (|| -> Result<Option<ChunksState>> {
+        match fs::read_to_string(&state_file_path) {
+            Ok(content) => Ok(Some(serde_json::from_str(&content)?)),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(err) => Err(err.into()),
         }
-    })?;
-    log::info!("remote directory id: {}", remote_dir_id.0);
+    })()
+    .context("failed to read chunks state file")?;
+    let state = rt.block_on(async {
+        if let Some(mut state) = state {
+            log::info!("fetching remote changes...");
+            match drive
+                .track_root_changes_from_delta_url(&state.delta_url)
+                .await
+            {
+                Ok(mut fetcher) => {
+                    state.update(&drive, &mut fetcher, &root_dir_id).await?;
+                    return Ok(state);
+                }
+                Err(err) if err.status_code() == Some(StatusCode::GONE) => {
+                    log::info!("delta url gone, re-enumeration is required");
+                }
+                Err(err) => return Err(err.into()),
+            }
+        }
 
-    Ok(Remote::new(drive, config.remote_dir.clone()))
+        log::info!("enumerating remote files...");
+        let mut fetcher = drive
+            .track_root_changes_from_initial_with_option(
+                CollectionOption::new()
+                    .select(ChunksState::SELECT_FIELDS)
+                    .page_size(DELTA_PAGE_SIZE),
+            )
+            .await?;
+        let mut state = ChunksState::default();
+        state.update(&drive, &mut fetcher, &root_dir_id).await?;
+        anyhow::Ok(state)
+    })?;
+    safe_write(&state_file_path, &state).context("failed to save chunks state")?;
+
+    let mut chunks = Vec::with_capacity(state.zones.values().map(|z| z.chunks.len()).sum());
+    let zone_cnt = state.zones.len();
+    for (_, zone) in state.zones {
+        let zone_start = geometry
+            .zone_size
+            .checked_mul(zone.zid)
+            .context("zone offset overflow")?;
+        for (coff, size) in zone.chunks {
+            let global_off = zone_start
+                .checked_add(coff)
+                .context("chunk offset overflow")?;
+            chunks.push((global_off, size));
+        }
+    }
+    // `ChunksState::zones` are ordered by item ids. We need to sort it by offset.
+    chunks.sort_unstable();
+    log::info!("loaded {} zones, {} chunks", zone_cnt, chunks.len());
+
+    let remote = Remote::new(drive, config.remote_dir.clone());
+    Ok((remote, chunks))
 }
 
 /// Write to the file with crash safety, and prevent non-owners from reading.
