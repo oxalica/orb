@@ -449,6 +449,9 @@ impl<B: Backend> Frontend<B> {
             // SAFETY: Initialied.
             unsafe { tail_buf.set_len(tail_buf.len() + buf.len()) };
 
+            // Always dirty the zone. It will be cleared after inline-committed or flushed.
+            self.dirty_zones.lock().insert(zid as u32);
+
             let new_wp = tail_coff + tail_buf.len() as u32;
             if new_wp as u64 == self.config.zone_secs.bytes() {
                 // If this write makes the zone full, update `cond` and commit inline.
@@ -460,7 +463,6 @@ impl<B: Backend> Frontend<B> {
                 if tail_buf.len() < self.config.max_chunk_size {
                     // Buffer small writes.
                     drop(tail);
-                    self.dirty_zones.lock().insert(zid as u32);
                     return Ok(prev_wp);
                 }
             }
