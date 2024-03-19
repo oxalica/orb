@@ -1,8 +1,10 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
+use std::hash::Hash;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::sync::Arc;
+use std::time::{Duration, SystemTime};
 
 use anyhow::{ensure, Context, Result};
 use bytes::Bytes;
@@ -10,11 +12,20 @@ use futures_util::{Stream, TryFutureExt, TryStreamExt};
 use onedrive_api::option::CollectionOption;
 use onedrive_api::resource::DriveItemField;
 use onedrive_api::{Auth, DriveLocation, ItemLocation, OneDrive, Permission, TrackChangeFetcher};
+use parking_lot::RwLock;
 use reqwest::{header, Client, StatusCode};
 use serde::{de, Deserialize, Serialize};
 
 use crate::service::Backend;
 
+/// In <https://learn.microsoft.com/en-us/graph/api/driveitem-get-content?view=graph-rest-1.0&tabs=http#response>:
+///
+/// > Preauthenticated download URLs are only valid for a short period of time (a few minutes) and
+/// > don't require an Authorization header to download.
+///
+/// Though it's discouraged to cache them, we still do it for a relatively safe time (60s) to
+/// avoid mass API calls which are rate limited.
+const URL_CACHE_DURATION: Duration = Duration::from_secs(60);
 const DELTA_PAGE_SIZE: usize = 10_000;
 
 const USER_AGENT: &str = concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VERSION"));
@@ -339,12 +350,17 @@ fn safe_write(path: &Path, data: &impl Serialize) -> Result<()> {
 pub struct Remote {
     drive: OneDrive,
     root_dir: String,
+    download_url_cache: Arc<RwLock<TimedCache<(u32, u32), String>>>,
 }
 
 impl Remote {
     fn new(drive: OneDrive, root_dir: String) -> Self {
         assert!(root_dir.starts_with('/') && !root_dir.ends_with('/'));
-        Self { drive, root_dir }
+        Self {
+            drive,
+            root_dir,
+            download_url_cache: Arc::new(RwLock::new(TimedCache::new(URL_CACHE_DURATION))),
+        }
     }
 
     fn chunk_path(&self, zid: u32, coff: u32) -> String {
@@ -372,13 +388,26 @@ impl Backend for Remote {
             self.drive.access_token().to_owned(),
             DriveLocation::me(),
         );
-        let path = self.chunk_path(zid, coff);
-        let fut = async move {
-            log::debug!("downloading chunk {path} starting at {read_offset}B");
 
-            let url = drive
-                .get_item_download_url(ItemLocation::from_path(&path).unwrap())
-                .await?;
+        let url = self.download_url_cache.read().get(&(zid, coff)).cloned();
+        let path = self.chunk_path(zid, coff);
+        let cache = Arc::clone(&self.download_url_cache);
+
+        let fut = async move {
+            let url = match url {
+                Some(url) => url,
+                None => {
+                    log::debug!("fetching download url of chunk {path}");
+                    let now = SystemTime::now();
+                    let url = drive
+                        .get_item_download_url(ItemLocation::from_path(&path).unwrap())
+                        .await?;
+                    cache.write().insert((zid, coff), url.clone(), now);
+                    url
+                }
+            };
+
+            log::debug!("downloading chunk {path} starting at {read_offset}B");
 
             let range = format!("bytes={}-", read_offset);
             let resp = drive
@@ -405,9 +434,21 @@ impl Backend for Remote {
     async fn upload_chunk(&self, zid: u32, coff: u32, data: Bytes) -> Result<()> {
         let path = self.chunk_path(zid, coff);
         log::debug!("uploading chunk {path} with {}B", data.len());
-        self.drive
+        let item = self
+            .drive
             .upload_small(ItemLocation::from_path(&path).unwrap(), data)
             .await?;
+
+        // Cache the download url returned. It must replace old ones, otherwise the cached content
+        // suffers from ABA-problem if it was deleted before.
+        let url = item.download_url.context("missing download url")?;
+        // NB. This uses timestamp after upload completion, since uploading takes
+        // quite some time.
+        let now = SystemTime::now();
+        self.download_url_cache
+            .write()
+            .insert((zid, coff), url, now);
+
         Ok(())
     }
 
@@ -417,6 +458,8 @@ impl Backend for Remote {
         self.drive
             .delete(ItemLocation::from_path(&path).unwrap())
             .await?;
+        // No need to clear the cache. Frontend will not download non-existing chunks.
+        // When new chunks are uploaded, cache will be updated in `upload_chunk` anyway.
         Ok(())
     }
 
@@ -426,6 +469,57 @@ impl Backend for Remote {
         self.drive
             .delete(ItemLocation::from_path(&path).unwrap())
             .await?;
+        self.download_url_cache.write().clear();
         Ok(())
+    }
+}
+
+struct TimedCache<K, V> {
+    expire_duration: Duration,
+    cleanup_threshold: usize,
+    map: HashMap<K, (SystemTime, V)>,
+}
+
+impl<K: Eq + Hash, V> TimedCache<K, V> {
+    const MIN_CLEANUP_THRESHOLD: usize = 16;
+
+    fn new(expire_duration: Duration) -> Self {
+        Self {
+            expire_duration,
+            cleanup_threshold: Self::MIN_CLEANUP_THRESHOLD,
+            map: HashMap::with_capacity(Self::MIN_CLEANUP_THRESHOLD),
+        }
+    }
+
+    fn get(&self, key: &K) -> Option<&V> {
+        match self.map.get(key) {
+            Some((time, v)) if SystemTime::now() <= *time => Some(v),
+            _ => None,
+        }
+    }
+
+    fn insert(&mut self, key: K, value: V, now: SystemTime) {
+        use std::collections::hash_map::Entry;
+
+        let expire_time = now + self.expire_duration;
+        match self.map.entry(key) {
+            Entry::Occupied(mut ent) if ent.get().0 < now => {
+                *ent.get_mut() = (expire_time, value);
+            }
+            Entry::Occupied(_) => {}
+            Entry::Vacant(ent) => {
+                ent.insert((expire_time, value));
+                if self.map.len() >= self.cleanup_threshold {
+                    self.map.retain(|_, (expire_ts, _)| now < *expire_ts);
+                    // O(2N / (2N - N)) = O(1)
+                    self.cleanup_threshold = Self::MIN_CLEANUP_THRESHOLD.max(self.map.len() * 2);
+                }
+            }
+        }
+    }
+
+    fn clear(&mut self) {
+        self.map.clear();
+        self.cleanup_threshold = Self::MIN_CLEANUP_THRESHOLD;
     }
 }
