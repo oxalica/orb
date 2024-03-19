@@ -15,7 +15,7 @@ futures-util = { version = "0.3", features = ["io"] }
 itertools = "0.12.1"
 log = "0.4.21"
 lru = "0.12.3"
-onedrive-api = "0.9.1"
+onedrive-api = { git = "https://github.com/oxalica/onedrive-api.git", rev = "2872e5338d09a348be6f371ff073666dcc251405" }
 orb-ublk = { path = "./orb-ublk" }
 parking_lot = "0.12"
 reqwest = { version = "0.11.26", features = ["stream"] }

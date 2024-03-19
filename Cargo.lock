@@ -911,8 +911,7 @@ checksum = "3fdb12b2476b595f9358c5161aa467c2438859caa136dec86c26fdd2efe17b92"
 [[package]]
 name = "onedrive-api"
 version = "0.9.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "db0beaa84d3903bc5114fad4aad88a867a00ad294bc1cdc372220efc1da2f142"
+source = "git+https://github.com/oxalica/onedrive-api.git?rev=2872e5338d09a348be6f371ff073666dcc251405#2872e5338d09a348be6f371ff073666dcc251405"
 dependencies = [
  "bytes",
  "reqwest",

@@ -347,6 +347,7 @@ fn safe_write(path: &Path, data: &impl Serialize) -> Result<()> {
     Ok(())
 }
 
+#[derive(Debug)]
 pub struct Remote {
     drive: OneDrive,
     root_dir: String,
@@ -383,12 +384,7 @@ impl Backend for Remote {
         coff: u32,
         read_offset: u64,
     ) -> impl Stream<Item = Result<Bytes>> + Send + 'static {
-        let drive = OneDrive::new_with_client(
-            self.drive.client().clone(),
-            self.drive.access_token().to_owned(),
-            DriveLocation::me(),
-        );
-
+        let drive = self.drive.clone();
         let url = self.download_url_cache.read().get(&(zid, coff)).cloned();
         let path = self.chunk_path(zid, coff);
         let cache = Arc::clone(&self.download_url_cache);
@@ -474,6 +470,7 @@ impl Backend for Remote {
     }
 }
 
+#[derive(Debug)]
 struct TimedCache<K, V> {
     expire_duration: Duration,
     cleanup_threshold: usize,
