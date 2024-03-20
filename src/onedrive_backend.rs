@@ -6,12 +6,14 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
-use anyhow::{ensure, Context, Result};
+use anyhow::{anyhow, bail, ensure, Context, Result};
 use bytes::Bytes;
 use futures_util::{Stream, TryFutureExt, TryStreamExt};
-use onedrive_api::option::CollectionOption;
+use onedrive_api::option::{CollectionOption, DriveItemPutOption};
 use onedrive_api::resource::DriveItemField;
-use onedrive_api::{Auth, DriveLocation, ItemLocation, OneDrive, Permission, TrackChangeFetcher};
+use onedrive_api::{
+    Auth, ConflictBehavior, DriveLocation, ItemLocation, OneDrive, Permission, TrackChangeFetcher,
+};
 use parking_lot::RwLock;
 use reqwest::{header, Client, StatusCode};
 use serde::{de, Deserialize, Serialize};
@@ -27,7 +29,19 @@ use crate::service::Backend;
 /// Though it's discouraged to cache them, we still do it for a relatively safe time (60s) to
 /// avoid mass API calls which are rate limited.
 const URL_CACHE_DURATION: Duration = Duration::from_secs(60);
+
 const DELTA_PAGE_SIZE: usize = 10_000;
+
+/// Chunks smaller than this is uploaded via upload-small API, otherwise session upload API is
+/// used. The maximum valid value is not known. Two documentation sources give conflict results.
+/// - 250MB: <https://learn.microsoft.com/en-us/graph/api/driveitem-put-content?view=graph-rest-1.0&tabs=http>
+/// - 4MB: <https://learn.microsoft.com/en-us/onedrive/developer/rest-api/api/driveitem_put_content?view=odsp-graph-online>
+///
+/// Note that the session upload API has higher bandwidth limit than main Microsoft Graph API.
+/// We should prefer that unless the request lattency is an issue (session upload requires at least
+/// 2 requests per file).
+const SESSION_UPLOAD_THRESHOLD: usize = 4_000_000; // 4MB
+const SESSION_UPLOAD_MAX_PART_SIZE: usize = 60 << 20; // 60MiB, must be aligned to 320KiB.
 
 const USER_AGENT: &str = concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VERSION"));
 const XDG_STATE_DIR_NAME: &str = env!("CARGO_PKG_NAME");
@@ -427,21 +441,65 @@ impl Backend for Remote {
 
     async fn upload_chunk(&self, zid: u32, coff: u32, data: Bytes) -> Result<()> {
         let path = self.chunk_path(zid, coff);
-        log::debug!("uploading chunk {path} with {}B", data.len());
-        let item = self
-            .drive
-            .upload_small(ItemLocation::from_path(&path).unwrap(), data)
-            .await?;
+        let total_len = data.len();
+        log::debug!("uploading chunk {path} with {total_len}B");
+        let loc = ItemLocation::from_path(&path).unwrap();
 
-        // Cache the download url returned. It must replace old ones, otherwise the cached content
-        // suffers from ABA-problem if it was deleted before.
-        let url = item.download_url.context("missing download url")?;
-        // NB. This uses timestamp after upload completion, since uploading takes
-        // quite some time.
-        let now = SystemTime::now();
-        self.download_url_cache
-            .write()
-            .insert((zid, coff), url, now);
+        let item = if total_len <= SESSION_UPLOAD_THRESHOLD {
+            self.drive.upload_small(loc, data).await?
+        } else {
+            assert!(!data.is_empty());
+
+            // The tail chunk may be replaced several times.
+            let opt = DriveItemPutOption::new().conflict_behavior(ConflictBehavior::Replace);
+            let (sess, _) = self.drive.new_upload_session_with_option(loc, opt).await?;
+            let mut rest = data;
+            let mut offset = 0u64;
+            loop {
+                let part_len = rest.len().min(SESSION_UPLOAD_MAX_PART_SIZE);
+                let part = rest.split_to(part_len);
+                let new_offset = offset + part_len as u64;
+                let ret = sess
+                    .upload_part(
+                        part,
+                        offset..new_offset,
+                        total_len as u64,
+                        self.drive.client(),
+                    )
+                    .await;
+                let err = match (ret, new_offset == total_len as u64) {
+                    (Err(err), _) => err.into(),
+                    (Ok(None), false) => {
+                        offset = new_offset;
+                        continue;
+                    }
+                    (Ok(Some(item)), true) => break item,
+                    (Ok(Some(item)), false) => {
+                        // The session is completed, thus no need to delete.
+                        bail!("unexpected completion for {path} at {new_offset}/{total_len}: {item:?}");
+                    }
+                    (Ok(None), true) => {
+                        anyhow!("failed to complete uploading for {path} at {new_offset}B")
+                    }
+                };
+                if let Err(err) = sess.delete(self.drive.client()).await {
+                    log::error!("failed to delete upload session for {path}: {err}");
+                }
+                return Err(err);
+            }
+        };
+
+        // Cache the new download url returned. We must invalidate old ones if exists.
+        if let Some(url) = item.download_url {
+            // NB. This uses timestamp after upload completion, since uploading takes
+            // quite some time.
+            let now = SystemTime::now();
+            self.download_url_cache
+                .write()
+                .insert((zid, coff), url, now);
+        } else {
+            self.download_url_cache.write().remove(&(zid, coff));
+        }
 
         Ok(())
     }
@@ -511,6 +569,10 @@ impl<K: Eq + Hash, V> TimedCache<K, V> {
                 }
             }
         }
+    }
+
+    fn remove(&mut self, key: &K) {
+        self.map.remove(key);
     }
 
     fn clear(&mut self) {
