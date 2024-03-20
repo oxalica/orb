@@ -15,6 +15,7 @@ use onedrive_api::{Auth, DriveLocation, ItemLocation, OneDrive, Permission, Trac
 use parking_lot::RwLock;
 use reqwest::{header, Client, StatusCode};
 use serde::{de, Deserialize, Serialize};
+use serde_inline_default::serde_inline_default;
 
 use crate::service::Backend;
 
@@ -35,6 +36,7 @@ const STATE_FILE_NAME: &str = "state.json";
 
 const GEOMETRY_FILE_NAME: &str = "geometry.json";
 
+#[serde_inline_default]
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
@@ -42,12 +44,8 @@ pub struct Config {
     remote_dir: String,
     #[serde(default = "default_state_dir")]
     state_dir: PathBuf,
-    #[serde(default = "default_timeout")]
+    #[serde_inline_default(15)]
     connect_timeout_sec: u64,
-}
-
-fn default_timeout() -> u64 {
-    15
 }
 
 fn de_remote_dir<'de, D: de::Deserializer<'de>>(de: D) -> Result<String, D::Error> {

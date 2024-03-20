@@ -6,6 +6,7 @@ use anyhow::{bail, Context, Result};
 use orb_ublk::runtime::TokioRuntimeBuilder;
 use orb_ublk::{ControlDevice, DeviceBuilder, DeviceInfo};
 use serde::Deserialize;
+use serde_inline_default::serde_inline_default;
 use tokio::runtime::Runtime;
 
 #[derive(Debug, clap::Parser)]
@@ -52,30 +53,19 @@ enum BackendConfig {
     Onedrive(orb::onedrive_backend::Config),
 }
 
+#[serde_inline_default]
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct UblkConfig {
-    #[serde(default = "default_id")]
+    #[serde_inline_default(-1)]
     id: i32,
     #[serde(default)]
     unprivileged: bool,
     // TODO: Validate these.
-    #[serde(default = "default_queues")]
+    #[serde_inline_default(1)]
     queues: u16,
-    #[serde(default = "default_queue_depth")]
+    #[serde_inline_default(NonZeroU16::new(64).unwrap())]
     queue_depth: NonZeroU16,
-}
-
-fn default_id() -> i32 {
-    -1
-}
-
-fn default_queues() -> u16 {
-    1
-}
-
-fn default_queue_depth() -> NonZeroU16 {
-    NonZeroU16::new(64).unwrap()
 }
 
 fn serve_main(cmd: ServeCmd) -> Result<()> {

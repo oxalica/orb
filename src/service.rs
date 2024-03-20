@@ -50,6 +50,7 @@ use orb_ublk::{
 use parking_lot::Mutex;
 use rustix::io::Errno;
 use serde::{Deserialize, Serialize};
+use serde_inline_default::serde_inline_default;
 
 // TODO: Configurable.
 const LOGICAL_BLOCK_SECS: Sector = Sector(1);
@@ -74,6 +75,7 @@ pub trait Backend: Send + Sync + 'static {
     fn delete_all_zones(&self) -> impl Future<Output = Result<()>> + Send + '_;
 }
 
+#[serde_inline_default]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
@@ -86,12 +88,8 @@ pub struct Config {
     #[serde(deserialize_with = "de_size")]
     pub max_chunk_size: usize,
 
-    #[serde(default = "default_concurrent_streams")]
+    #[serde_inline_default(NonZeroUsize::new(16).unwrap())]
     pub max_concurrent_streams: NonZeroUsize,
-}
-
-fn default_concurrent_streams() -> NonZeroUsize {
-    NonZeroUsize::new(16).unwrap()
 }
 
 mod serde_sector {

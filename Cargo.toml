@@ -22,6 +22,7 @@ reqwest = { version = "0.11.26", features = ["stream"] }
 rustix = "0.38"
 sd-notify = "0.4.1"
 serde = { version = "1", features = ["derive"] }
+serde-inline-default = "0.2"
 serde_json = "1.0.114"
 tokio = { version = "1", features = ["macros", "sync", "time"] }
 toml = "0.8"
