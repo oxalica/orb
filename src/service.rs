@@ -41,7 +41,7 @@ use std::sync::Arc;
 
 use anyhow::{ensure, Context, Result};
 use bytes::{BufMut, Bytes, BytesMut};
-use futures_util::{AsyncBufRead, AsyncBufReadExt, Stream, TryStreamExt};
+use futures_util::{AsyncBufRead, AsyncReadExt, Stream, TryStreamExt};
 use itertools::Itertools;
 use lru::LruCache;
 use orb_ublk::{
@@ -619,37 +619,26 @@ impl<B: Backend> BlockDevice for Frontend<B> {
             // not grab the lock before us, because of `watch::Receiver::wait_for` condition.
             assert_eq!(*state.pos_tx.borrow(), read_start_in_chunk);
 
-            // XXX: Could we simply `read_exact` here?
-            let mut remaining = read_len;
-            while remaining != 0 {
-                let data = match state.stream.fill_buf().await {
-                    Ok(data) => data,
-                    Err(err) => {
-                        // TODO: Retry on connection lost.
-                        log::error!(
-                            "failed to download chunk at zone={zid} coff={coff}: {err}",
-                            coff = stream.coff
-                        );
-                        return Err(Errno::IO);
+            // The kernel read length is usually quite large (>=512KiB) for read-ahead, while
+            // stream read size is quite small (~16KiB). To prevent frequent `pwrite` into kernel,
+            // we buffer them locally and submit it into kernel once.
+            let mut data = vec![0u8; read_len as usize];
+            match state.stream.read_exact(&mut data).await {
+                Ok(()) => buf.put_slice(&data)?,
+                Err(err) if err.kind() == io::ErrorKind::UnexpectedEof => {
+                    log::debug!("stream ended early, retrying");
+                    if flags.contains(IoFlags::FailfastDev) {
+                        return Err(Errno::AGAIN);
                     }
-                };
-
-                // TODO: Bubble up the error.
-                assert!(
-                    !data.is_empty(),
-                    "stream ended early while expecting {}B more",
-                    remaining,
-                );
-
-                // NB. Clamp by expected `stream.len`. This is necessary to handle finilizing
-                // chunks which have 1byte more than `stream.len`. The trailing byte is ignored,
-                // and the stream will be closed due to `stream.len == 0` without errors.
-                let len = Ord::min(data.len(), remaining as usize);
-                buf.put_slice(&data[..len])?;
-
-                state.stream.consume_unpin(len);
-                remaining -= len as u32;
-                read_start += len as u32;
+                    continue;
+                }
+                Err(err) => {
+                    log::error!(
+                        "failed to download chunk at zone={zid} coff={coff}: {err}",
+                        coff = stream.coff,
+                    );
+                    return Err(Errno::IO);
+                }
             }
 
             // Update stream position and notify pending readers.
@@ -661,6 +650,8 @@ impl<B: Backend> BlockDevice for Frontend<B> {
                 .insert(state)
                 .pos_tx
                 .send_modify(|pos| *pos += read_len);
+
+            read_start += read_len;
         }
 
         Ok(())

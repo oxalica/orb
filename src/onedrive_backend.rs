@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
+use std::future::ready;
 use std::hash::Hash;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -8,7 +9,7 @@ use std::time::{Duration, SystemTime};
 
 use anyhow::{anyhow, bail, ensure, Context, Result};
 use bytes::Bytes;
-use futures_util::{Stream, TryFutureExt, TryStreamExt};
+use futures_util::{Stream, StreamExt, TryFutureExt, TryStreamExt};
 use onedrive_api::option::{CollectionOption, DriveItemPutOption};
 use onedrive_api::resource::DriveItemField;
 use onedrive_api::{
@@ -439,8 +440,13 @@ impl Backend for Remote {
                 );
             }
 
-            // TODO: Retry?
-            Ok(resp.bytes_stream().map_err(anyhow::Error::from))
+            Ok(resp
+                .bytes_stream()
+                // Treat body reading error as early EOF, so the frontend will do retry.
+                // When the connection is stall for too long, the error is:
+                // `request or response body error: error reading a body from connection: Connection reset by peer (os error 104)`.
+                .take_while(|ret| ready(!matches!(ret, Err(err) if err.is_body())))
+                .map_err(anyhow::Error::from))
         };
         fut.try_flatten_stream()
     }
