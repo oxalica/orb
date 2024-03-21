@@ -14,7 +14,7 @@ use onedrive_api::resource::DriveItemField;
 use onedrive_api::{
     Auth, ConflictBehavior, DriveLocation, ItemLocation, OneDrive, Permission, TrackChangeFetcher,
 };
-use parking_lot::RwLock;
+use parking_lot::Mutex;
 use reqwest::{header, Client, StatusCode};
 use serde::{de, Deserialize, Serialize};
 use serde_inline_default::serde_inline_default;
@@ -363,8 +363,11 @@ fn safe_write(path: &Path, data: &impl Serialize) -> Result<()> {
 pub struct Remote {
     drive: OneDrive,
     root_dir: String,
-    download_url_cache: Arc<RwLock<TimedCache<(u32, u32), String>>>,
+    download_url_cache: Mutex<TimedCache<(u32, u32), CacheCell>>,
 }
+
+/// In case of concurrent cache population, only one wins, to avoid redundant API calls.
+type CacheCell = Arc<tokio::sync::OnceCell<String>>;
 
 impl Remote {
     fn new(drive: OneDrive, root_dir: String) -> Self {
@@ -372,7 +375,7 @@ impl Remote {
         Self {
             drive,
             root_dir,
-            download_url_cache: Arc::new(RwLock::new(TimedCache::new(URL_CACHE_DURATION))),
+            download_url_cache: Mutex::new(TimedCache::new(URL_CACHE_DURATION)),
         }
     }
 
@@ -396,24 +399,27 @@ impl Backend for Remote {
         coff: u32,
         read_offset: u64,
     ) -> impl Stream<Item = Result<Bytes>> + Send + 'static {
-        let drive = self.drive.clone();
-        let url = self.download_url_cache.read().get(&(zid, coff)).cloned();
-        let path = self.chunk_path(zid, coff);
-        let cache = Arc::clone(&self.download_url_cache);
-
-        let fut = async move {
-            let url = match url {
-                Some(url) => url,
+        let cell = {
+            let mut cache = self.download_url_cache.lock();
+            match cache.get(&(zid, coff)) {
+                Some(cell) => Arc::clone(cell),
                 None => {
-                    log::debug!("fetching download url of chunk {path}");
-                    let now = SystemTime::now();
-                    let url = drive
-                        .get_item_download_url(ItemLocation::from_path(&path).unwrap())
-                        .await?;
-                    cache.write().insert((zid, coff), url.clone(), now);
-                    url
+                    let cell = Arc::new(tokio::sync::OnceCell::new());
+                    cache.insert((zid, coff), cell.clone(), SystemTime::now());
+                    cell
                 }
-            };
+            }
+        };
+
+        let drive = self.drive.clone();
+        let path = self.chunk_path(zid, coff);
+        let fut = async move {
+            let url = cell
+                .get_or_try_init(|| {
+                    log::debug!("fetching download url of chunk {path}");
+                    drive.get_item_download_url(ItemLocation::from_path(&path).unwrap())
+                })
+                .await?;
 
             log::debug!("downloading chunk {path} starting at {read_offset}B");
 
@@ -494,11 +500,12 @@ impl Backend for Remote {
             // NB. This uses timestamp after upload completion, since uploading takes
             // quite some time.
             let now = SystemTime::now();
+            let cell = Arc::new(tokio::sync::OnceCell::const_new_with(url));
             self.download_url_cache
-                .write()
-                .insert((zid, coff), url, now);
+                .lock()
+                .insert((zid, coff), cell, now);
         } else {
-            self.download_url_cache.write().remove(&(zid, coff));
+            self.download_url_cache.lock().remove(&(zid, coff));
         }
 
         Ok(())
@@ -521,7 +528,7 @@ impl Backend for Remote {
         self.drive
             .delete(ItemLocation::from_path(&path).unwrap())
             .await?;
-        self.download_url_cache.write().clear();
+        self.download_url_cache.lock().clear();
         Ok(())
     }
 }
