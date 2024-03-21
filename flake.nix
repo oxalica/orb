@@ -14,7 +14,7 @@ rec {
       rev = self.rev or (lib.warn "Git changes are not committed" (self.dirtyRev or "dirty"));
     in rec {
       default = orb;
-      orb = with pkgs; rustPlatform.buildRustPackage {
+      orb = with pkgs; rustPlatform.buildRustPackage rec {
         pname = "orb";
         version = "git-${rev}";
         src = self;
@@ -25,11 +25,17 @@ rec {
           allowBuiltinFetchGit = true;
         };
 
-        nativeBuildInputs = [ pkg-config rustPlatform.bindgenHook ];
+        nativeBuildInputs = [ pkg-config rustPlatform.bindgenHook installShellFiles ];
         buildInputs = [ linuxHeaders openssl ];
+
+        buildFeatures = [ "completion" ];
 
         postInstall = ''
           install -DT ./orb@.example.service $out/etc/systemd/system/orb@.service
+          installShellCompletion \
+            --bash completions/bash/${pname}.bash \
+            --fish completions/fish/${pname}.fish \
+            --zsh completions/zsh/_${pname}
         '';
 
         meta = {

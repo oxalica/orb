@@ -1,41 +1,23 @@
 use std::num::NonZeroU16;
-use std::path::PathBuf;
 use std::{fs, io};
 
 use anyhow::{bail, Context, Result};
+use clap::Parser;
+use cli::{Cli, ServeCmd, StopCmd};
 use orb_ublk::runtime::TokioRuntimeBuilder;
 use orb_ublk::{ControlDevice, DeviceBuilder, DeviceInfo};
 use serde::Deserialize;
 use serde_inline_default::serde_inline_default;
 use tokio::runtime::Runtime;
 
-#[derive(Debug, clap::Parser)]
-enum Cli {
-    Serve(ServeCmd),
-    Stop(StopCmd),
-}
+mod cli;
 
 fn main() -> Result<()> {
     env_logger::init();
-    let cli = <Cli as clap::Parser>::parse();
-    match cli {
+    match Cli::parse() {
         Cli::Serve(cmd) => serve_main(cmd),
         Cli::Stop(cmd) => stop_cmd(cmd),
     }
-}
-
-/// Start and run the service in the foreground.
-///
-/// The block device will be ready on `/dev/ublkbX` where X is the next unused integer starting at
-/// 0 . Service configurations are passed via the config file. The service will run until it is
-/// signaled to exit via SIGINT (Ctrl-C) or SIGTERM, or the device gets deleted by manual `orb
-/// stop`. The block device and the control device are cleaned up when the process is exiting.
-/// If it somehow failed to correctly clean up, `orb stop` can also be used to release stall
-/// control devices.
-#[derive(Debug, clap::Args)]
-struct ServeCmd {
-    #[clap(long, short)]
-    config_file: PathBuf,
 }
 
 #[derive(Debug, Deserialize)]
@@ -156,23 +138,6 @@ fn serve<B: orb::service::Backend>(
         .context("service failed")?;
 
     Ok(())
-}
-
-/// Stop and clean up ublk control and block devices `/dev/ublk{c,b}*`.
-///
-/// This can be either used to stop a running service, or release resources when the service
-/// aborted unexpectedly without a correct clean up.
-///
-/// If the coresponding devices are created by privileged process, this command also requires
-/// root privilege to clean them up.
-#[derive(Debug, clap::Args)]
-struct StopCmd {
-    /// Clean all existing `ublk` devices.
-    #[clap(long, exclusive = true)]
-    all: bool,
-    /// The integer device ids to clean up, ie. the number in the tail of `/dev/ublk{b,c}*`.
-    #[clap(required = true)]
-    dev_ids: Vec<u32>,
 }
 
 fn stop_cmd(cmd: StopCmd) -> Result<()> {

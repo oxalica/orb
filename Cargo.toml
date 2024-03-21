@@ -3,6 +3,10 @@ name = "orb"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+default = []
+completion = ["dep:clap", "dep:clap_complete"]
+
 [dependencies]
 anyhow = "1"
 bytes = "1"
@@ -29,6 +33,10 @@ toml = "0.8"
 
 [dev-dependencies]
 rustix = { version = "0.38", features = ["fs"] }
+
+[build-dependencies]
+clap = { version = "4", optional = true, features = ["derive"] }
+clap_complete = { version = "4", optional = true }
 
 [workspace]
 resolver = "2"
