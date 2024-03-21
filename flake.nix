@@ -28,6 +28,10 @@ rec {
         nativeBuildInputs = [ pkg-config rustPlatform.bindgenHook ];
         buildInputs = [ linuxHeaders openssl ];
 
+        postInstall = ''
+          install -DT ./orb@.example.service $out/etc/systemd/system/orb@.service
+        '';
+
         meta = {
           inherit description;
           homepage = "https://github.com/oxalica/orb";

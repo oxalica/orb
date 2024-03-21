@@ -1,0 +1,37 @@
+[Unit]
+Description=OneDrive Block Device Daemon (%i)
+Requires=modprobe@ublk_drv.service
+After=network-online.service modprobe@ublk_drv.service
+
+[Service]
+Type=notify
+ExecStart=/usr/bin/orb serve --config-file "${CONFIGURATION_DIRECTORY}/%i.toml"
+StateDirectory="orb/%i"
+StateDirectoryMode=0700
+ConfigurationDirectory=orb
+Environment="RUST_BACKTRACE=1"
+
+CapabilityBoundingSet=CAP_SYS_ADMIN CAP_SYS_RESOURCE
+DeviceAllow=/dev/ublk-control rw
+DeviceAllow=char-ublk-char rw
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectClock=yes
+ProtectControlGroups=yes
+ProtectHome=yes
+ProtectHostname=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectProc=invisible
+ProtectSystem=strict
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+SystemCallArchitectures=native
+SystemCallErrorNumber=EPERM
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged
