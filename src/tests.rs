@@ -3,11 +3,12 @@ use std::fs::File;
 use std::future::Future;
 use std::io::Read;
 use std::num::NonZeroUsize;
+use std::time::Duration;
 use std::{mem, ptr, slice};
 
 use anyhow::Result;
 use bytes::Bytes;
-use futures_util::Stream;
+use futures_util::{FutureExt, Stream};
 use orb_ublk::{
     BlockDevice, IoFlags, ReadBuf, Sector, WriteBuf, Zone, ZoneBuf, ZoneCond, ZoneType,
 };
@@ -22,6 +23,7 @@ use crate::service::{Backend, Config, Frontend};
 pub struct TestBackend {
     inner: Memory,
     log: Mutex<String>,
+    delay: Mutex<Duration>,
 }
 
 impl TestBackend {
@@ -29,6 +31,7 @@ impl TestBackend {
         Self {
             inner: Memory::new(zone_cnt),
             log: Mutex::default(),
+            delay: Mutex::new(Duration::ZERO),
         }
     }
 
@@ -48,6 +51,15 @@ impl TestBackend {
     pub fn drain_log(&self) -> String {
         mem::take(&mut self.log.lock())
     }
+
+    fn delay(&self) -> impl Future<Output = ()> + 'static {
+        let delay = *self.delay.lock();
+        async move {
+            if delay != Duration::ZERO {
+                tokio::time::sleep(delay).await;
+            }
+        }
+    }
 }
 
 macro_rules! act {
@@ -64,7 +76,13 @@ impl Backend for TestBackend {
         read_offset: u64,
     ) -> impl Stream<Item = Result<Bytes>> + Send + 'static {
         act!(self, "download({zid}, {coff}, {read_offset})");
-        self.inner.download_chunk(zid, coff, read_offset)
+        let delay = self.delay();
+        let stream = self.inner.download_chunk(zid, coff, read_offset);
+        async move {
+            delay.await;
+            stream
+        }
+        .flatten_stream()
     }
 
     fn upload_chunk(
@@ -74,17 +92,26 @@ impl Backend for TestBackend {
         data: Bytes,
     ) -> impl Future<Output = Result<()>> + Send + '_ {
         act!(self, "upload({zid}, {coff}, {})", data.len());
-        self.inner.upload_chunk(zid, coff, data)
+        async move {
+            self.delay().await;
+            self.inner.upload_chunk(zid, coff, data).await
+        }
     }
 
     fn delete_zone(&self, zid: u64) -> impl Future<Output = Result<()>> + Send + '_ {
         act!(self, "delete_zone({zid})");
-        self.inner.delete_zone(zid)
+        async move {
+            self.delay().await;
+            self.inner.delete_zone(zid).await
+        }
     }
 
     fn delete_all_zones(&self) -> impl Future<Output = Result<()>> + Send + '_ {
         act!(self, "delete_all_zones()");
-        self.inner.delete_all_zones()
+        async move {
+            self.delay().await;
+            self.inner.delete_all_zones().await
+        }
     }
 }
 
@@ -253,7 +280,7 @@ async fn read_stream_reuse() {
     // The first zone is full, thus no initial download.
     assert_eq!(dev.backend().drain_log(), "");
 
-    // Read [0s, 1s), stream pos at 2s.
+    // Read [0s, 2s), stream pos at 2s.
     let got = dev.test_read(Sector(0), Sector(2)).await.unwrap();
     let expect = [1u8; Sector(2).bytes() as _];
     assert_eq!(got, expect);
@@ -278,6 +305,44 @@ async fn read_stream_reuse() {
     let got = dev.test_read(Sector(2), Sector(1)).await.unwrap();
     assert_eq!(got, [1u8; Sector(1).bytes() as _]);
     assert_eq!(dev.backend().drain_log(), "");
+}
+
+/// When reading takes some time, multiple consective reads are serialized and
+/// reuse one stream.
+#[tokio::test]
+async fn read_stream_wait_reuse() {
+    // The exact delay time does not matter. Just to ensure all ready futures are polled into
+    // Pending state before responding.
+    const DELAY: Duration = Duration::from_millis(100);
+
+    let expect = [
+        &[1u8; Sector(2).bytes() as _][..],
+        &[2u8; Sector(2).bytes() as _],
+    ]
+    .concat();
+    let dev = new_dev(&[
+        // [0, 4s)
+        (0, 0, expect.clone()),
+        // [4, 8s)
+        (0, 2048, vec![1u8; Sector(4).bytes() as usize]),
+    ])
+    .await;
+    // The first zone is full, thus no initial download.
+    assert_eq!(dev.backend().drain_log(), "");
+
+    *dev.backend().delay.lock() = DELAY;
+
+    // Read [0s, 2s) and [2s, 4s) concurrently, while polling them in order.
+    let (got1, got2) = tokio::join!(
+        dev.test_read(Sector(0), Sector(2)),
+        dev.test_read(Sector(2), Sector(2)),
+    );
+    let (expect1, expect2) = expect.split_at(expect.len() / 2);
+    assert_eq!(got1.unwrap(), expect1);
+    assert_eq!(got2.unwrap(), expect2);
+
+    // Only downloads once.
+    assert_eq!(dev.backend().drain_log(), "download(0, 0, 0);");
 }
 
 #[tokio::test]

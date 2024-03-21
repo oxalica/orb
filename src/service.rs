@@ -37,6 +37,7 @@ use std::future::Future;
 use std::io;
 use std::num::NonZeroUsize;
 use std::pin::Pin;
+use std::sync::Arc;
 
 use anyhow::{ensure, Context, Result};
 use bytes::{BufMut, Bytes, BytesMut};
@@ -51,6 +52,7 @@ use parking_lot::Mutex;
 use rustix::io::Errno;
 use serde::{Deserialize, Serialize};
 use serde_inline_default::serde_inline_default;
+use tokio::sync::watch;
 
 // TODO: Configurable.
 const LOGICAL_BLOCK_SECS: Sector = Sector(1);
@@ -152,7 +154,8 @@ pub struct Frontend<B> {
     backend: B,
     on_ready: Mutex<Option<OnReady>>,
 
-    stream_cache: Mutex<LruCache<u64, DownloadStream>>,
+    /// See docs of `DownloadStream`.
+    streams: Mutex<LruCache<u64, DownloadStream>>,
     zones: Box<[Zone]>,
     dirty_zones: Mutex<BTreeSet<u32>>,
     /// The global write fence for exclusive write operations (RESET_ALL) or synchronization
@@ -160,9 +163,27 @@ pub struct Frontend<B> {
     exclusive_write_fence: tokio::sync::RwLock<()>,
 }
 
+/// Active streams are keyed by global "reserved" stream position, counting all pending reads.
+/// This allows multiple read-ahead requests to be queued, without creating new streams.
+///
+/// ```text
+/// |             chunk                     |
+///        *stream-pos     *reserved-pos    *chunk-end
+///        |<------------->|<-------------->|
+///          pending reads   reserved remaining
+/// ```
+#[derive(Clone)]
 struct DownloadStream {
+    /// The remaining bytes starting at the position after all reserved pending reads.
+    reserved_remaining: u32,
+    /// The zone-relative starting offset of this chunk.
     coff: u32,
-    len: u32,
+    pos: watch::Receiver<u32>,
+    state: Arc<Mutex<Option<StreamState>>>,
+}
+
+struct StreamState {
+    pos_tx: watch::Sender<u32>,
     stream: Pin<Box<dyn AsyncBufRead + Send>>,
 }
 
@@ -238,7 +259,7 @@ impl<B: Backend> Frontend<B> {
             backend,
             on_ready: Mutex::new(Some(Box::new(on_ready) as _)),
 
-            stream_cache: Mutex::new(LruCache::new(config.max_concurrent_streams)),
+            streams: Mutex::new(LruCache::new(config.max_concurrent_streams)),
             zones,
             dirty_zones: Mutex::default(),
             exclusive_write_fence: tokio::sync::RwLock::new(()),
@@ -508,7 +529,7 @@ impl<B: Backend> BlockDevice for Frontend<B> {
         self.on_ready.lock().take().unwrap()(dev_info, stop)
     }
 
-    async fn read(&self, off: Sector, buf: &mut ReadBuf<'_>, _flags: IoFlags) -> Result<(), Errno> {
+    async fn read(&self, off: Sector, buf: &mut ReadBuf<'_>, flags: IoFlags) -> Result<(), Errno> {
         let (zid, mut read_start) = self.check_zone_and_range(off, buf.remaining())?;
         let zone = &self.zones[zid];
 
@@ -516,51 +537,92 @@ impl<B: Backend> BlockDevice for Frontend<B> {
         while buf.remaining() != 0 {
             let global_offset = self.config.zone_secs.bytes() * zid as u64 + read_start as u64;
 
-            let stream = self.stream_cache.lock().pop(&global_offset);
-            let mut stream = match stream {
-                Some(stream) => stream,
-                None => {
-                    let chunks = zone.chunk_ends.lock();
-                    let tail_start = chunks.last().copied().unwrap_or(0);
-                    if let Some(offset_in_tail) = read_start.checked_sub(tail_start) {
-                        // Read from tail, or zeros beyond the write pointer.
-                        {
-                            let tail = zone.tail.lock();
-                            drop(chunks);
-                            if (offset_in_tail as usize) < tail.as_ref().len() {
-                                let data = &tail.as_ref()[offset_in_tail as usize..];
-                                let len = Ord::min(data.len(), buf.remaining());
-                                buf.put_slice(&data[..len])?;
+            let (stream, read_len) = {
+                let mut streams = self.streams.lock();
+                let mut stream = match streams.pop(&global_offset) {
+                    Some(stream) => stream,
+                    None => {
+                        let chunks = zone.chunk_ends.lock();
+                        let tail_start = chunks.last().copied().unwrap_or(0);
+                        if let Some(offset_in_tail) = read_start.checked_sub(tail_start) {
+                            // Read from tail, or zeros beyond the write pointer.
+                            drop(streams);
+                            {
+                                let tail = zone.tail.lock();
+                                drop(chunks);
+                                if (offset_in_tail as usize) < tail.as_ref().len() {
+                                    let data = &tail.as_ref()[offset_in_tail as usize..];
+                                    let len = Ord::min(data.len(), buf.remaining());
+                                    buf.put_slice(&data[..len])?;
+                                }
                             }
+                            if buf.remaining() != 0 {
+                                buf.put_slice(&ZEROES[..buf.remaining()])?;
+                            }
+                            return Ok(());
                         }
-                        if buf.remaining() != 0 {
-                            buf.put_slice(&ZEROES[..buf.remaining()])?;
-                        }
-                        return Ok(());
-                    }
 
-                    // The first chunks whose end > `read_end`, covering the first byte to read.
-                    let idx = chunks.partition_point(|&end| end <= read_start);
-                    assert!(idx < chunks.len());
-                    let chunk_start = if idx > 0 { chunks[idx - 1] } else { 0 };
-                    let chunk_end = chunks[idx];
-                    let offset_in_chunk = read_start - chunk_start;
-                    let stream_len = chunk_end - read_start;
-                    let stream = self
-                        .backend
-                        .download_chunk(zid as u32, chunk_start, offset_in_chunk as u64)
-                        .map_err(io::Error::other)
-                        .into_async_read();
-                    DownloadStream {
-                        coff: chunk_start,
-                        len: stream_len,
-                        stream: Box::pin(stream) as _,
+                        // The first chunks whose end > `read_end`, covering the first byte to read.
+                        let idx = chunks.partition_point(|&end| end <= read_start);
+                        assert!(idx < chunks.len());
+                        let chunk_start = if idx > 0 { chunks[idx - 1] } else { 0 };
+                        let chunk_end = chunks[idx];
+                        let offset_in_chunk = read_start - chunk_start;
+                        let stream_len = chunk_end - read_start;
+                        let stream = self
+                            .backend
+                            .download_chunk(zid as u32, chunk_start, offset_in_chunk as u64)
+                            .map_err(io::Error::other)
+                            .into_async_read();
+                        let (pos_tx, pos) = watch::channel(offset_in_chunk);
+                        DownloadStream {
+                            reserved_remaining: stream_len,
+                            coff: chunk_start,
+                            pos,
+                            state: Arc::new(Mutex::new(Some(StreamState {
+                                stream: Box::pin(stream) as _,
+                                pos_tx,
+                            }))),
+                        }
                     }
+                };
+
+                let read_len = Ord::min(stream.reserved_remaining, buf.remaining() as u32);
+                assert_ne!(read_len, 0);
+                stream.reserved_remaining -= read_len;
+                // Put it back only if if can be reused later.
+                if stream.reserved_remaining != 0 {
+                    streams.push(global_offset + read_len as u64, stream.clone());
                 }
+
+                (stream, read_len)
             };
 
-            while buf.remaining() != 0 && stream.len != 0 {
-                let data = match stream.stream.fill_buf().await {
+            let read_start_in_chunk = read_start - stream.coff;
+            let Some(mut state) = stream
+                .pos
+                .clone()
+                .wait_for(|&pos| pos >= read_start_in_chunk)
+                .await
+                .ok()
+                .and_then(|_| stream.state.lock().take())
+            else {
+                log::debug!("stream closed, retrying");
+                if flags.contains(IoFlags::FailfastDev) {
+                    return Err(Errno::AGAIN);
+                }
+                continue;
+            };
+
+            // If we successfully took the stream state, the previous read must be successful,
+            // otherwise the state cell would be left empty. Also that readers queued after us must
+            // not grab the lock before us, because of `watch::Receiver::wait_for` condition.
+            assert_eq!(*state.pos_tx.borrow(), read_start_in_chunk);
+
+            // XXX: Could we simply `read_exact` here?
+            let mut remaining = read_len;
+            while remaining != 0 {
+                let data = match state.stream.fill_buf().await {
                     Ok(data) => data,
                     Err(err) => {
                         // TODO: Retry on connection lost.
@@ -571,27 +633,34 @@ impl<B: Backend> BlockDevice for Frontend<B> {
                         return Err(Errno::IO);
                     }
                 };
+
+                // TODO: Bubble up the error.
                 assert!(
                     !data.is_empty(),
                     "stream ended early while expecting {}B more",
-                    stream.len,
+                    remaining,
                 );
+
                 // NB. Clamp by expected `stream.len`. This is necessary to handle finilizing
                 // chunks which have 1byte more than `stream.len`. The trailing byte is ignored,
                 // and the stream will be closed due to `stream.len == 0` without errors.
-                let len = data.len().min(buf.remaining()).min(stream.len as usize);
+                let len = Ord::min(data.len(), remaining as usize);
                 buf.put_slice(&data[..len])?;
 
-                stream.stream.consume_unpin(len);
-                stream.len -= len as u32;
+                state.stream.consume_unpin(len);
+                remaining -= len as u32;
                 read_start += len as u32;
             }
 
-            if stream.len != 0 {
-                let new_global_offset =
-                    self.config.zone_secs.bytes() * zid as u64 + read_start as u64;
-                self.stream_cache.lock().push(new_global_offset, stream);
-            }
+            // Update stream position and notify pending readers.
+            // NB. We must set state back before sending notification, or the waiting reader
+            // may preemptively access the stream state and fail.
+            stream
+                .state
+                .lock()
+                .insert(state)
+                .pos_tx
+                .send_modify(|pos| *pos += read_len);
         }
 
         Ok(())
