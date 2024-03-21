@@ -409,7 +409,7 @@ impl Backend for Remote {
                 Some(cell) => Arc::clone(cell),
                 None => {
                     let cell = Arc::new(tokio::sync::OnceCell::new());
-                    cache.insert((zid, coff), cell.clone(), SystemTime::now());
+                    cache.insert((zid, coff), cell.clone());
                     cell
                 }
             }
@@ -516,11 +516,8 @@ impl Backend for Remote {
         if let Some(url) = item.download_url {
             // NB. This uses timestamp after upload completion, since uploading takes
             // quite some time.
-            let now = SystemTime::now();
             let cell = Arc::new(tokio::sync::OnceCell::const_new_with(url));
-            self.download_url_cache
-                .lock()
-                .insert((zid, coff), cell, now);
+            self.download_url_cache.lock().insert((zid, coff), cell);
         } else {
             self.download_url_cache.lock().remove(&(zid, coff));
         }
@@ -571,15 +568,15 @@ impl<K: Eq + Hash, V> TimedCache<K, V> {
         }
     }
 
-    fn insert(&mut self, key: K, value: V, now: SystemTime) {
+    fn insert(&mut self, key: K, value: V) {
         use std::collections::hash_map::Entry;
 
+        let now = SystemTime::now();
         let expire_time = now + self.expire_duration;
         match self.map.entry(key) {
-            Entry::Occupied(mut ent) if ent.get().0 < now => {
+            Entry::Occupied(mut ent) => {
                 *ent.get_mut() = (expire_time, value);
             }
-            Entry::Occupied(_) => {}
             Entry::Vacant(ent) => {
                 ent.insert((expire_time, value));
                 if self.map.len() >= self.cleanup_threshold {
