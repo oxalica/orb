@@ -15,10 +15,10 @@ futures-util = { version = "0.3", features = ["io"] }
 itertools = "0.12.1"
 log = "0.4.21"
 lru = "0.12.3"
-onedrive-api = { git = "https://github.com/oxalica/onedrive-api.git", rev = "2872e5338d09a348be6f371ff073666dcc251405" }
+onedrive-api = { git = "https://github.com/oxalica/onedrive-api.git", rev = "c6b76ed493b2e226c4cf09871c62c8955ee50520" }
 orb-ublk = { path = "./orb-ublk" }
 parking_lot = "0.12"
-reqwest = { version = "0.11.26", features = ["stream"] }
+reqwest = { version = "0.12", features = ["stream"] }
 rustix = "0.38"
 sd-notify = "0.4.1"
 serde = { version = "1", features = ["derive"] }
