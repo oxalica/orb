@@ -465,7 +465,7 @@ impl Backend for Remote {
         log::debug!("uploading chunk {path} with {total_len}B");
         let loc = ItemLocation::from_path(&path).unwrap();
 
-        let item = if total_len <= SESSION_UPLOAD_THRESHOLD {
+        let _item = if total_len <= SESSION_UPLOAD_THRESHOLD {
             retry_request(|| self.drive.upload_small(loc, data.clone())).await?
         } else {
             assert!(!data.is_empty());
@@ -512,15 +512,11 @@ impl Backend for Remote {
             }
         };
 
-        // Cache the new download url returned. We must invalidate old ones if exists.
-        if let Some(url) = item.download_url {
-            // NB. This uses timestamp after upload completion, since uploading takes
-            // quite some time.
-            let cell = Arc::new(tokio::sync::OnceCell::const_new_with(url));
-            self.download_url_cache.lock().insert((zid, coff), cell);
-        } else {
-            self.download_url_cache.lock().remove(&(zid, coff));
-        }
+        // Invalidate old ones if exists.
+        // NB. The download url returned from `item` sometimes has issue on download:
+        // it will 302 to `https://login.live.com/login.srv?[..]`.
+        // Here we force a re-fetch on the next download.
+        self.download_url_cache.lock().remove(&(zid, coff));
 
         Ok(())
     }
