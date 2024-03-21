@@ -388,7 +388,7 @@ impl<B: Backend> Frontend<B> {
             // .io_opt_size(self.config.min_chunk_size.bytes())
             .chunk_sectors(self.config.zone_secs)
             // Simulate a rotational device to minimize random I/O (seeks).
-            .attrs(DeviceAttrs::Rotational | DeviceAttrs::VolatileCache)
+            .attrs(DeviceAttrs::Rotational | DeviceAttrs::VolatileCache | DeviceAttrs::Fua)
             .zoned(ZonedParams {
                 // TODO: Limit open or active zones.
                 max_open_zones: 0,
@@ -432,12 +432,13 @@ impl<B: Backend> Frontend<B> {
         zid: usize,
         coff: Option<u32>,
         buf: &WriteBuf<'_>,
+        fua: bool,
     ) -> Result<u32, Errno> {
         let zone = &self.zones[zid];
         let _fence = self.exclusive_write_fence.read().await;
         let _zone_guard = zone.commit_lock.lock().await;
 
-        let (tail_coff, data, prev_wp) = {
+        let (tail_coff, data, prev_wp, clear_tail) = 'do_commit: {
             let mut cond = zone.cond.lock();
             if *cond == ZoneCond::Full {
                 return Err(Errno::IO);
@@ -479,19 +480,23 @@ impl<B: Backend> Frontend<B> {
                 if matches!(*cond, ZoneCond::Empty | ZoneCond::Closed) {
                     *cond = ZoneCond::ImpOpen;
                 }
+                // Buffer small writes, but only if not FUA.
                 if tail_buf.len() < self.config.max_chunk_size {
-                    // Buffer small writes.
-                    drop(tail);
-                    return Ok(prev_wp);
+                    if !fua {
+                        return Ok(prev_wp);
+                    }
+                    // Commit inline if FUA, and do not freeze the tail.
+                    let data = Bytes::copy_from_slice(tail_buf);
+                    break 'do_commit (tail_coff, data, prev_wp, false);
                 }
             }
 
             let data = tail_buf.split().freeze();
             *tail = TailChunk::Uploading(data.clone());
-            (tail_coff, data, prev_wp)
+            (tail_coff, data, prev_wp, true)
         };
 
-        self.commit_tail_chunk(zid as u32, tail_coff, data, true)
+        self.commit_tail_chunk(zid as u32, tail_coff, data, clear_tail)
             .await?;
         Ok(prev_wp)
     }
@@ -657,9 +662,10 @@ impl<B: Backend> BlockDevice for Frontend<B> {
         Ok(())
     }
 
-    async fn write(&self, off: Sector, buf: WriteBuf<'_>, _flags: IoFlags) -> Result<usize, Errno> {
+    async fn write(&self, off: Sector, buf: WriteBuf<'_>, flags: IoFlags) -> Result<usize, Errno> {
         let (zid, coff) = self.check_zone_and_range(off, buf.len())?;
-        self.zone_append_impl(zid, Some(coff), &buf).await?;
+        self.zone_append_impl(zid, Some(coff), &buf, flags.contains(IoFlags::Fua))
+            .await?;
         Ok(buf.len())
     }
 
@@ -667,14 +673,17 @@ impl<B: Backend> BlockDevice for Frontend<B> {
         &self,
         off: Sector,
         buf: WriteBuf<'_>,
-        _flags: IoFlags,
+        flags: IoFlags,
     ) -> Result<Sector, Errno> {
         let zid = self.to_zone_id(off)?;
-        let prev_wp = self.zone_append_impl(zid, None, &buf).await?;
+        let prev_wp = self
+            .zone_append_impl(zid, None, &buf, flags.contains(IoFlags::Fua))
+            .await?;
         let prev_abs_wp = self.config.zone_secs * zid as u64 + Sector::from_bytes(prev_wp.into());
         Ok(prev_abs_wp)
     }
 
+    // This always commits, thus obeys FUA semantic.
     async fn zone_finish(&self, off: Sector, _flags: IoFlags) -> Result<(), Errno> {
         let zid = self.to_zone_id(off)?;
         let zone = &self.zones[zid];
@@ -783,6 +792,7 @@ impl<B: Backend> BlockDevice for Frontend<B> {
         Ok(())
     }
 
+    // This always commits, thus obeys FUA semantic.
     async fn zone_reset(&self, off: Sector, _flags: IoFlags) -> Result<(), Errno> {
         let zid = self.to_zone_id(off)?;
         let zone = &self.zones[zid];
@@ -811,6 +821,7 @@ impl<B: Backend> BlockDevice for Frontend<B> {
         Ok(())
     }
 
+    // This always commits, thus obeys FUA semantic.
     async fn zone_reset_all(&self, _flags: IoFlags) -> Result<(), Errno> {
         let _fence = self.exclusive_write_fence.write().await;
 
@@ -860,7 +871,7 @@ impl<B: Backend> BlockDevice for Frontend<B> {
                 } else {
                     // Small chunks can still grow. Do not freeze it.
                     // This should not cause race because we are holding write locks.
-                    Bytes::copy_from_slice(&tail_buf[..])
+                    Bytes::copy_from_slice(tail_buf)
                 };
                 Some(async move {
                     let _zone_guard = zone_guard;

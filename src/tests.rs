@@ -130,11 +130,20 @@ trait TestFrontend: BlockDevice {
     }
 
     async fn test_write_all(&self, off: Sector, buf: &mut [u8]) -> Result<(), Errno> {
+        self.test_write_all_flags(off, buf, IoFlags::empty()).await
+    }
+
+    async fn test_write_all_flags(
+        &self,
+        off: Sector,
+        buf: &mut [u8],
+        flags: IoFlags,
+    ) -> Result<(), Errno> {
         assert!(!buf.is_empty());
         assert_eq!(buf.len() % Sector::SIZE as usize, 0);
         let len = buf.len();
         let buf = WriteBuf::from_raw(buf);
-        let written = self.write(off, buf, IoFlags::empty()).await?;
+        let written = self.write(off, buf, flags).await?;
         assert_eq!(written, len);
         Ok(())
     }
@@ -477,6 +486,37 @@ async fn bufferred_read_write() {
     assert_eq!(dev.backend().drain_log(), "upload(0, 0, 512);");
 
     // `FLUSH` is idempotent and does no redundant work.
+    dev.flush(IoFlags::empty()).await.unwrap();
+    assert_eq!(dev.backend().drain_log(), "");
+}
+
+#[tokio::test]
+async fn write_fua() {
+    let dev = new_dev(&[]).await;
+
+    let mut expect = [1u8; Sector(2).bytes() as _];
+    expect[Sector(1).bytes() as _..].fill(2u8);
+
+    dev.test_write_all_flags(Sector(0), &mut [1u8; Sector::SIZE as usize], IoFlags::Fua)
+        .await
+        .unwrap();
+    // Should commit it inline.
+    assert_eq!(dev.backend().drain_log(), "upload(0, 0, 512);");
+    let got = dev.test_read(Sector(0), Sector(1)).await.unwrap();
+    assert_eq!(got, expect[..expect.len() / 2]);
+
+    // No action on FLUSH.
+    assert_eq!(dev.backend().drain_log(), "");
+
+    dev.test_write_all_flags(Sector(1), &mut [2u8; Sector::SIZE as usize], IoFlags::Fua)
+        .await
+        .unwrap();
+    // Also commit inline and replace the chunk.
+    assert_eq!(dev.backend().drain_log(), "upload(0, 0, 1024);");
+    let got = dev.test_read(Sector(0), Sector(2)).await.unwrap();
+    assert_eq!(got, expect);
+
+    // No action on FLUSH.
     dev.flush(IoFlags::empty()).await.unwrap();
     assert_eq!(dev.backend().drain_log(), "");
 }
