@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
-use std::future::ready;
+use std::future::{ready, Future};
 use std::hash::Hash;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -32,6 +32,9 @@ use crate::service::Backend;
 const URL_CACHE_DURATION: Duration = Duration::from_secs(60);
 
 const DELTA_PAGE_SIZE: usize = 10_000;
+
+const SERVER_ERROR_RETRY_CNT: usize = 2;
+const SERVER_ERROR_RETRY_DELAY: Duration = Duration::from_secs(3);
 
 /// Chunks smaller than this is uploaded via upload-small API, otherwise session upload API is
 /// used. The maximum valid value is not known. Two documentation sources give conflict results.
@@ -418,19 +421,24 @@ impl Backend for Remote {
             let url = cell
                 .get_or_try_init(|| {
                     log::debug!("fetching download url of chunk {path}");
-                    drive.get_item_download_url(ItemLocation::from_path(&path).unwrap())
+                    retry_request(|| {
+                        drive.get_item_download_url(ItemLocation::from_path(&path).unwrap())
+                    })
                 })
                 .await?;
 
             log::debug!("downloading chunk {path} starting at {read_offset}B");
 
             let range = format!("bytes={}-", read_offset);
-            let resp = drive
-                .client()
-                .get(url)
-                .header(header::RANGE, range)
-                .send()
-                .await?;
+            let resp = retry_request(|| {
+                drive
+                    .client()
+                    .get(url)
+                    .header(header::RANGE, range.clone())
+                    .send()
+                    .map_err(Into::into)
+            })
+            .await?;
             resp.error_for_status_ref()?;
             if read_offset != 0 {
                 ensure!(
@@ -458,27 +466,30 @@ impl Backend for Remote {
         let loc = ItemLocation::from_path(&path).unwrap();
 
         let item = if total_len <= SESSION_UPLOAD_THRESHOLD {
-            self.drive.upload_small(loc, data).await?
+            retry_request(|| self.drive.upload_small(loc, data.clone())).await?
         } else {
             assert!(!data.is_empty());
 
             // The tail chunk may be replaced several times.
             let opt = DriveItemPutOption::new().conflict_behavior(ConflictBehavior::Replace);
-            let (sess, _) = self.drive.new_upload_session_with_option(loc, opt).await?;
+            let (sess, _) =
+                retry_request(|| self.drive.new_upload_session_with_option(loc, opt.clone()))
+                    .await?;
             let mut rest = data;
             let mut offset = 0u64;
             loop {
                 let part_len = rest.len().min(SESSION_UPLOAD_MAX_PART_SIZE);
                 let part = rest.split_to(part_len);
                 let new_offset = offset + part_len as u64;
-                let ret = sess
-                    .upload_part(
-                        part,
+                let ret = retry_request(|| {
+                    sess.upload_part(
+                        part.clone(),
                         offset..new_offset,
                         total_len as u64,
                         self.drive.client(),
                     )
-                    .await;
+                })
+                .await;
                 let err = match (ret, new_offset == total_len as u64) {
                     (Err(err), _) => err.into(),
                     (Ok(None), false) => {
@@ -520,9 +531,7 @@ impl Backend for Remote {
     async fn delete_zone(&self, zid: u64) -> Result<()> {
         let path = self.zone_path(zid as u32);
         log::debug!("deleting {path}");
-        self.drive
-            .delete(ItemLocation::from_path(&path).unwrap())
-            .await?;
+        retry_request(|| self.drive.delete(ItemLocation::from_path(&path).unwrap())).await?;
         // No need to clear the cache. Frontend will not download non-existing chunks.
         // When new chunks are uploaded, cache will be updated in `upload_chunk` anyway.
         Ok(())
@@ -531,9 +540,7 @@ impl Backend for Remote {
     async fn delete_all_zones(&self) -> Result<()> {
         let path = self.all_zones_dir_path();
         log::debug!("deleting all {path}");
-        self.drive
-            .delete(ItemLocation::from_path(&path).unwrap())
-            .await?;
+        retry_request(|| self.drive.delete(ItemLocation::from_path(&path).unwrap())).await?;
         self.download_url_cache.lock().clear();
         Ok(())
     }
@@ -591,5 +598,27 @@ impl<K: Eq + Hash, V> TimedCache<K, V> {
     fn clear(&mut self) {
         self.map.clear();
         self.cleanup_threshold = Self::MIN_CLEANUP_THRESHOLD;
+    }
+}
+
+async fn retry_request<T, F, Fut>(mut f: F) -> onedrive_api::Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = onedrive_api::Result<T>>,
+{
+    let mut retry_num = 1usize;
+    loop {
+        match f().await {
+            Ok(v) => return Ok(v),
+            Err(err)
+                if err.status_code().map_or(false, |st| st.is_server_error())
+                    && retry_num <= SERVER_ERROR_RETRY_CNT =>
+            {
+                log::warn!("retry {retry_num}/{SERVER_ERROR_RETRY_CNT} on server error: {err}");
+                retry_num += 1;
+                tokio::time::sleep(SERVER_ERROR_RETRY_DELAY).await;
+            }
+            Err(err) => return Err(err),
+        }
     }
 }
