@@ -146,7 +146,7 @@ impl Config {
     }
 }
 
-type OnReady = Box<dyn FnOnce(&DeviceInfo, Stopper) -> io::Result<()> + Send + Sync>;
+type OnReady = Box<dyn FnOnce(&DeviceInfo, Stopper) -> io::Result<()> + Send>;
 
 /// TODO: Improve concurrency.
 pub struct Frontend<B> {
@@ -248,7 +248,7 @@ impl<B: Backend> Frontend<B> {
         config: Config,
         backend: B,
         // XXX: Sync should not be required.
-        on_ready: impl FnOnce(&DeviceInfo, Stopper) -> io::Result<()> + Send + Sync + 'static,
+        on_ready: impl FnOnce(&DeviceInfo, Stopper) -> io::Result<()> + Send + 'static,
     ) -> Result<Self> {
         config.validate().context("invalid configuration")?;
         let nr_zones = usize::try_from(config.dev_secs / config.zone_secs).unwrap();

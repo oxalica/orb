@@ -473,6 +473,21 @@ impl AutoReloginOnedrive {
         let (drive, _) = self.get(&state);
         Ok(retry_request(|| f(drive.clone())).await?)
     }
+
+    pub async fn reload(&self) -> Result<()> {
+        let mut cred = (|| -> Result<Credential> {
+            let content = fs::read_to_string(&self.cred_path)?;
+            Ok(serde_json::from_str(&content)?)
+        })()
+        .context("failed to read credentials")?;
+        let (access_token, _) = cred.login(self.client.clone()).await?;
+
+        let mut state = self.state.write().await;
+        state.tick += 1;
+        state.access_token = access_token;
+        state.cred = cred;
+        Ok(())
+    }
 }
 
 #[derive(Debug)]
@@ -493,6 +508,10 @@ impl Remote {
             root_dir,
             download_url_cache: Mutex::new(TimedCache::new(URL_CACHE_DURATION)),
         }
+    }
+
+    pub fn get_drive(&self) -> Arc<AutoReloginOnedrive> {
+        self.drive.clone()
     }
 
     fn chunk_path(&self, zid: u32, coff: u32) -> String {

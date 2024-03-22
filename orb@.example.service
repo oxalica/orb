@@ -4,7 +4,7 @@ Requires=modprobe@ublk_drv.service
 After=network-online.service modprobe@ublk_drv.service
 
 [Service]
-Type=notify
+Type=notify-reload
 ExecStart=/usr/bin/orb serve --config-file "${CONFIGURATION_DIRECTORY}/%i.toml"
 StateDirectory="orb/%i"
 StateDirectoryMode=0700

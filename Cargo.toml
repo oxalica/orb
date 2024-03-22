@@ -12,7 +12,6 @@ anyhow = "1"
 bytes = "1"
 bytesize = { version = "1", features = ["serde"] }
 clap = { version = "4", features = ["derive"] }
-ctrlc = { version = "3", features = ["termination"] }
 dirs = "5.0.1"
 env_logger = "0.11"
 futures-util = { version = "0.3", features = ["io"] }
@@ -24,12 +23,12 @@ onedrive-api = { git = "https://github.com/oxalica/onedrive-api.git", rev = "c6b
 orb-ublk = { path = "./orb-ublk" }
 parking_lot = "0.12"
 reqwest = { version = "0.12", features = ["stream"] }
-rustix = "0.38"
+rustix = { version = "0.38", features = ["time"] }
 sd-notify = "0.4.1"
 serde = { version = "1", features = ["derive"] }
 serde-inline-default = "0.2"
 serde_json = "1.0.114"
-tokio = { version = "1", features = ["macros", "sync", "time"] }
+tokio = { version = "1", features = ["macros", "signal", "sync", "time"] }
 toml = "0.8"
 
 [dev-dependencies]

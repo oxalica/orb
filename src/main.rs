@@ -1,4 +1,5 @@
 use std::num::NonZeroU16;
+use std::sync::Arc;
 use std::{fs, io};
 
 use anyhow::{bail, Context, Result};
@@ -9,6 +10,10 @@ use orb_ublk::{ControlDevice, DeviceBuilder, DeviceInfo};
 use serde::Deserialize;
 use serde_inline_default::serde_inline_default;
 use tokio::runtime::Runtime;
+use tokio::signal::unix as signal;
+
+#[cfg(not(target_os = "linux"))]
+compile_error!("Only Linux is supported because of ublk driver");
 
 mod cli;
 
@@ -69,14 +74,44 @@ fn serve_main(cmd: ServeCmd) -> Result<()> {
             let zone_cnt = config.device.dev_secs / config.device.zone_secs;
             let zone_cnt = zone_cnt.try_into().context("zone count overflow")?;
             let memory = orb::memory_backend::Memory::new(zone_cnt);
-            serve(&ctl, rt, &config, memory, Vec::new())
+            serve(&ctl, rt, &config, memory, Vec::new(), || Ok(()))
         }
         BackendConfig::Onedrive(backend_config) => {
             let (remote, chunks) =
                 orb::onedrive_backend::init(backend_config, &config.device, &rt)?;
-            serve(&ctl, rt, &config, remote, chunks)
+            let drive = remote.get_drive();
+            serve(&ctl, rt, &config, remote, chunks, move || {
+                register_reload_signal(drive)
+            })
         }
     }
+}
+
+fn register_reload_signal(
+    drive: Arc<orb::onedrive_backend::AutoReloginOnedrive>,
+) -> io::Result<()> {
+    let mut sighup = signal::signal(signal::SignalKind::hangup())?;
+    tokio::spawn(async move {
+        loop {
+            sighup.recv().await.unwrap();
+            let ts = rustix::time::clock_gettime(rustix::time::ClockId::Monotonic);
+            let ts_usec = ts.tv_sec * 1_000_000 + ts.tv_nsec / 1_000;
+            let _ = sd_notify::notify(
+                false,
+                &[
+                    sd_notify::NotifyState::Reloading,
+                    sd_notify::NotifyState::Custom(&format!("MONOTONIC_USEC={ts_usec}")),
+                ],
+            );
+            log::info!("signaled to reload...");
+            match drive.reload().await {
+                Ok(()) => log::info!("reloaded successfully"),
+                Err(err) => log::error!("failed to reload credentials: {err}"),
+            }
+            let _ = sd_notify::notify(false, &[sd_notify::NotifyState::Ready]);
+        }
+    });
+    Ok(())
 }
 
 fn serve<B: orb::service::Backend>(
@@ -85,14 +120,24 @@ fn serve<B: orb::service::Backend>(
     config: &Config,
     backend: B,
     chunks: Vec<(u64, u64)>,
+    on_ready: impl FnOnce() -> io::Result<()> + Send + 'static,
 ) -> Result<()> {
     let on_ready = |dev_info: &DeviceInfo, stopper: orb_ublk::Stopper| {
-        ctrlc::set_handler(move || {
-            let _ = sd_notify::notify(false, &[sd_notify::NotifyState::Stopping]);
+        let mut sigint = signal::signal(signal::SignalKind::interrupt())?;
+        let mut sigterm = signal::signal(signal::SignalKind::terminate())?;
+        tokio::task::spawn(async move {
+            tokio::select! {
+                v = sigint.recv() => v,
+                v = sigterm.recv() => v,
+            }
+            .unwrap();
             log::info!("Signaled to stop, exiting");
+            let _ = sd_notify::notify(false, &[sd_notify::NotifyState::Stopping]);
             stopper.stop();
-        })
-        .map_err(|err| io::Error::other(format!("failed to setup signal handler: {err}")))?;
+        });
+
+        on_ready()?;
+
         log::info!("Block device ready at /dev/ublkb{}", dev_info.dev_id());
         let _ = sd_notify::notify(false, &[sd_notify::NotifyState::Ready]);
         Ok(())
