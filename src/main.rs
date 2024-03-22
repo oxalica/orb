@@ -44,8 +44,6 @@ struct UblkConfig {
     #[serde(default)]
     unprivileged: bool,
     // TODO: Validate these.
-    #[serde_inline_default(1)]
-    queues: u16,
     #[serde_inline_default(NonZeroU16::new(64).unwrap())]
     queue_depth: NonZeroU16,
 }
@@ -121,20 +119,14 @@ fn serve<B: orb::service::Backend>(
     } else {
         dev_params.set_io_flusher(true);
     }
-    let queues = if config.ublk.queues != 0 {
-        config.ublk.queues
-    } else {
-        let n = std::thread::available_parallelism().context("failed to available parallelism")?;
-        u16::try_from(n.get()).unwrap_or(u16::MAX)
-    };
     builder
         .name("orb")
-        .queues(queues)
+        .queues(1)
         .queue_depth(config.ublk.queue_depth.get())
         .zoned()
         .create_service(ctl)
         .context("failed to create ublk device")?
-        .serve(&TokioRuntimeBuilder, &dev_params, &frontend)
+        .serve_local(&TokioRuntimeBuilder, &dev_params, &frontend)
         .context("service failed")?;
 
     Ok(())

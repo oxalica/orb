@@ -45,11 +45,6 @@ max_chunk_size = "128MiB"
 # https://man7.org/linux/man-pages/man2/prctl.2.html
 #unprivileged = false
 
-# The number of queues to process requests in parallel. When set to zero, it
-# uses the logical core numbers available on the system.
-# Setting it to other than 1 is usually an overkill when the backend is slow.
-#queues = 1
-
 # The max concurrency of each queue.
 #queue_depth = 64
 
