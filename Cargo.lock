@@ -1032,6 +1032,7 @@ dependencies = [
  "dirs",
  "env_logger",
  "futures-util",
+ "humantime",
  "itertools",
  "log",
  "lru",

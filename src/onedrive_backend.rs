@@ -1,11 +1,11 @@
 use std::collections::{BTreeMap, HashMap};
-use std::fs;
 use std::future::{ready, Future};
 use std::hash::Hash;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
+use std::{fmt, fs};
 
 use anyhow::{anyhow, bail, ensure, Context, Result};
 use bytes::Bytes;
@@ -86,7 +86,7 @@ fn default_state_dir() -> PathBuf {
         .join(XDG_STATE_DIR_NAME)
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Credential {
     read_write: bool,
@@ -94,6 +94,32 @@ struct Credential {
     redirect_uri: String,
     client_id: String,
     client_secret: Option<String>,
+}
+
+impl Credential {
+    async fn login(&mut self, client: Client) -> Result<(String, SystemTime)> {
+        let perm = Permission::new_read()
+            .write(self.read_write)
+            .offline_access(true);
+        let auth = Auth::new_with_client(client, &self.client_id, perm, &self.redirect_uri);
+        let login_time = SystemTime::now();
+        let mut resp = retry_request(|| {
+            auth.login_with_refresh_token(&self.refresh_token, self.client_secret.as_deref())
+        })
+        .await
+        .context("failed to login")?;
+        self.refresh_token = resp
+            .refresh_token
+            .take()
+            .context("missing new refresh token")?;
+        let expire_time = login_time + Duration::from_secs(resp.expires_in_secs);
+        log::info!(
+            "logined and got new tokens valid for {}s (until {})",
+            resp.expires_in_secs,
+            humantime::format_rfc3339_seconds(expire_time),
+        );
+        Ok((resp.access_token, expire_time))
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -210,30 +236,20 @@ pub fn init(
         .build()
         .context("failed to build reqwest client")?;
 
-    let access_token = {
-        let cred_path = config.state_dir.join(CREDENTIAL_FILE_NAME);
-        let mut cred = (|| -> Result<Credential> {
-            let content = fs::read_to_string(&cred_path)?;
-            Ok(serde_json::from_str(&content)?)
-        })()
-        .context("failed to load credentials, have you manually it setup?")?;
+    let cred_path = config.state_dir.join(CREDENTIAL_FILE_NAME);
+    let mut cred = (|| -> Result<Credential> {
+        let content = fs::read_to_string(&cred_path)?;
+        Ok(serde_json::from_str(&content)?)
+    })()
+    .context("failed to load credentials, have you manually it setup?")?;
 
-        log::info!("logining...");
-        let perm = Permission::new_read()
-            .write(cred.read_write)
-            .offline_access(true);
-        let auth = Auth::new_with_client(client.clone(), &cred.client_id, perm, &cred.redirect_uri);
-        let resp = rt
-            .block_on(
-                auth.login_with_refresh_token(&cred.refresh_token, cred.client_secret.as_deref()),
-            )
-            .context("failed to login")?;
-
-        cred.refresh_token = resp.refresh_token.context("missing new refresh token")?;
-        safe_write(&cred_path, &cred).context("failed to update refresh token")?;
-        resp.access_token
-    };
-    let drive = OneDrive::new_with_client(client.clone(), access_token, DriveLocation::me());
+    log::info!("logining...");
+    let (access_token, _) = rt
+        .block_on(cred.login(client.clone()))
+        .context("failed to login with saved credential")?;
+    safe_write(&cred_path, &cred).context("failed to update refresh token")?;
+    let drive =
+        OneDrive::new_with_client(client.clone(), access_token.clone(), DriveLocation::me());
 
     // Geometry validation.
     let geometry = Geometry {
@@ -338,6 +354,12 @@ pub fn init(
     chunks.sort_unstable();
     log::info!("loaded {} zones, {} chunks", zone_cnt, chunks.len());
 
+    let drive = Arc::new(AutoReloginOnedrive::new(
+        cred,
+        cred_path,
+        client,
+        access_token,
+    ));
     let remote = Remote::new(drive, config.remote_dir.clone());
     Ok((remote, chunks))
 }
@@ -364,8 +386,98 @@ fn safe_write(path: &Path, data: &impl Serialize) -> Result<()> {
 }
 
 #[derive(Debug)]
+pub struct AutoReloginOnedrive {
+    state: tokio::sync::RwLock<LoginState>,
+    client: Client,
+    cred_path: PathBuf,
+}
+
+struct LoginState {
+    tick: u64,
+    access_token: String,
+    cred: Credential,
+}
+
+impl fmt::Debug for LoginState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("LoginState")
+            .field("tick", &self.tick)
+            .finish_non_exhaustive()
+    }
+}
+
+impl AutoReloginOnedrive {
+    fn new(cred: Credential, cred_path: PathBuf, client: Client, access_token: String) -> Self {
+        Self {
+            state: tokio::sync::RwLock::new(LoginState {
+                tick: 0,
+                access_token,
+                cred,
+            }),
+            client,
+            cred_path,
+        }
+    }
+
+    fn get(&self, state: &LoginState) -> (OneDrive, u64) {
+        let drive = OneDrive::new_with_client(
+            self.client.clone(),
+            state.access_token.clone(),
+            DriveLocation::me(),
+        );
+        (drive, state.tick)
+    }
+
+    async fn with<T, F, Fut>(&self, mut f: F) -> Result<T>
+    where
+        F: FnMut(OneDrive) -> Fut,
+        Fut: Future<Output = onedrive_api::Result<T>>,
+    {
+        let (drive, tick) = self.get(&*self.state.read().await);
+        let req_err = match retry_request(|| f(drive.clone())).await {
+            Ok(v) => return Ok(v),
+            Err(err) if err.status_code() == Some(StatusCode::UNAUTHORIZED) => err,
+            Err(err) => return Err(err.into()),
+        };
+
+        // Token expired.
+
+        let mut state = self.state.write().await;
+        // If relogin happened between observations, treat it as done.
+        if tick == state.tick {
+            log::info!("token expired, relogining...");
+            let (access_token, _) = match state.cred.login(self.client.clone()).await {
+                Ok(resp) => resp,
+                Err(login_err) => {
+                    log::error!("relogin failed: {login_err}");
+                    return Err(req_err.into());
+                }
+            };
+            let cred_path = self.cred_path.clone();
+            let cred = state.cred.clone();
+
+            // Update and release the lock before saving.
+            state.access_token = access_token;
+            state.tick += 1;
+
+            // Spawn non-delimited task for saveing. No ordering is required for it.
+            tokio::task::spawn_blocking(move || {
+                if let Err(save_err) = safe_write(&cred_path, &cred) {
+                    log::error!("failed to save new refresh token: {save_err}");
+                }
+            });
+        }
+
+        // Retry the request after relogined only once. If the user suspend/resume rapidly
+        // between requests, we cannot help them :(.
+        let (drive, _) = self.get(&state);
+        Ok(retry_request(|| f(drive.clone())).await?)
+    }
+}
+
+#[derive(Debug)]
 pub struct Remote {
-    drive: OneDrive,
+    drive: Arc<AutoReloginOnedrive>,
     root_dir: String,
     download_url_cache: Mutex<TimedCache<(u32, u32), CacheCell>>,
 }
@@ -374,7 +486,7 @@ pub struct Remote {
 type CacheCell = Arc<tokio::sync::OnceCell<String>>;
 
 impl Remote {
-    fn new(drive: OneDrive, root_dir: String) -> Self {
+    fn new(drive: Arc<AutoReloginOnedrive>, root_dir: String) -> Self {
         assert!(root_dir.starts_with('/') && !root_dir.ends_with('/'));
         Self {
             drive,
@@ -418,21 +530,21 @@ impl Backend for Remote {
         let drive = self.drive.clone();
         let path = self.chunk_path(zid, coff);
         let fut = async move {
+            let loc = ItemLocation::from_path(&path).unwrap();
             let url = cell
                 .get_or_try_init(|| {
                     log::debug!("fetching download url of chunk {path}");
-                    retry_request(|| {
-                        drive.get_item_download_url(ItemLocation::from_path(&path).unwrap())
-                    })
+                    drive.with(|drive| async move { drive.get_item_download_url(loc).await })
                 })
                 .await?;
 
             log::debug!("downloading chunk {path} starting at {read_offset}B");
 
             let range = format!("bytes={}-", read_offset);
+            // No authentication required.
             let resp = retry_request(|| {
                 drive
-                    .client()
+                    .client
                     .get(url)
                     .header(header::RANGE, range.clone())
                     .send()
@@ -466,27 +578,37 @@ impl Backend for Remote {
         let loc = ItemLocation::from_path(&path).unwrap();
 
         let _item = if total_len <= SESSION_UPLOAD_THRESHOLD {
-            retry_request(|| self.drive.upload_small(loc, data.clone())).await?
+            self.drive
+                .with(|drive| {
+                    let data = data.clone();
+                    async move { drive.upload_small(loc, data).await }
+                })
+                .await?
         } else {
             assert!(!data.is_empty());
 
             // The tail chunk may be replaced several times.
-            let opt = DriveItemPutOption::new().conflict_behavior(ConflictBehavior::Replace);
-            let (sess, _) =
-                retry_request(|| self.drive.new_upload_session_with_option(loc, opt.clone()))
-                    .await?;
+            let (sess, _) = self
+                .drive
+                .with(|drive| async move {
+                    let opt =
+                        DriveItemPutOption::new().conflict_behavior(ConflictBehavior::Replace);
+                    drive.new_upload_session_with_option(loc, opt).await
+                })
+                .await?;
             let mut rest = data;
             let mut offset = 0u64;
             loop {
                 let part_len = rest.len().min(SESSION_UPLOAD_MAX_PART_SIZE);
                 let part = rest.split_to(part_len);
                 let new_offset = offset + part_len as u64;
+                // No authentication required.
                 let ret = retry_request(|| {
                     sess.upload_part(
                         part.clone(),
                         offset..new_offset,
                         total_len as u64,
-                        self.drive.client(),
+                        &self.drive.client,
                     )
                 })
                 .await;
@@ -505,7 +627,8 @@ impl Backend for Remote {
                         anyhow!("failed to complete uploading for {path} at {new_offset}B")
                     }
                 };
-                if let Err(err) = sess.delete(self.drive.client()).await {
+                // No authentication required.
+                if let Err(err) = sess.delete(&self.drive.client).await {
                     log::error!("failed to delete upload session for {path}: {err}");
                 }
                 return Err(err);
@@ -524,7 +647,10 @@ impl Backend for Remote {
     async fn delete_zone(&self, zid: u64) -> Result<()> {
         let path = self.zone_path(zid as u32);
         log::debug!("deleting {path}");
-        retry_request(|| self.drive.delete(ItemLocation::from_path(&path).unwrap())).await?;
+        let path = ItemLocation::from_path(&path).unwrap();
+        self.drive
+            .with(|drive| async move { drive.delete(path).await })
+            .await?;
         // No need to clear the cache. Frontend will not download non-existing chunks.
         // When new chunks are uploaded, cache will be updated in `upload_chunk` anyway.
         Ok(())
@@ -533,7 +659,10 @@ impl Backend for Remote {
     async fn delete_all_zones(&self) -> Result<()> {
         let path = self.all_zones_dir_path();
         log::debug!("deleting all {path}");
-        retry_request(|| self.drive.delete(ItemLocation::from_path(&path).unwrap())).await?;
+        let path = ItemLocation::from_path(&path).unwrap();
+        self.drive
+            .with(|drive| async move { drive.delete(path).await })
+            .await?;
         self.download_url_cache.lock().clear();
         Ok(())
     }

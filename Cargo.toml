@@ -16,6 +16,7 @@ ctrlc = { version = "3", features = ["termination"] }
 dirs = "5.0.1"
 env_logger = "0.11"
 futures-util = { version = "0.3", features = ["io"] }
+humantime = "2"
 itertools = "0.12.1"
 log = "0.4.21"
 lru = "0.12.3"
