@@ -18,6 +18,8 @@ mod cli;
 
 const LOGICAL_SECTOR_SIZE: u32 = 4 << 10; // Typical page size.
 
+type Frontend<B> = orb::service::Frontend<B, LOGICAL_SECTOR_SIZE>;
+
 fn main() -> Result<()> {
     env_logger::init();
     match Cli::parse() {
@@ -74,7 +76,7 @@ fn serve_main(cmd: ServeCmd) -> Result<()> {
             let zone_cnt = config.device.dev_secs / config.device.zone_secs;
             let zone_cnt = zone_cnt.try_into().context("zone count overflow")?;
             let memory = orb::memory_backend::Memory::new(zone_cnt);
-            serve(&ctl, &mut rt, &config, memory, Vec::new())
+            serve(&ctl, &mut rt, &config, memory, Vec::new())?;
         }
         BackendConfig::Onedrive(backend_config) => {
             let (remote, chunks) =
@@ -84,9 +86,19 @@ fn serve_main(cmd: ServeCmd) -> Result<()> {
                 let _guard = rt.enter();
                 register_reload_signal(drive)?;
             }
-            serve(&ctl, &mut rt, &config, remote, chunks)
+            let frontend = serve(&ctl, &mut rt, &config, remote, chunks)?;
+
+            log::info!("flushing buffers before exit...");
+            rt.block_on(orb_ublk::BlockDevice::flush(
+                &frontend,
+                orb_ublk::IoFlags::empty(),
+            ))
+            // Error reasons should be reported inside `flush`, the returned error here is
+            // always EIO and carrying no information.
+            .inspect_err(|_| log::error!("final flush failed, data may be lost!"))?;
         }
     }
+    Ok(())
 }
 
 fn register_reload_signal(
@@ -122,7 +134,7 @@ fn serve<B: orb::service::Backend>(
     config: &Config,
     backend: B,
     chunks: Vec<(u64, u64)>,
-) -> Result<()> {
+) -> Result<Frontend<B>> {
     let on_ready = |dev_info: &DeviceInfo, stopper: orb_ublk::Stopper| {
         let mut sigint = signal::signal(signal::SignalKind::interrupt())?;
         let mut sigterm = signal::signal(signal::SignalKind::terminate())?;
@@ -143,8 +155,7 @@ fn serve<B: orb::service::Backend>(
     };
 
     let mut frontend =
-        <orb::service::Frontend<_, LOGICAL_SECTOR_SIZE>>::new(config.device, backend, on_ready)
-            .expect("config is validated");
+        Frontend::new(config.device, backend, on_ready).expect("config is validated");
     rt.block_on(frontend.init_chunks(&chunks))
         .context("failed to initialize chunks")?;
     // Free memory.
@@ -170,7 +181,7 @@ fn serve<B: orb::service::Backend>(
         .serve_local(rt, &dev_params, &frontend)
         .context("service failed")?;
 
-    Ok(())
+    Ok(frontend)
 }
 
 fn stop_cmd(cmd: StopCmd) -> Result<()> {
