@@ -38,11 +38,15 @@ impl TestBackend {
     #[track_caller]
     pub fn new_with_chunks(
         nr_zones: usize,
-        chunks: impl IntoIterator<Item = (usize, u32, Vec<u8>)>,
+        // (zid, cid, data) where cid := coff / SECTOR_SIZE.
+        chunks: impl IntoIterator<Item = (u32, u32, Vec<u8>)>,
     ) -> Self {
         let mut this = Self::new_empty(nr_zones);
-        for (zid, coff, data) in chunks {
-            let prev = this.inner.zones[zid].get_mut().insert(coff, data.into());
+        for (zid, cid, data) in chunks {
+            let coff = cid * Sector::SIZE;
+            let prev = this.inner.zones[zid as usize]
+                .get_mut()
+                .insert(coff, data.into());
             assert!(prev.is_none());
         }
         this
@@ -140,7 +144,7 @@ trait TestFrontend: BlockDevice {
         flags: IoFlags,
     ) -> Result<(), Errno> {
         assert!(!buf.is_empty());
-        assert_eq!(buf.len() % Sector::SIZE as usize, 0);
+        assert_eq!(buf.len() % sec(1), 0);
         let len = buf.len();
         let buf = WriteBuf::from_raw(buf);
         let written = self.write(off, buf, flags).await?;
@@ -150,7 +154,7 @@ trait TestFrontend: BlockDevice {
 
     async fn test_zone_append_all(&self, off: Sector, buf: &mut [u8]) -> Result<Sector, Errno> {
         assert!(!buf.is_empty());
-        assert_eq!(buf.len() % Sector::SIZE as usize, 0);
+        assert_eq!(buf.len() % sec(1), 0);
         let buf = WriteBuf::from_raw(buf);
         let pos = self.zone_append(off, buf, IoFlags::empty()).await?;
         Ok(pos)
@@ -201,18 +205,23 @@ const CONFIG: Config = Config {
     },
 };
 
-async fn new_dev(chunks: &[(usize, u32, Vec<u8>)]) -> Frontend<TestBackend> {
+/// Accept `[(zid, cid, data)]`, where `cid := coff / SECTOR_SIZE`.
+async fn new_dev(chunks: &[(u32, u32, Vec<u8>)]) -> Frontend<TestBackend> {
     let backend = TestBackend::new_with_chunks(NR_ZONES, chunks.iter().cloned());
     let chunk_meta = chunks
         .iter()
-        .map(|(zid, coff, data)| {
-            let global_off = *zid as u64 * CONFIG.zone_secs.bytes() + *coff as u64;
+        .map(|(zid, cid, data)| {
+            let global_off = *zid as u64 * CONFIG.zone_secs.bytes() + Sector(*cid as u64).bytes();
             (global_off, data.len() as u64)
         })
         .collect::<Vec<_>>();
     let mut dev = Frontend::new(CONFIG, backend, |_, _| Ok(())).unwrap();
     dev.init_chunks(&chunk_meta).await.unwrap();
     dev
+}
+
+pub const fn sec(n: usize) -> usize {
+    Sector(n as u64).bytes() as _
 }
 
 fn zone(i: u64, rel_wp: Sector, cond: ZoneCond) -> Zone {
@@ -239,13 +248,13 @@ async fn report_zones() {
 #[tokio::test]
 async fn init_chunks() {
     let dev = new_dev(&[
-        (0, 0, vec![1u8; 1024]),
+        (0, 0, vec![1u8; sec(2)]),
         // Partial tail. Need download.
-        (0, 1024, vec![2u8; 512]),
+        (0, 2, vec![2u8; sec(1)]),
         // Manually finished.
-        (1, 0, vec![3u8; 512 + 1]),
+        (1, 0, vec![3u8; sec(1) + 1]),
         // Large enough chunk.
-        (2, 0, vec![4u8; 1024]),
+        (2, 0, vec![4u8; sec(2)]),
         // Full of data.
         (3, 0, vec![5u8; CONFIG.zone_secs.bytes() as _]),
     ])
@@ -262,7 +271,9 @@ async fn init_chunks() {
     assert_eq!(got, expect);
 
     let got = dev.test_read(Sector(0), CONFIG.zone_secs).await.unwrap();
-    let expect = [&[1u8; 1024][..], &[2u8; 512], &[0u8; 4096 - 1024 - 512]].concat();
+    let mut expect = [0u8; CONFIG.zone_secs.bytes() as _];
+    expect[..sec(2)].fill(1u8);
+    expect[sec(2)..sec(3)].fill(2u8);
     assert_eq!(got, expect);
     // Only the first chunk is downloaded. The second chunk is prefetched before.
     assert_eq!(dev.backend().drain_log(), "download(0, 0, 0);");
@@ -271,8 +282,9 @@ async fn init_chunks() {
         .test_read(CONFIG.zone_secs, CONFIG.zone_secs)
         .await
         .unwrap();
-    // NB. The finish-marker byte will be not read, thus only first 512bytes are non-zero.
-    let expect = [&[3u8; 512][..], &[0u8; 4096 - 512]].concat();
+    // NB. The finish-marker byte will be not read, thus only the first sector is non-zero.
+    let mut expect = [0u8; CONFIG.zone_secs.bytes() as _];
+    expect[..sec(1)].fill(3u8);
     assert_eq!(got, expect);
     assert_eq!(dev.backend().drain_log(), "download(1, 0, 0);");
 }
@@ -281,9 +293,9 @@ async fn init_chunks() {
 async fn read_stream_reuse() {
     let dev = new_dev(&[
         // [0, 4s)
-        (0, 0, vec![1u8; Sector(4).bytes() as _]),
+        (0, 0, vec![1u8; sec(4)]),
         // [4, 8s)
-        (0, 2048, vec![1u8; Sector(4).bytes() as usize]),
+        (0, 4, vec![1u8; sec(4)]),
     ])
     .await;
     // The first zone is full, thus no initial download.
@@ -291,13 +303,13 @@ async fn read_stream_reuse() {
 
     // Read [0s, 2s), stream pos at 2s.
     let got = dev.test_read(Sector(0), Sector(2)).await.unwrap();
-    let expect = [1u8; Sector(2).bytes() as _];
+    let expect = [1u8; sec(2)];
     assert_eq!(got, expect);
     assert_eq!(dev.backend().drain_log(), "download(0, 0, 0);");
 
     // Read [2s, 6s), drain the first stream, and start another one.
     let got = dev.test_read(Sector(2), Sector(4)).await.unwrap();
-    assert_eq!(got, [1u8; Sector(4).bytes() as _]);
+    assert_eq!(got, [1u8; sec(4)]);
     assert_eq!(dev.backend().drain_log(), "download(0, 2048, 0);");
 
     // Read [6s, 8s), drain the second one.
@@ -307,12 +319,12 @@ async fn read_stream_reuse() {
 
     // Read [1s, 2s), start at middle.
     let got = dev.test_read(Sector(1), Sector(1)).await.unwrap();
-    assert_eq!(got, [1u8; Sector(1).bytes() as _]);
+    assert_eq!(got, [1u8; sec(1)]);
     assert_eq!(dev.backend().drain_log(), "download(0, 0, 512);");
 
     // Read [2s, 3s), reuse.
     let got = dev.test_read(Sector(2), Sector(1)).await.unwrap();
-    assert_eq!(got, [1u8; Sector(1).bytes() as _]);
+    assert_eq!(got, [1u8; sec(1)]);
     assert_eq!(dev.backend().drain_log(), "");
 }
 
@@ -324,16 +336,12 @@ async fn read_stream_wait_reuse() {
     // Pending state before responding.
     const DELAY: Duration = Duration::from_millis(100);
 
-    let expect = [
-        &[1u8; Sector(2).bytes() as _][..],
-        &[2u8; Sector(2).bytes() as _],
-    ]
-    .concat();
+    let expect = [&[1u8; sec(2)][..], &[2u8; sec(2)]].concat();
     let dev = new_dev(&[
         // [0, 4s)
         (0, 0, expect.clone()),
         // [4, 8s)
-        (0, 2048, vec![1u8; Sector(4).bytes() as usize]),
+        (0, 4, vec![1u8; sec(4)]),
     ])
     .await;
     // The first zone is full, thus no initial download.
@@ -357,8 +365,8 @@ async fn read_stream_wait_reuse() {
 #[tokio::test]
 async fn zone_open_close() {
     let dev = new_dev(&[
-        (0, 0, vec![1u8; 512]),  // With tail.
-        (2, 0, vec![2u8; 1024]), // Without tail.
+        (0, 0, vec![1u8; sec(1)]), // With tail.
+        (2, 0, vec![2u8; sec(2)]), // Without tail.
     ])
     .await;
     assert_eq!(dev.backend().drain_log(), "download(0, 0, 0);");
@@ -401,8 +409,8 @@ async fn zone_open_close() {
 #[tokio::test]
 async fn reset_zone() {
     let dev = new_dev(&[
-        (0, 0, vec![1u8; 512]),  // With tail.
-        (2, 0, vec![2u8; 1024]), // Without tail.
+        (0, 0, vec![1u8; sec(1)]), // With tail.
+        (2, 0, vec![2u8; sec(2)]), // Without tail.
     ])
     .await;
     assert_eq!(dev.backend().drain_log(), "download(0, 0, 0);");
@@ -442,8 +450,8 @@ async fn reset_zone() {
 #[tokio::test]
 async fn reset_all_zone() {
     let dev = new_dev(&[
-        (0, 0, vec![1u8; 512]),     // With tail.
-        (2, 0, vec![2u8; 512 + 1]), // Full.
+        (0, 0, vec![1u8; sec(1)]),     // With tail.
+        (2, 0, vec![2u8; sec(1) + 1]), // Full.
     ])
     .await;
     assert_eq!(dev.backend().drain_log(), "download(0, 0, 0);");
@@ -468,11 +476,11 @@ async fn bufferred_read_write() {
     let mut expect = [0u8; CONFIG.zone_secs.bytes() as usize];
     assert_eq!(got, expect);
 
-    dev.test_write_all(Sector(0), &mut [42u8; Sector::SIZE as usize])
+    dev.test_write_all(Sector(0), &mut [42u8; sec(1)])
         .await
         .unwrap();
     let got = dev.test_read(Sector(0), CONFIG.zone_secs).await.unwrap();
-    expect[..Sector::SIZE as usize].fill(42u8);
+    expect[..sec(1)].fill(42u8);
     assert_eq!(got, expect);
     assert_eq!(
         dev.test_report_zones(Sector(0), 1).await.unwrap()[0],
@@ -494,10 +502,10 @@ async fn bufferred_read_write() {
 async fn write_fua() {
     let dev = new_dev(&[]).await;
 
-    let mut expect = [1u8; Sector(2).bytes() as _];
-    expect[Sector(1).bytes() as _..].fill(2u8);
+    let mut expect = [1u8; sec(2)];
+    expect[sec(1)..].fill(2u8);
 
-    dev.test_write_all_flags(Sector(0), &mut [1u8; Sector::SIZE as usize], IoFlags::Fua)
+    dev.test_write_all_flags(Sector(0), &mut [1u8; sec(1)], IoFlags::Fua)
         .await
         .unwrap();
     // Should commit it inline.
@@ -508,7 +516,7 @@ async fn write_fua() {
     // No action on FLUSH.
     assert_eq!(dev.backend().drain_log(), "");
 
-    dev.test_write_all_flags(Sector(1), &mut [2u8; Sector::SIZE as usize], IoFlags::Fua)
+    dev.test_write_all_flags(Sector(1), &mut [2u8; sec(1)], IoFlags::Fua)
         .await
         .unwrap();
     // Also commit inline and replace the chunk.
@@ -525,8 +533,8 @@ async fn write_fua() {
 async fn read_tail() {
     let dev = new_dev(&[]).await;
 
-    let mut buf = [1u8; Sector(2).bytes() as _];
-    buf[Sector(1).bytes() as _..].fill(2u8);
+    let mut buf = [1u8; sec(2)];
+    buf[sec(1)..].fill(2u8);
 
     // Delayed tail.
     dev.test_write_all(Sector(0), &mut buf).await.unwrap();
@@ -534,20 +542,20 @@ async fn read_tail() {
 
     assert_eq!(
         dev.test_read(Sector(0), Sector(1)).await.unwrap(),
-        [1u8; Sector(1).bytes() as _],
+        [1u8; sec(1)],
     );
     assert_eq!(
         dev.test_read(Sector(1), Sector(1)).await.unwrap(),
-        [2u8; Sector(1).bytes() as _],
+        [2u8; sec(1)],
     );
     assert_eq!(
         dev.test_read(Sector(2), Sector(1)).await.unwrap(),
-        [0u8; Sector(1).bytes() as _],
+        [0u8; sec(1)],
     );
 
     assert_eq!(
         dev.test_read(Sector(0), Sector(3)).await.unwrap(),
-        [&buf[..], &[0u8; Sector(1).bytes() as _]].concat(),
+        [&buf[..], &[0u8; sec(1)]].concat(),
     );
 
     // Read from cache.
@@ -558,7 +566,7 @@ async fn read_tail() {
 async fn reset_discard_buffer() {
     let dev = new_dev(&[]).await;
 
-    dev.test_write_all(Sector(0), &mut [42u8; Sector(1).bytes() as _])
+    dev.test_write_all(Sector(0), &mut [42u8; sec(1)])
         .await
         .unwrap();
     dev.zone_reset(Sector(0), IoFlags::empty()).await.unwrap();
@@ -568,7 +576,7 @@ async fn reset_discard_buffer() {
     let got = dev.test_read(Sector(0), CONFIG.zone_secs).await.unwrap();
     assert_eq!(got, [0u8; CONFIG.zone_secs.bytes() as _]);
 
-    dev.test_write_all(Sector(0), &mut [42u8; Sector(1).bytes() as _])
+    dev.test_write_all(Sector(0), &mut [42u8; sec(1)])
         .await
         .unwrap();
     dev.zone_reset_all(IoFlags::empty()).await.unwrap();
@@ -596,7 +604,7 @@ async fn inline_commit() {
     assert_eq!(dev.backend().drain_log(), "");
 
     // Buffered.
-    let mut data2 = [1u8; Sector::SIZE as usize];
+    let mut data2 = [1u8; sec(1)];
     dev.test_write_all(off, &mut data2).await.unwrap();
     off += Sector::from_bytes(data2.len() as _);
     assert_eq!(dev.backend().drain_log(), "");
@@ -622,11 +630,11 @@ async fn zone_append() {
     let dev = new_dev(&[]).await;
 
     let off = Sector(0);
-    let mut data1 = [1u8; Sector(2).bytes() as _];
+    let mut data1 = [1u8; sec(2)];
     let pos1 = dev.test_zone_append_all(off, &mut data1).await.unwrap();
     assert_eq!(pos1, Sector(0));
 
-    let mut data2 = [2u8; Sector(1).bytes() as _];
+    let mut data2 = [2u8; sec(1)];
     let pos2 = dev.test_zone_append_all(off, &mut data2).await.unwrap();
     assert_eq!(pos2, Sector(2));
 
@@ -648,9 +656,7 @@ async fn zone_finish() {
     );
 
     let off = CONFIG.zone_secs;
-    dev.test_write_all(off, &mut [0u8; Sector(1).bytes() as _])
-        .await
-        .unwrap();
+    dev.test_write_all(off, &mut [0u8; sec(1)]).await.unwrap();
     dev.zone_finish(off, IoFlags::empty()).await.unwrap();
     assert_eq!(dev.backend().drain_log(), "upload(1, 0, 513);");
     assert_eq!(
@@ -663,8 +669,8 @@ async fn zone_finish() {
 async fn replace_tail() {
     let dev = new_dev(&[]).await;
 
-    let mut data = [1u8; Sector(2).bytes() as _];
-    let (lhs, rhs) = data.split_at_mut(Sector(1).bytes() as _);
+    let mut data = [1u8; sec(2)];
+    let (lhs, rhs) = data.split_at_mut(sec(1));
     rhs.fill(2u8);
 
     dev.test_zone_append_all(Sector(0), lhs).await.unwrap();
@@ -685,7 +691,7 @@ async fn replace_tail() {
     assert_eq!(dev.backend().drain_log(), "");
 
     // Previous chunk size is over min_chunk_size (1KiB), so this creates a new one.
-    dev.test_zone_append_all(Sector(0), &mut [3u8; Sector(1).bytes() as _])
+    dev.test_zone_append_all(Sector(0), &mut [3u8; sec(1)])
         .await
         .unwrap();
     dev.flush(IoFlags::empty()).await.unwrap();
