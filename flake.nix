@@ -29,7 +29,10 @@ rec {
         env.CFG_RELEASE = version;
 
         postInstall = ''
-          install -DTm644 ./orb@.example.service $out/etc/systemd/system/orb@.service
+          mkdir -p $out/etc/systemd/system
+          substitute ./orb@.example.service $out/etc/systemd/system/orb@.service \
+            --replace-fail '/usr/bin/orb' "$out/bin/orb"
+
           installShellCompletion \
             --bash completions/bash/${pname}.bash \
             --fish completions/fish/${pname}.fish \
