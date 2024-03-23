@@ -74,15 +74,17 @@ fn serve_main(cmd: ServeCmd) -> Result<()> {
             let zone_cnt = config.device.dev_secs / config.device.zone_secs;
             let zone_cnt = zone_cnt.try_into().context("zone count overflow")?;
             let memory = orb::memory_backend::Memory::new(zone_cnt);
-            serve(&ctl, &mut rt, &config, memory, Vec::new(), || Ok(()))
+            serve(&ctl, &mut rt, &config, memory, Vec::new())
         }
         BackendConfig::Onedrive(backend_config) => {
             let (remote, chunks) =
                 orb::onedrive_backend::init(backend_config, &config.device, &rt)?;
             let drive = remote.get_drive();
-            serve(&ctl, &mut rt, &config, remote, chunks, move || {
-                register_reload_signal(drive)
-            })
+            {
+                let _guard = rt.enter();
+                register_reload_signal(drive)?;
+            }
+            serve(&ctl, &mut rt, &config, remote, chunks)
         }
     }
 }
@@ -120,7 +122,6 @@ fn serve<B: orb::service::Backend>(
     config: &Config,
     backend: B,
     chunks: Vec<(u64, u64)>,
-    on_ready: impl FnOnce() -> io::Result<()> + Send + 'static,
 ) -> Result<()> {
     let on_ready = |dev_info: &DeviceInfo, stopper: orb_ublk::Stopper| {
         let mut sigint = signal::signal(signal::SignalKind::interrupt())?;
@@ -135,8 +136,6 @@ fn serve<B: orb::service::Backend>(
             let _ = sd_notify::notify(false, &[sd_notify::NotifyState::Stopping]);
             stopper.stop();
         });
-
-        on_ready()?;
 
         log::info!("Block device ready at /dev/ublkb{}", dev_info.dev_id());
         let _ = sd_notify::notify(false, &[sd_notify::NotifyState::Ready]);
