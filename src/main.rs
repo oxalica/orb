@@ -17,6 +17,8 @@ compile_error!("Only Linux is supported because of ublk driver");
 
 mod cli;
 
+const LOGICAL_SECTOR_SIZE: u32 = 4 << 10; // Typical page size.
+
 fn main() -> Result<()> {
     env_logger::init();
     match Cli::parse() {
@@ -144,7 +146,8 @@ fn serve<B: orb::service::Backend>(
     };
 
     let mut frontend =
-        orb::service::Frontend::new(config.device, backend, on_ready).expect("config is validated");
+        <orb::service::Frontend<_, LOGICAL_SECTOR_SIZE>>::new(config.device, backend, on_ready)
+            .expect("config is validated");
     rt.block_on(frontend.init_chunks(&chunks))
         .context("failed to initialize chunks")?;
     // Free memory.

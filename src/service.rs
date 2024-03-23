@@ -54,9 +54,6 @@ use serde::{Deserialize, Serialize};
 use serde_inline_default::serde_inline_default;
 use tokio::sync::watch;
 
-// TODO: Configurable.
-const LOGICAL_BLOCK_SECS: Sector = Sector(1);
-
 const MAX_READ_LEN: usize = 1 << 20;
 static ZEROES: &[u8] = &[0u8; MAX_READ_LEN];
 
@@ -149,7 +146,7 @@ impl Config {
 type OnReady = Box<dyn FnOnce(&DeviceInfo, Stopper) -> io::Result<()> + Send>;
 
 /// TODO: Improve concurrency.
-pub struct Frontend<B> {
+pub struct Frontend<B, const LOGICAL_SECTOR_SIZE: u32 = { Sector::SIZE }> {
     config: Config,
     backend: B,
     on_ready: Mutex<Option<OnReady>>,
@@ -243,13 +240,15 @@ impl Default for Zone {
     }
 }
 
-impl<B: Backend> Frontend<B> {
+impl<B: Backend, const LOGICAL_SECTOR_SIZE: u32> Frontend<B, LOGICAL_SECTOR_SIZE> {
     pub fn new(
         config: Config,
         backend: B,
         // XXX: Sync should not be required.
         on_ready: impl FnOnce(&DeviceInfo, Stopper) -> io::Result<()> + Send + 'static,
     ) -> Result<Self> {
+        assert!(LOGICAL_SECTOR_SIZE.is_power_of_two() && LOGICAL_SECTOR_SIZE >= Sector::SIZE);
+
         config.validate().context("invalid configuration")?;
         let nr_zones = usize::try_from(config.dev_secs / config.zone_secs).unwrap();
         let zones = std::iter::repeat_with(Zone::default)
@@ -300,7 +299,7 @@ impl<B: Backend> Frontend<B> {
                             "offset not continous, expected to be {expect_global_off}",
                         );
                         ensure!(
-                            *coff as u64 % LOGICAL_BLOCK_SECS.bytes() == 0,
+                            *coff as u64 % LOGICAL_SECTOR_SIZE as u64 == 0,
                             "offset not aligned",
                         );
                         ensure!(len != 0, "chunk is empty");
@@ -381,7 +380,7 @@ impl<B: Backend> Frontend<B> {
         let mut params = DeviceParams::new();
         params
             .dev_sectors(self.config.dev_secs)
-            .logical_block_size(LOGICAL_BLOCK_SECS.bytes())
+            .logical_block_size(LOGICAL_SECTOR_SIZE as u64)
             // XXX: Chunks should have a 2^k alignment.
             // .physical_block_size(self.config.min_chunk_size.bytes())
             // .io_min_size(self.config.min_chunk_size.bytes())
@@ -529,7 +528,7 @@ impl<B: Backend> Frontend<B> {
     }
 }
 
-impl<B: Backend> BlockDevice for Frontend<B> {
+impl<B: Backend, const LOGICAL_SECTOR_SIZE: u32> BlockDevice for Frontend<B, LOGICAL_SECTOR_SIZE> {
     fn ready(&self, dev_info: &DeviceInfo, stop: Stopper) -> io::Result<()> {
         self.on_ready.lock().take().unwrap()(dev_info, stop)
     }
