@@ -34,14 +34,14 @@
 #![deny(clippy::await_holding_lock)]
 use std::collections::BTreeSet;
 use std::future::Future;
-use std::num::NonZeroUsize;
+use std::num::{NonZeroU32, NonZeroUsize};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::{fmt, io};
 
 use anyhow::{ensure, Context, Result};
 use bytes::{BufMut, Bytes, BytesMut};
-use futures_util::{AsyncBufRead, AsyncReadExt, Stream, TryStreamExt};
+use futures_util::{AsyncBufRead, AsyncReadExt, Stream, StreamExt, TryStreamExt};
 use itertools::Itertools;
 use lru::LruCache;
 use orb_ublk::{
@@ -89,6 +89,8 @@ pub struct Config {
 
     #[serde_inline_default(NonZeroUsize::new(16).unwrap())]
     pub max_concurrent_streams: NonZeroUsize,
+    #[serde_inline_default(NonZeroU32::new(8).unwrap())]
+    pub max_concurrent_commits: NonZeroU32,
 }
 
 mod serde_sector {
@@ -300,7 +302,11 @@ impl<B: Backend, const LOGICAL_SECTOR_SIZE: u32> Frontend<B, LOGICAL_SECTOR_SIZE
             streams: Mutex::new(LruCache::new(config.max_concurrent_streams)),
             zones,
             dirty_zones: Mutex::default(),
-            exclusive_write_fence: tokio::sync::RwLock::new(()),
+            exclusive_write_fence: tokio::sync::RwLock::with_max_readers(
+                (),
+                // Clamp to the max supported value for tokio.
+                config.max_concurrent_commits.get().min(u32::MAX >> 3),
+            ),
 
             config,
         })
@@ -921,11 +927,23 @@ impl<B: Backend, const LOGICAL_SECTOR_SIZE: u32> BlockDevice for Frontend<B, LOG
 
         // XXX: Can we release the write fence here?
 
-        let commit_ret = futures_util::future::join_all(commit_futs)
-            .await
-            .into_iter()
-            .collect();
+        let max_concurrent_commits = self.config.max_concurrent_commits.get() as usize;
+        if commit_futs.is_empty() {
+            // Do nothing.
+        } else if commit_futs.len() <= max_concurrent_commits {
+            let commit_ret = futures_util::future::join_all(commit_futs)
+                .await
+                .into_iter()
+                .collect();
+            ret = ret.and(commit_ret);
+        } else {
+            let mut stream =
+                futures_util::stream::iter(commit_futs).buffer_unordered(max_concurrent_commits);
+            while let Some(r) = stream.next().await {
+                ret = ret.and(r);
+            }
+        }
 
-        ret.and(commit_ret)
+        ret
     }
 }

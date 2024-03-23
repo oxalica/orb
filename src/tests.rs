@@ -2,7 +2,7 @@ use std::fmt::Write;
 use std::fs::File;
 use std::future::Future;
 use std::io::Read;
-use std::num::NonZeroUsize;
+use std::num::{NonZeroU32, NonZeroUsize};
 use std::time::Duration;
 use std::{mem, ptr, slice};
 
@@ -209,6 +209,10 @@ const CONFIG: Config = Config {
     max_chunk_size: 2 << 10,
     // Workaround: `Option::unwrap` is not const stable yet.
     max_concurrent_streams: match NonZeroUsize::new(8) {
+        Some(n) => n,
+        None => unreachable!(),
+    },
+    max_concurrent_commits: match NonZeroU32::new(8) {
         Some(n) => n,
         None => unreachable!(),
     },

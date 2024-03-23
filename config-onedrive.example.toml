@@ -27,6 +27,11 @@ max_chunk_size = "128MiB"
 # The maximum number of concurrenct download streams.
 #max_concurrent_streams = 16
 
+# The maximum number of concurrent upload streams. The maximum buffer memory
+# consumption can be calculated by `max_concurrent_commits * max_chunk_size`.
+# Further WRITE/APPEND/FINISH will block until some buffers being committed.
+#max_concurrent_commits = 8
+
 # ublk device and queue configurations.
 [ublk]
 # The device id, ie. the integer part in `/dev/ublk{b,c}X`, to use.
