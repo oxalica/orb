@@ -2,6 +2,7 @@
 name = "orb"
 version = "0.1.0"
 edition = "2021"
+description = "OneDrive as a block device"
 
 [features]
 default = []

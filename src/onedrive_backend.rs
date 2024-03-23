@@ -49,7 +49,7 @@ const SERVER_ERROR_RETRY_DELAY: Duration = Duration::from_secs(3);
 const SESSION_UPLOAD_THRESHOLD: usize = 4_000_000; // 4MB
 const SESSION_UPLOAD_MAX_PART_SIZE: usize = 60 << 20; // 60MiB, must be aligned to 320KiB.
 
-const USER_AGENT: &str = concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VERSION"));
+const USER_AGENT: &str = concat!(env!("CARGO_PKG_NAME"), "/", env!("CFG_RELEASE"));
 const XDG_STATE_DIR_NAME: &str = env!("CARGO_PKG_NAME");
 const CREDENTIAL_FILE_NAME: &str = "credential.json";
 const STATE_FILE_NAME: &str = "state.json";

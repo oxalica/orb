@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use clap::builder::TypedValueParser;
 
 #[derive(Debug, clap::Parser)]
+#[clap(about, version = env!("CFG_RELEASE"))]
 pub enum Cli {
     Serve(ServeCmd),
     Stop(StopCmd),

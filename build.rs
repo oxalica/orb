@@ -6,6 +6,12 @@ fn main() {
     // Do NOT rerun on src changes.
     println!("cargo:rerun-if-changed=build.rs");
 
+    println!("cargo:rerun-if-env-changed=CFG_RELEASE");
+    if std::env::var("CFG_RELEASE").is_err() {
+        let version = std::env::var("CARGO_PKG_VERSION").unwrap();
+        println!("cargo:rustc-env=CFG_RELEASE={version}");
+    }
+
     #[cfg(feature = "completion")]
     {
         use clap::ValueEnum;

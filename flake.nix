@@ -1,5 +1,5 @@
 rec {
-  description = "OneDrive Block Device Daemon";
+  description = "OneDrive as a block device";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
@@ -29,6 +29,8 @@ rec {
         buildInputs = [ linuxHeaders openssl ];
 
         buildFeatures = [ "completion" ];
+
+        env.CFG_RELEASE = version;
 
         postInstall = ''
           install -DT ./orb@.example.service $out/etc/systemd/system/orb@.service
