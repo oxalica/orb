@@ -19,6 +19,15 @@ use super::{safe_write, Credential, CREDENTIAL_FILE_NAME, STATE_FILE_NAME, USER_
 const LOCALHOST: &str = "localhost";
 const LOCALHOST_ADDR: &str = "localhost:0";
 
+const DISCLAIMER: &str = "\
+Disclaimer: Microsoft OneDrive is a file hosting service operated by Microsoft. This program \
+orb has nothing to do with Microsoft, other than using their public API interface on behalf of \
+users, once the user explicitly logins here. \
+This program is licensed under GNU General Public License 3 or (at your option) any later versions. \
+This program is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY. \
+You can run `orb --help` for license details. \
+";
+
 pub fn interactive_login(state_dir: PathBuf, client_id: String) -> Result<()> {
     // Fail fast on insufficient permission.
     std::fs::create_dir_all(&state_dir).context("failed to create directory")?;
@@ -104,8 +113,9 @@ pub fn interactive_login(state_dir: PathBuf, client_id: String) -> Result<()> {
         }
         println!(
             "\
+            {DISCLAIMER}\n\n\
             A login page should be opened in your default browser. \
-            Please continue login in that page. \
+            Please continue login in that page, or press Ctrl-C here to stop login and exit. \
             If it is not opened automatically, please manually open this link:\n\
             {auth_url}\
             "

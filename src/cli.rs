@@ -2,6 +2,21 @@ use std::path::PathBuf;
 
 use clap::builder::TypedValueParser;
 
+/// OneDrive as a block device.
+///
+/// Disclaimer: Microsoft OneDrive is a file hosting service operated by Microsoft. This program
+/// orb has nothing to do with Microsoft, other than using their public API interface on behalf of
+/// users, once the user explicitly logins via `orb login`.
+///
+/// Copyright (C) 2024 Oxalica
+///
+/// This program is free software: you can redistribute it and/or modify it under the terms of the
+/// GNU General Public License as published by the Free Software Foundation, either version 3 of
+/// the License, or (at your option) any later version. This program is distributed in the hope
+/// that it will be useful, but WITHOUT ANY WARRANTY; without even the implied warranty of
+/// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU General Public License for
+/// more details. You should have received a copy of the GNU General Public License along with this
+/// program. If not, see <https://www.gnu.org/licenses/>.
 #[derive(Debug, clap::Parser)]
 #[clap(about, version = env!("CFG_RELEASE"))]
 pub enum Cli {

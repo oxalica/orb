@@ -43,6 +43,7 @@ rec {
           inherit description;
           homepage = "https://github.com/oxalica/orb";
           mainProgram = "orb";
+          license = [ lib.license.gpl3Plus ];
         };
       };
     });
