@@ -22,6 +22,8 @@ use serde_inline_default::serde_inline_default;
 
 use crate::service::Backend;
 
+pub mod login;
+
 /// In <https://learn.microsoft.com/en-us/graph/api/driveitem-get-content?view=graph-rest-1.0&tabs=http#response>:
 ///
 /// > Preauthenticated download URLs are only valid for a short period of time (a few minutes) and

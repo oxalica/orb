@@ -4,7 +4,7 @@ use std::{fs, io};
 
 use anyhow::{bail, Context, Result};
 use clap::Parser;
-use cli::{Cli, ServeCmd, StopCmd};
+use cli::{Cli, LoginCmd, ServeCmd, StopCmd};
 use orb_ublk::{ControlDevice, DeviceBuilder, DeviceInfo};
 use serde::Deserialize;
 use serde_inline_default::serde_inline_default;
@@ -25,6 +25,7 @@ fn main() -> Result<()> {
     match Cli::parse() {
         Cli::Serve(cmd) => serve_main(cmd),
         Cli::Stop(cmd) => stop_cmd(cmd),
+        Cli::Login(cmd) => login_cmd(cmd),
     }
 }
 
@@ -219,4 +220,12 @@ fn open_ctl_dev() -> Result<ControlDevice> {
             bail!("failed to open {}{}", ControlDevice::PATH, help);
         }
     }
+}
+
+pub fn login_cmd(cmd: LoginCmd) -> Result<()> {
+    let state_dir = cmd.state_dir.unwrap_or_else(|| {
+        let inst = cmd.systemd.unwrap();
+        format!("/var/lib/orb/{inst}").into()
+    });
+    orb::onedrive_backend::login::interactive_login(state_dir, cmd.client_id)
 }

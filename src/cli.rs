@@ -1,9 +1,12 @@
 use std::path::PathBuf;
 
+use clap::builder::TypedValueParser;
+
 #[derive(Debug, clap::Parser)]
 pub enum Cli {
     Serve(ServeCmd),
     Stop(StopCmd),
+    Login(LoginCmd),
 }
 
 /// Start and run the service in the foreground.
@@ -35,4 +38,50 @@ pub struct StopCmd {
     /// The integer device ids to clean up, ie. the number in the tail of `/dev/ublk{b,c}*`.
     #[clap(required = true)]
     pub dev_ids: Vec<u32>,
+}
+
+/// Interactive login Microsoft account and save credential for service use.
+///
+/// Login can be done while service is running. You can use `systemctl reload` (SIGHUP) to trigger
+/// a reload of updated credentials, so that buffered data will not be lost when tokens somehow
+/// failed to be refreshed automatically.
+/// A successful login always clears existing states (under `state.json`) and enforces a
+/// re-synchronization on the next service start.
+///
+/// WARNING: When the service is running, credentials updating must guarantee that the new one
+/// refers to the same account as the old one, otherwise the state will be inconsistent, and all
+/// buffered data will be lost!
+#[derive(Debug, clap::Args)]
+pub struct LoginCmd {
+    /// Save credentials for systemd service `orb@<INSTANCE>.service`. This is a shortcut for
+    /// `--state-dir /var/lib/orb/<INSTANCE>`.
+    ///
+    /// INSTANCE should be in systemd-escaped form.
+    #[clap(
+        long,
+        conflicts_with = "state_dir",
+        name = "INSTANCE",
+        value_parser = clap::builder::StringValueParser::new().try_map(systemd_name_checker),
+    )]
+    pub systemd: Option<String>,
+
+    /// The state directory to store credentials.
+    #[clap(long)]
+    pub state_dir: Option<PathBuf>,
+
+    /// The client ID for the registered application.
+    #[clap(long)]
+    pub client_id: String,
+}
+
+fn systemd_name_checker(s: String) -> Result<String, &'static str> {
+    if !s.is_empty()
+        && !s.starts_with('.')
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'\\')
+    {
+        Ok(s)
+    } else {
+        Err("invalid escaped systemd instance name")
+    }
 }
