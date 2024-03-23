@@ -19,11 +19,7 @@ rec {
         version = "git-${rev}";
         src = self;
 
-        cargoLock = {
-          lockFile = ./Cargo.lock;
-          # WAIT: onedrive-api release.
-          allowBuiltinFetchGit = true;
-        };
+        cargoLock.lockFile = ./Cargo.lock;
 
         nativeBuildInputs = [ pkg-config rustPlatform.bindgenHook installShellFiles ];
         buildInputs = [ linuxHeaders openssl ];

@@ -17,10 +17,12 @@ dirs = "5.0.1"
 env_logger = "0.11"
 futures-util = { version = "0.3", features = ["io"] }
 humantime = "2"
+hyper = { version = "1", features = ["http1", "server"] }
+hyper-util = { version = "0.1", features = [] }
 itertools = "0.12.1"
 log = "0.4.21"
 lru = "0.12.3"
-onedrive-api = { git = "https://github.com/oxalica/onedrive-api.git", rev = "c6b76ed493b2e226c4cf09871c62c8955ee50520" }
+onedrive-api = "0.10.0"
 open = "5.1.2"
 orb-ublk = { path = "./orb-ublk" }
 parking_lot = "0.12"
@@ -32,8 +34,6 @@ serde-inline-default = "0.2"
 serde_json = "1.0.114"
 tokio = { version = "1", features = ["macros", "net", "signal", "sync", "time"] }
 toml = "0.8"
-hyper = { version = "1", features = ["http1", "server"] }
-hyper-util = { version = "0.1", features = [] }
 
 [dev-dependencies]
 rustix = { version = "0.38", features = ["fs"] }

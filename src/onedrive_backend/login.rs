@@ -8,7 +8,7 @@ use futures_util::FutureExt;
 use hyper::service::service_fn;
 use hyper::{header, Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
-use onedrive_api::{Auth, Permission, TokenResponse};
+use onedrive_api::{Auth, ClientCredential, Permission, Tenant, TokenResponse};
 use reqwest::Url;
 use rustix::fs::Access;
 use tokio::sync::mpsc;
@@ -54,7 +54,13 @@ pub fn interactive_login(state_dir: PathBuf, client_id: String) -> Result<()> {
         let port = listener.local_addr()?.port();
 
         let redirect_uri = format!("http://{LOCALHOST}:{port}");
-        let auth = Arc::new(Auth::new_with_client(client, client_id, perm, redirect_uri));
+        let auth = Arc::new(Auth::new_with_client(
+            client,
+            client_id,
+            perm,
+            redirect_uri,
+            Tenant::Consumers,
+        ));
 
         let (tx, mut rx) = mpsc::channel(1);
         let auth2 = auth.clone();
@@ -93,7 +99,7 @@ pub fn interactive_login(state_dir: PathBuf, client_id: String) -> Result<()> {
         }
 
         let auth_url = auth.code_auth_url();
-        if let Err(err) = open::that_detached(&auth_url) {
+        if let Err(err) = open::that_detached(auth_url.as_str()) {
             log::error!("failed to open URL in browser: {err}");
         }
         println!(
@@ -119,7 +125,6 @@ pub fn interactive_login(state_dir: PathBuf, client_id: String) -> Result<()> {
         refresh_token: tokens.refresh_token.unwrap(), // Checked in handler.
         redirect_uri: auth.redirect_uri().to_owned(),
         client_id: auth.client_id().to_owned(),
-        client_secret: None,
     };
 
     let state_path = state_dir.join(STATE_FILE_NAME);
@@ -177,7 +182,7 @@ async fn request_handler(
         };
     };
 
-    match auth.login_with_code(&code, None).await {
+    match auth.login_with_code(&code, &ClientCredential::None).await {
         Ok(tokens) if tokens.refresh_token.is_some() => match tx.try_send(tokens) {
             Ok(()) | Err(TrySendError::Full(_)) => (
                 StatusCode::OK,

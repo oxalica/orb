@@ -13,7 +13,8 @@ use futures_util::{Stream, StreamExt, TryFutureExt, TryStreamExt};
 use onedrive_api::option::{CollectionOption, DriveItemPutOption};
 use onedrive_api::resource::DriveItemField;
 use onedrive_api::{
-    Auth, ConflictBehavior, DriveLocation, ItemLocation, OneDrive, Permission, TrackChangeFetcher,
+    Auth, ClientCredential, ConflictBehavior, DriveLocation, ItemLocation, OneDrive, Permission,
+    Tenant, TrackChangeFetcher,
 };
 use parking_lot::Mutex;
 use reqwest::{header, Client, StatusCode};
@@ -95,7 +96,6 @@ struct Credential {
     refresh_token: String,
     redirect_uri: String,
     client_id: String,
-    client_secret: Option<String>,
 }
 
 impl Credential {
@@ -103,10 +103,16 @@ impl Credential {
         let perm = Permission::new_read()
             .write(self.read_write)
             .offline_access(true);
-        let auth = Auth::new_with_client(client, &self.client_id, perm, &self.redirect_uri);
+        let auth = Auth::new_with_client(
+            client,
+            &self.client_id,
+            perm,
+            &self.redirect_uri,
+            Tenant::Consumers,
+        );
         let login_time = SystemTime::now();
         let mut resp = retry_request(|| {
-            auth.login_with_refresh_token(&self.refresh_token, self.client_secret.as_deref())
+            auth.login_with_refresh_token(&self.refresh_token, &ClientCredential::None)
         })
         .await
         .context("failed to login")?;
