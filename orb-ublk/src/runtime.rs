@@ -89,7 +89,7 @@ mod sync {
     }
 }
 
-pub use tokio_support::{Builder as TokioRuntimeBuilder, Runtime as TokioRuntime};
+pub use tokio_support::Builder as TokioRuntimeBuilder;
 
 mod tokio_support {
     use tokio::io::unix::AsyncFd;
@@ -102,32 +102,29 @@ mod tokio_support {
     pub struct Builder;
 
     impl AsyncRuntimeBuilder for Builder {
-        type Runtime = Runtime;
+        type Runtime = tokio::runtime::Runtime;
 
         fn build(&self) -> io::Result<Self::Runtime> {
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()?;
-            Ok(Runtime(runtime))
+            Ok(runtime)
         }
     }
 
-    #[derive(Debug)]
-    pub struct Runtime(tokio::runtime::Runtime);
-
-    impl AsyncRuntime for Runtime {
+    impl AsyncRuntime for tokio::runtime::Runtime {
         type Spawner<'env> = Spawner<'env>;
 
         fn drive_uring<'env, T, F>(&mut self, uring: &IoUring, mut on_cqe: F) -> io::Result<T>
         where
             F: for<'scope> FnMut(&'scope Self::Spawner<'env>) -> io::Result<ControlFlow<T>>,
         {
-            let _guard = self.0.enter();
+            let _guard = self.enter();
             let uring_fd = AsyncFd::with_interest(uring.as_raw_fd(), Interest::READABLE)?;
             // NB. This must be dropped before return. See more in `Spawner::spawn`.
             let local_set = LocalSet::new();
             let spawner = Spawner(PhantomData);
-            local_set.block_on(&self.0, async {
+            local_set.block_on(self, async {
                 loop {
                     uring_fd.readable().await?.clear_ready();
                     if let ControlFlow::Break(ret) = on_cqe(&spawner)? {

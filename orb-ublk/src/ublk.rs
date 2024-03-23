@@ -802,20 +802,27 @@ impl Service<'_> {
 
             let threads = (0..nr_queues)
                 .map(|thread_id| {
-                    let mut worker = IoWorker {
-                        thread_id,
-                        ready_tx: Some(ready_tx.clone().clone()),
-                        cdev: self.cdev.as_fd(),
-                        dev_info: &self.dev_info,
-                        handler,
-                        runtime_builder,
-                        set_io_flusher: params.set_io_flusher,
-                        wait_device_start: None,
-                        stop_guard: thread_stop_guard.clone(),
-                    };
+                    let cdev = self.cdev.as_fd();
+                    let dev_info = self.dev_info;
+                    let ready_tx = ready_tx.clone();
+                    let stop_guard = thread_stop_guard.clone();
                     thread::Builder::new()
                         .name(format!("io-worker-{thread_id}"))
-                        .spawn_scoped(s, move || worker.run())
+                        .spawn_scoped(s, move || {
+                            let mut runtime = runtime_builder.build()?;
+                            let mut worker = IoWorker {
+                                thread_id,
+                                ready_tx: Some(ready_tx),
+                                cdev,
+                                dev_info: &dev_info,
+                                handler,
+                                runtime: &mut runtime,
+                                set_io_flusher: params.set_io_flusher,
+                                wait_device_start: None,
+                                stop_guard,
+                            };
+                            worker.run()
+                        })
                 })
                 .collect::<io::Result<Vec<_>>>()?;
 
@@ -870,14 +877,14 @@ impl Service<'_> {
     /// # Panics
     ///
     /// Panic if the number of [`queues`](DeviceBuilder::queues) of this device is not one.
-    pub fn serve_local<RB, D>(
+    pub fn serve_local<R, D>(
         &mut self,
-        runtime_builder: &RB,
+        runtime: &mut R,
         params: &DeviceParams,
         handler: &D,
     ) -> io::Result<()>
     where
-        RB: AsyncRuntimeBuilder,
+        R: AsyncRuntime,
         D: BlockDevice,
     {
         self.check_params(params);
@@ -903,7 +910,7 @@ impl Service<'_> {
             cdev: self.cdev.as_fd(),
             dev_info: &self.dev_info,
             handler,
-            runtime_builder,
+            runtime,
             set_io_flusher: params.set_io_flusher,
             wait_device_start: Some((&self.ctl.uring, stopper)),
             stop_guard: SignalStopOnDrop(exit_fd.as_fd()),
@@ -1002,14 +1009,14 @@ fn sync_cancel_all<S: squeue::EntryMarker, C: cqueue::EntryMarker>(uring: &IoUri
     scopeguard::ScopeGuard::into_inner(guard);
 }
 
-struct IoWorker<'a, B, RB> {
+struct IoWorker<'a, 'r, B, R> {
     thread_id: u16,
     // Signal the main thread for service readiness. `None` for `serve_local`.
     ready_tx: Option<std::sync::mpsc::SyncSender<()>>,
     cdev: BorrowedFd<'a>,
     dev_info: &'a DeviceInfo,
     handler: &'a B,
-    runtime_builder: &'a RB,
+    runtime: &'r mut R,
     set_io_flusher: bool,
 
     // If the worker is running in-place by `Service::serve_local`, we need to wait for the
@@ -1021,7 +1028,7 @@ struct IoWorker<'a, B, RB> {
     stop_guard: SignalStopOnDrop<'a>,
 }
 
-impl<B: BlockDevice, RB: AsyncRuntimeBuilder> IoWorker<'_, B, RB> {
+impl<'r, B: BlockDevice, R: AsyncRuntime + 'r> IoWorker<'_, 'r, B, R> {
     // FIXME: Break this up?
     #[allow(clippy::too_many_lines)]
     #[allow(clippy::items_after_statements)]
@@ -1064,8 +1071,6 @@ impl<B: BlockDevice, RB: AsyncRuntimeBuilder> IoWorker<'_, B, RB> {
             .register_files(&[self.cdev.as_raw_fd()])?;
         const CDEV_FIXED_FD: Fixed = Fixed(0);
         const NOTIFY_USER_DATA: u64 = !0;
-
-        let mut runtime = self.runtime_builder.build()?;
 
         let refill_sqe =
             |sq: &mut SubmissionQueue<'_>, i: u16, result: Option<i32>, zone_append_lba: u64| {
@@ -1128,7 +1133,7 @@ impl<B: BlockDevice, RB: AsyncRuntimeBuilder> IoWorker<'_, B, RB> {
             }
         }
 
-        runtime.drive_uring(&io_ring, |spawner| {
+        self.runtime.drive_uring(&io_ring, |spawner| {
             // SAFETY: This is the only place to modify the CQ.
             let cq = unsafe { io_ring.completion_shared() };
             for cqe in cq {

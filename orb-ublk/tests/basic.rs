@@ -62,7 +62,8 @@ fn test_service<B: BlockDevice + Sync>(
         .unwrap();
     let tested = Arc::new(AtomicBool::new(false));
     if queues == 1 {
-        srv.serve_local(&rt_builder, params, &handler(tested.clone()))
+        let mut rt = rt_builder.build().unwrap();
+        srv.serve_local(&mut rt, params, &handler(tested.clone()))
             .unwrap();
     } else {
         srv.serve(&rt_builder, params, &handler(tested.clone()))

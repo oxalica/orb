@@ -5,7 +5,6 @@ use std::{fs, io};
 use anyhow::{bail, Context, Result};
 use clap::Parser;
 use cli::{Cli, ServeCmd, StopCmd};
-use orb_ublk::runtime::TokioRuntimeBuilder;
 use orb_ublk::{ControlDevice, DeviceBuilder, DeviceInfo};
 use serde::Deserialize;
 use serde_inline_default::serde_inline_default;
@@ -65,8 +64,7 @@ fn serve_main(cmd: ServeCmd) -> Result<()> {
     config.device.validate().context("invalid device config")?;
     let ctl = open_ctl_dev()?;
 
-    // XXX: Is there a way to reuse this runtime?
-    let rt = tokio::runtime::Builder::new_current_thread()
+    let mut rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .context("failed to build tokio runtime")?;
@@ -76,13 +74,13 @@ fn serve_main(cmd: ServeCmd) -> Result<()> {
             let zone_cnt = config.device.dev_secs / config.device.zone_secs;
             let zone_cnt = zone_cnt.try_into().context("zone count overflow")?;
             let memory = orb::memory_backend::Memory::new(zone_cnt);
-            serve(&ctl, rt, &config, memory, Vec::new(), || Ok(()))
+            serve(&ctl, &mut rt, &config, memory, Vec::new(), || Ok(()))
         }
         BackendConfig::Onedrive(backend_config) => {
             let (remote, chunks) =
                 orb::onedrive_backend::init(backend_config, &config.device, &rt)?;
             let drive = remote.get_drive();
-            serve(&ctl, rt, &config, remote, chunks, move || {
+            serve(&ctl, &mut rt, &config, remote, chunks, move || {
                 register_reload_signal(drive)
             })
         }
@@ -118,7 +116,7 @@ fn register_reload_signal(
 
 fn serve<B: orb::service::Backend>(
     ctl: &ControlDevice,
-    rt: Runtime,
+    rt: &mut Runtime,
     config: &Config,
     backend: B,
     chunks: Vec<(u64, u64)>,
@@ -152,10 +150,6 @@ fn serve<B: orb::service::Backend>(
         .context("failed to initialize chunks")?;
     // Free memory.
     drop(chunks);
-    // NB. This also drops all the connection pool. Otherwise, new requests may reuse old
-    // connections and await old `Future`s, which is in the old runtime thus never polled,
-    // resulting a deadlock.
-    drop(rt);
 
     let mut builder = DeviceBuilder::new();
     let mut dev_params = frontend.dev_params();
@@ -174,7 +168,7 @@ fn serve<B: orb::service::Backend>(
         .zoned()
         .create_service(ctl)
         .context("failed to create ublk device")?
-        .serve_local(&TokioRuntimeBuilder, &dev_params, &frontend)
+        .serve_local(rt, &dev_params, &frontend)
         .context("service failed")?;
 
     Ok(())
