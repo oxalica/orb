@@ -34,10 +34,10 @@
 #![deny(clippy::await_holding_lock)]
 use std::collections::BTreeSet;
 use std::future::Future;
-use std::io;
 use std::num::NonZeroUsize;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::{fmt, io};
 
 use anyhow::{ensure, Context, Result};
 use bytes::{BufMut, Bytes, BytesMut};
@@ -160,6 +160,28 @@ pub struct Frontend<B, const LOGICAL_SECTOR_SIZE: u32 = { Sector::SIZE }> {
     exclusive_write_fence: tokio::sync::RwLock<()>,
 }
 
+impl<B: fmt::Debug, const LOGICAL_SECTOR_SIZE: u32> fmt::Debug
+    for Frontend<B, LOGICAL_SECTOR_SIZE>
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        struct Indexed<'a, T>(&'a [T]);
+        impl<'a, T: fmt::Debug> fmt::Debug for Indexed<'a, T> {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.debug_map().entries(self.0.iter().enumerate()).finish()
+            }
+        }
+
+        f.debug_struct("Frontend")
+            .field("config", &self.config)
+            .field("backend", &self.backend)
+            .field("streams", &self.streams)
+            .field("zones", &Indexed(&self.zones))
+            .field("dirty_zones", &self.dirty_zones)
+            .field("exclusive_write_fence", &self.exclusive_write_fence)
+            .finish_non_exhaustive()
+    }
+}
+
 /// Active streams are keyed by global "reserved" stream position, counting all pending reads.
 /// This allows multiple read-ahead requests to be queued, without creating new streams.
 ///
@@ -169,7 +191,7 @@ pub struct Frontend<B, const LOGICAL_SECTOR_SIZE: u32 = { Sector::SIZE }> {
 ///        |<------------->|<-------------->|
 ///          pending reads   reserved remaining
 /// ```
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 struct DownloadStream {
     /// The remaining bytes starting at the position after all reserved pending reads.
     reserved_remaining: u32,
@@ -182,6 +204,12 @@ struct DownloadStream {
 struct StreamState {
     pos_tx: watch::Sender<u32>,
     stream: Pin<Box<dyn AsyncBufRead + Send>>,
+}
+
+impl fmt::Debug for StreamState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("StreamState").finish_non_exhaustive()
+    }
 }
 
 // `Mutex`es are locked in definition order.
@@ -208,10 +236,22 @@ impl Zone {
     }
 }
 
-#[derive(Debug)]
 enum TailChunk {
     Buffer(BytesMut),
     Uploading(Bytes),
+}
+
+impl fmt::Debug for TailChunk {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let (variant, len) = match self {
+            Self::Buffer(buf) if buf.is_empty() => return f.write_str("NoTail"),
+            Self::Buffer(buf) => ("Buffer", buf.len()),
+            Self::Uploading(buf) => ("Uploading", buf.len()),
+        };
+        f.debug_tuple(variant)
+            .field(&format_args!("<{len} bytes>"))
+            .finish()
+    }
 }
 
 impl TailChunk {
@@ -244,7 +284,6 @@ impl<B: Backend, const LOGICAL_SECTOR_SIZE: u32> Frontend<B, LOGICAL_SECTOR_SIZE
     pub fn new(
         config: Config,
         backend: B,
-        // XXX: Sync should not be required.
         on_ready: impl FnOnce(&DeviceInfo, Stopper) -> io::Result<()> + Send + 'static,
     ) -> Result<Self> {
         assert!(LOGICAL_SECTOR_SIZE.is_power_of_two() && LOGICAL_SECTOR_SIZE >= Sector::SIZE);

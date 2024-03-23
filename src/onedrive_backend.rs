@@ -506,7 +506,14 @@ pub struct Remote {
 }
 
 /// In case of concurrent cache population, only one wins, to avoid redundant API calls.
-type CacheCell = Arc<tokio::sync::OnceCell<String>>;
+#[derive(Clone)]
+struct CacheCell(Arc<tokio::sync::OnceCell<String>>);
+
+impl fmt::Debug for CacheCell {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("CacheCell")
+    }
+}
 
 impl Remote {
     fn new(drive: Arc<AutoReloginOnedrive>, root_dir: String) -> Self {
@@ -545,9 +552,9 @@ impl Backend for Remote {
         let cell = {
             let mut cache = self.download_url_cache.lock();
             match cache.get(&(zid, coff)) {
-                Some(cell) => Arc::clone(cell),
+                Some(cell) => cell.clone(),
                 None => {
-                    let cell = Arc::new(tokio::sync::OnceCell::new());
+                    let cell = CacheCell(Arc::new(tokio::sync::OnceCell::new()));
                     cache.insert((zid, coff), cell.clone());
                     cell
                 }
@@ -559,6 +566,7 @@ impl Backend for Remote {
         let fut = async move {
             let loc = ItemLocation::from_path(&path).unwrap();
             let url = cell
+                .0
                 .get_or_try_init(|| {
                     log::debug!("fetching download url of chunk {path}");
                     drive.with(|drive| async move { drive.get_item_download_url(loc).await })

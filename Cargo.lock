@@ -1081,6 +1081,7 @@ dependencies = [
  "parking_lot",
  "reqwest",
  "rustix",
+ "scoped-tls",
  "sd-notify",
  "serde",
  "serde-inline-default",
@@ -1443,6 +1444,12 @@ checksum = "fbc91545643bcf3a0bbb6569265615222618bdf33ce4ffbbd13c4bbd4c093534"
 dependencies = [
  "windows-sys 0.52.0",
 ]
+
+[[package]]
+name = "scoped-tls"
+version = "1.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e1cf6437eb19a8f4a6cc0f7dca544973b0b78843adbfeb3683d1a94a0024a294"
 
 [[package]]
 name = "scopeguard"

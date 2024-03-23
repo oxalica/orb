@@ -1,4 +1,6 @@
+use std::fmt::Debug;
 use std::num::NonZeroU16;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::{fs, io};
 
@@ -130,13 +132,18 @@ fn register_reload_signal(
     Ok(())
 }
 
-fn serve<B: orb::service::Backend>(
+fn serve<B: orb::service::Backend + Debug>(
     ctl: &ControlDevice,
     rt: &mut Runtime,
     config: &Config,
     backend: B,
     chunks: Vec<(u64, u64)>,
 ) -> Result<Frontend<B>> {
+    // Workaround: This is very ugly since scoped_tls support neither fat pointers nor !Sized
+    // types. There is a PR but the crate is inactive.
+    // See: https://github.com/alexcrichton/scoped-tls/pull/27
+    scoped_tls::scoped_thread_local!(static FRONTEND_PTR: *const ());
+
     let on_ready = |dev_info: &DeviceInfo, stopper: orb_ublk::Stopper| {
         let mut sigint = signal::signal(signal::SignalKind::interrupt())?;
         let mut sigterm = signal::signal(signal::SignalKind::terminate())?;
@@ -150,6 +157,50 @@ fn serve<B: orb::service::Backend>(
             let _ = sd_notify::notify(false, &[sd_notify::NotifyState::Stopping]);
             stopper.stop();
         });
+
+        let mut sigusr1 = signal::signal(signal::SignalKind::user_defined1())?;
+        if FRONTEND_PTR.is_set() {
+            tokio::task::spawn(async move {
+                use std::io::Write;
+                use std::os::unix::fs::OpenOptionsExt;
+                use std::time::SystemTime;
+
+                while let Some(()) = sigusr1.recv().await {
+                    log::warn!("debug dumping states...");
+                    let ts = SystemTime::now()
+                        .duration_since(SystemTime::UNIX_EPOCH)
+                        .unwrap()
+                        .as_secs();
+                    // XXX: Is there a better way to retrieve this directory?
+                    let dir = std::env::var("STATE_DIRECTORY")
+                        .or_else(|_| std::env::var("TMPDIR"))
+                        .unwrap_or_else(|_| "/tmp".to_owned());
+                    let debug_out = FRONTEND_PTR
+                        // SAFETY: This must be the frontend reference set outside.
+                        .with(|&ptr| format!("{:#?}", unsafe { &*ptr.cast::<Frontend<B>>() }));
+                    let path = PathBuf::from(dir).join(format!("orb-state-dump.{ts}"));
+                    let ret = tokio::task::spawn_blocking({
+                        let path = path.clone();
+                        move || {
+                            let mut file = std::fs::OpenOptions::new()
+                                .create(true)
+                                .truncate(true)
+                                .write(true)
+                                .mode(0o600) // rw-------
+                                .open(path)?;
+                            file.write_all(debug_out.as_bytes())?;
+                            file.sync_data()
+                        }
+                    })
+                    .await
+                    .unwrap();
+                    match ret {
+                        Ok(()) => log::warn!("debug dump saved at {}", path.display()),
+                        Err(err) => log::error!("failed to save debug dump: {err}"),
+                    }
+                }
+            });
+        }
 
         log::info!("Block device ready at /dev/ublkb{}", dev_info.dev_id());
         let _ = sd_notify::notify(false, &[sd_notify::NotifyState::Ready]);
@@ -173,15 +224,18 @@ fn serve<B: orb::service::Backend>(
     } else {
         dev_params.set_io_flusher(true);
     }
-    builder
-        .name("orb")
-        .queues(1)
-        .queue_depth(config.ublk.queue_depth.get())
-        .zoned()
-        .create_service(ctl)
-        .context("failed to create ublk device")?
-        .serve_local(rt, &dev_params, &frontend)
-        .context("service failed")?;
+
+    FRONTEND_PTR.set(&std::ptr::from_ref(&frontend).cast(), || {
+        builder
+            .name("orb")
+            .queues(1)
+            .queue_depth(config.ublk.queue_depth.get())
+            .zoned()
+            .create_service(ctl)
+            .context("failed to create ublk device")?
+            .serve_local(rt, &dev_params, &frontend)
+            .context("service failed")
+    })?;
 
     Ok(frontend)
 }

@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::fmt;
 use std::future::{ready, Future};
 
 use anyhow::{anyhow, Result};
@@ -13,9 +14,34 @@ use crate::service::Backend;
 #[serde(deny_unknown_fields)]
 pub struct Config {}
 
-#[derive(Debug)]
 pub struct Memory {
     pub(crate) zones: Box<[RwLock<HashMap<u32, Bytes>>]>,
+}
+
+impl fmt::Debug for Memory {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        struct ZonesDebug<'a>(&'a [RwLock<HashMap<u32, Bytes>>]);
+
+        impl fmt::Debug for ZonesDebug<'_> {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                let mut map = f.debug_map();
+                map.entries(self.0.iter().enumerate().map(|(zid, chunks)| {
+                    let mut ranges = chunks
+                        .read()
+                        .iter()
+                        .map(|(&coff, data)| coff..(coff + data.len() as u32))
+                        .collect::<Vec<_>>();
+                    ranges.sort_unstable_by_key(|range| range.start);
+                    (zid, ranges)
+                }));
+                map.finish()
+            }
+        }
+
+        f.debug_struct("Memory")
+            .field("zones", &ZonesDebug(&self.zones))
+            .finish()
+    }
 }
 
 impl Memory {
