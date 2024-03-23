@@ -33,7 +33,7 @@ rec {
         env.CFG_RELEASE = version;
 
         postInstall = ''
-          install -DT ./orb@.example.service $out/etc/systemd/system/orb@.service
+          install -DTm644 ./orb@.example.service $out/etc/systemd/system/orb@.service
           installShellCompletion \
             --bash completions/bash/${pname}.bash \
             --fish completions/fish/${pname}.fish \
