@@ -21,7 +21,8 @@ const LOGICAL_SECTOR_SIZE: u32 = 4 << 10; // Typical page size.
 type Frontend<B> = orb::service::Frontend<B, LOGICAL_SECTOR_SIZE>;
 
 fn main() -> Result<()> {
-    env_logger::init();
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+
     match Cli::parse() {
         Cli::Serve(cmd) => serve_main(cmd),
         Cli::Stop(cmd) => stop_cmd(cmd),
