@@ -75,3 +75,7 @@ remote_dir = "/orb"
 
 # Connection timeout in seconds.
 #connect_timeout_sec = 15
+
+# The size of each part request for large uploads.
+# It will be clamped to [4MB, 60MiB] and aligned to 320KiB.
+#upload_part_max_size = "60MiB"

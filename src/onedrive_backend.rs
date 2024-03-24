@@ -9,6 +9,7 @@ use std::{fmt, fs, mem};
 
 use anyhow::{anyhow, bail, ensure, Context, Result};
 use bytes::Bytes;
+use bytesize::ByteSize;
 use futures_util::{Stream, StreamExt, TryFutureExt, TryStreamExt};
 use onedrive_api::option::{CollectionOption, DriveItemPutOption};
 use onedrive_api::resource::DriveItemField;
@@ -49,8 +50,9 @@ const SERVER_ERROR_RETRY_DEFAULT_DELAY: Duration = Duration::from_secs(1);
 /// Note that the session upload API has higher bandwidth limit than main Microsoft Graph API.
 /// We should prefer that unless the request lattency is an issue (session upload requires at least
 /// 2 requests per file).
-const SESSION_UPLOAD_THRESHOLD: usize = 4_000_000; // 4MB
-const SESSION_UPLOAD_MAX_PART_SIZE: usize = 60 << 20; // 60MiB, must be aligned to 320KiB.
+const SESSION_UPLOAD_THRESHOLD: usize = 4_000_000;
+const SESSION_UPLOAD_MAX_PART_SIZE: usize = 60 << 20; // 60MiB, aligned to 320KiB.
+const SESSION_UPLOAD_ALIGN: usize = 320 << 10; // 320KiB
 
 const USER_AGENT: &str = concat!(env!("CARGO_PKG_NAME"), "/", env!("CFG_RELEASE"));
 const XDG_STATE_DIR_NAME: &str = env!("CARGO_PKG_NAME");
@@ -69,6 +71,19 @@ pub struct Config {
     state_dir: PathBuf,
     #[serde_inline_default(15)]
     connect_timeout_sec: u64,
+
+    #[serde(deserialize_with = "de_part_max_size")]
+    #[serde_inline_default(SESSION_UPLOAD_MAX_PART_SIZE)]
+    upload_part_max_size: usize,
+}
+
+fn de_part_max_size<'de, D: de::Deserializer<'de>>(de: D) -> Result<usize, D::Error> {
+    let size = ByteSize::deserialize(de)?.0;
+    Ok((size.clamp(
+        SESSION_UPLOAD_THRESHOLD as u64,
+        SESSION_UPLOAD_MAX_PART_SIZE as u64,
+    ) as usize)
+        .next_multiple_of(SESSION_UPLOAD_ALIGN))
 }
 
 fn de_remote_dir<'de, D: de::Deserializer<'de>>(de: D) -> Result<String, D::Error> {
@@ -370,7 +385,7 @@ pub fn init(
         client,
         access_token,
     ));
-    let remote = Remote::new(drive, config.remote_dir.clone());
+    let remote = Remote::new(drive, config.clone());
     Ok((remote, chunks))
 }
 
@@ -502,8 +517,8 @@ impl AutoReloginOnedrive {
 
 #[derive(Debug)]
 pub struct Remote {
+    config: Config,
     drive: Arc<AutoReloginOnedrive>,
-    root_dir: String,
     download_url_cache: Mutex<TimedCache<(u32, u32), CacheCell>>,
 }
 
@@ -518,11 +533,11 @@ impl fmt::Debug for CacheCell {
 }
 
 impl Remote {
-    fn new(drive: Arc<AutoReloginOnedrive>, root_dir: String) -> Self {
-        assert!(root_dir.starts_with('/') && !root_dir.ends_with('/'));
+    fn new(drive: Arc<AutoReloginOnedrive>, config: Config) -> Self {
+        assert!(config.remote_dir.starts_with('/') && !config.remote_dir.ends_with('/'));
         Self {
+            config,
             drive,
-            root_dir,
             download_url_cache: Mutex::new(TimedCache::new(URL_CACHE_DURATION)),
         }
     }
@@ -532,15 +547,18 @@ impl Remote {
     }
 
     fn chunk_path(&self, zid: u32, coff: u32) -> String {
-        format!("{}/zones/z{:06x}/c{:08x}", self.root_dir, zid, coff)
+        format!(
+            "{}/zones/z{:06x}/c{:08x}",
+            self.config.remote_dir, zid, coff
+        )
     }
 
     fn zone_path(&self, zid: u32) -> String {
-        format!("{}/zones/z{:06x}", self.root_dir, zid)
+        format!("{}/zones/z{:06x}", self.config.remote_dir, zid)
     }
 
     fn all_zones_dir_path(&self) -> String {
-        format!("{}/zones", self.root_dir)
+        format!("{}/zones", self.config.remote_dir)
     }
 }
 
@@ -637,7 +655,7 @@ impl Backend for Remote {
             let mut rest = data;
             let mut offset = 0u64;
             loop {
-                let part_len = rest.len().min(SESSION_UPLOAD_MAX_PART_SIZE);
+                let part_len = rest.len().min(self.config.upload_part_max_size);
                 let part = rest.split_to(part_len);
                 let new_offset = offset + part_len as u64;
                 // No authentication required.
