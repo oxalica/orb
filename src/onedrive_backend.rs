@@ -36,8 +36,10 @@ const URL_CACHE_DURATION: Duration = Duration::from_secs(60);
 
 const DELTA_PAGE_SIZE: usize = 10_000;
 
-const SERVER_ERROR_RETRY_CNT: usize = 2;
-const SERVER_ERROR_RETRY_DELAY: Duration = Duration::from_secs(3);
+// When Retry-After is specified, it is always used. Otherwise, we first use the default delay,
+// then do exponential backoff (2x), thus the wait times are: 1s, 2s, 4s, 8s, 16s.
+const SERVER_ERROR_RETRY_CNT: usize = 5;
+const SERVER_ERROR_RETRY_DEFAULT_DELAY: Duration = Duration::from_secs(1);
 
 /// Chunks smaller than this is uploaded via upload-small API, otherwise session upload API is
 /// used. The maximum valid value is not known. Two documentation sources give conflict results.
@@ -793,16 +795,30 @@ where
     Fut: Future<Output = onedrive_api::Result<T>>,
 {
     let mut retry_num = 1usize;
+    let mut next_delay = SERVER_ERROR_RETRY_DEFAULT_DELAY;
+
+    fn should_retry(st: StatusCode) -> bool {
+        st == StatusCode::TOO_MANY_REQUESTS
+            || !st.is_client_error() && !st.is_success() && !st.is_redirection()
+    }
+
     loop {
         match f().await {
             Ok(v) => return Ok(v),
+            // For HTTP 429 (Too many requests) or on `Retry-After` given, always retry.
+            // Otherwise, retry all errors except obvious client errors.
             Err(err)
-                if err.status_code().map_or(false, |st| st.is_server_error())
+                if (err.retry_after().is_some()
+                    || err.status_code().map_or(true, should_retry))
                     && retry_num <= SERVER_ERROR_RETRY_CNT =>
             {
-                log::warn!("retry {retry_num}/{SERVER_ERROR_RETRY_CNT} on server error: {err}");
+                let delay = err.retry_after().unwrap_or(next_delay);
+                log::warn!(
+                    "retry {retry_num}/{SERVER_ERROR_RETRY_CNT} in {delay:?} on error: {err}",
+                );
                 retry_num += 1;
-                tokio::time::sleep(SERVER_ERROR_RETRY_DELAY).await;
+                tokio::time::sleep(delay).await;
+                next_delay = delay * 2;
             }
             Err(err) => return Err(err),
         }
