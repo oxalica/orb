@@ -5,7 +5,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
-use std::{fmt, fs};
+use std::{fmt, fs, mem};
 
 use anyhow::{anyhow, bail, ensure, Context, Result};
 use bytes::Bytes;
@@ -631,6 +631,7 @@ impl Backend for Remote {
                     drive.new_upload_session_with_option(loc, opt).await
                 })
                 .await?;
+
             let mut rest = data;
             let mut offset = 0u64;
             loop {
@@ -647,8 +648,8 @@ impl Backend for Remote {
                     )
                 })
                 .await;
+
                 let err = match (ret, new_offset == total_len as u64) {
-                    (Err(err), _) => err.into(),
                     (Ok(None), false) => {
                         offset = new_offset;
                         continue;
@@ -661,6 +662,34 @@ impl Backend for Remote {
                     (Ok(None), true) => {
                         anyhow!("failed to complete uploading for {path} at {new_offset}B")
                     }
+                    // In some rare cases, uploading is successful for server but failed for us in
+                    // combination of network fluctuation and auto-retrying. We need to re-sync the
+                    // stream position.
+                    (Err(err), _)
+                        if err.status_code() == Some(StatusCode::RANGE_NOT_SATISFIABLE) =>
+                    {
+                        log::warn!("upload session for {path} is out of sync, re-syncing...");
+                        let new_meta = retry_request(|| sess.get_meta(&self.drive.client))
+                            .await
+                            .context("failed to get out of sync")?;
+                        let expected = new_meta.next_expected_ranges;
+                        ensure!(
+                            // Must return one trailing chunk.
+                            expected.len() == 1
+                            // Must not revert already uploaded parts.
+                            && offset < expected[0].start
+                            // Must not end early.
+                            && expected[0].end.map_or(true, |end| end == total_len as u64 - 1),
+                            "unexpected next_expected_ranges for {path}, \
+                            previously at {offset}/{total_len}, \
+                            got {expected:?}",
+                        );
+                        let prev_offset = mem::replace(&mut offset, expected[0].start);
+                        rest = rest.slice((offset - prev_offset) as usize..);
+                        log::info!("upload position for {path} skipped from {prev_offset} to {offset}/{total_len}");
+                        continue;
+                    }
+                    (Err(err), _) => err.into(),
                 };
                 // No authentication required.
                 if let Err(err) = sess.delete(&self.drive.client).await {
