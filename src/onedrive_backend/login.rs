@@ -156,7 +156,6 @@ async fn request_handler(
     req: Request<hyper::body::Incoming>,
     auth: Arc<Auth>,
     tx: mpsc::Sender<TokenResponse>,
-    // ) -> Result<Response<String>, Infallible> {
 ) -> (StatusCode, String) {
     if req.method() != Method::GET {
         return (

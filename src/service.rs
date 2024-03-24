@@ -556,7 +556,7 @@ impl<B: Backend, const LOGICAL_SECTOR_SIZE: u32> Frontend<B, LOGICAL_SECTOR_SIZE
         let len = data.len();
         if let Err(err) = self.backend.upload_chunk(zid, coff, data).await {
             log::error!("failed to upload chunk at zid={zid} coff={coff} len={len}: {err}");
-            // NB. Intentionally keep it in `TailChunk::Commiting` state,
+            // NB. Intentionally keep it in `TailChunk::Uploading` state,
             // poison all following writes.
             return Err(Errno::IO);
         }
