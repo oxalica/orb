@@ -70,7 +70,7 @@ fn main() -> anyhow::Result<()> {
         .physical_block_size(cli.physical_block_size)
         .io_min_size(cli.physical_block_size)
         .io_opt_size(cli.physical_block_size)
-        .attrs(DeviceAttrs::VolatileCache)
+        .attrs(DeviceAttrs::VolatileCache | DeviceAttrs::Fua)
         .set_io_flusher(cli.privileged);
     if cli.discard {
         params.discard(DiscardParams {
@@ -109,10 +109,13 @@ impl BlockDevice for LoopDev {
         Ok(())
     }
 
-    async fn write(&self, off: Sector, buf: WriteBuf<'_>, _flags: IoFlags) -> Result<usize, Errno> {
+    async fn write(&self, off: Sector, buf: WriteBuf<'_>, flags: IoFlags) -> Result<usize, Errno> {
         self.file
             .write_all_at(buf.as_slice().unwrap(), off.bytes())
             .map_err(convert_err)?;
+        if flags.contains(IoFlags::Fua) {
+            self.file.sync_data().map_err(convert_err)?;
+        }
         Ok(buf.len())
     }
 
@@ -120,22 +123,30 @@ impl BlockDevice for LoopDev {
         self.file.sync_data().map_err(convert_err)
     }
 
-    async fn discard(&self, off: Sector, len: usize, _flags: IoFlags) -> Result<(), Errno> {
+    async fn discard(&self, off: Sector, len: usize, flags: IoFlags) -> Result<(), Errno> {
         fallocate(
             &self.file,
             FallocateFlags::PUNCH_HOLE,
             off.bytes(),
             len as _,
-        )
+        )?;
+        if flags.contains(IoFlags::Fua) {
+            self.file.sync_data().map_err(convert_err)?;
+        }
+        Ok(())
     }
 
-    async fn write_zeroes(&self, off: Sector, len: usize, _flags: IoFlags) -> Result<(), Errno> {
+    async fn write_zeroes(&self, off: Sector, len: usize, flags: IoFlags) -> Result<(), Errno> {
         fallocate(
             &self.file,
             FallocateFlags::PUNCH_HOLE,
             off.bytes(),
             len as _,
-        )
+        )?;
+        if flags.contains(IoFlags::Fua) {
+            self.file.sync_data().map_err(convert_err)?;
+        }
+        Ok(())
     }
 }
 

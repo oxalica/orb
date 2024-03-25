@@ -159,7 +159,7 @@ fn main() -> anyhow::Result<()> {
     let params = *DeviceParams::new()
         .dev_sectors(size_sectors)
         .chunk_sectors(zone_sectors)
-        .attrs(DeviceAttrs::VolatileCache)
+        .attrs(DeviceAttrs::VolatileCache | DeviceAttrs::Fua)
         .logical_block_size(cli.logical_block_size.0)
         .physical_block_size(cli.physical_block_size.0)
         .io_min_size(cli.physical_block_size.0)
@@ -226,7 +226,7 @@ impl BlockDevice for ZonedDev {
         Ok(())
     }
 
-    async fn write(&self, off: Sector, buf: WriteBuf<'_>, _flags: IoFlags) -> Result<usize, Errno> {
+    async fn write(&self, off: Sector, buf: WriteBuf<'_>, flags: IoFlags) -> Result<usize, Errno> {
         let off = off.bytes();
         let zid = off / self.zone_size;
         let mut zones = self.zones.lock().unwrap();
@@ -242,6 +242,9 @@ impl BlockDevice for ZonedDev {
         let mut buf2 = vec![0u8; buf.len()];
         buf.copy_to_slice(&mut buf2)?;
         self.file.write_all_at(&buf2, off).map_err(convert_err)?;
+        if flags.contains(IoFlags::Fua) {
+            self.flush_sync()?;
+        }
         z.rel_wptr = new_rel_wptr;
         if new_rel_wptr == self.zone_size {
             z.cond = ZoneCond::Full;
@@ -288,16 +291,19 @@ impl BlockDevice for ZonedDev {
         Ok(())
     }
 
-    async fn zone_finish(&self, off: Sector, _flags: IoFlags) -> Result<(), Errno> {
+    async fn zone_finish(&self, off: Sector, flags: IoFlags) -> Result<(), Errno> {
         let zid = off.bytes() / self.zone_size;
         let mut zones = self.zones.lock().unwrap();
+        if flags.contains(IoFlags::Fua) {
+            self.flush_sync()?;
+        }
         let z = &mut zones.zones[zid as usize];
         z.rel_wptr = self.zone_size;
         z.cond = ZoneCond::Full;
         Ok(())
     }
 
-    async fn zone_reset(&self, off: Sector, _flags: IoFlags) -> Result<(), Errno> {
+    async fn zone_reset(&self, off: Sector, flags: IoFlags) -> Result<(), Errno> {
         let zid = off.bytes() / self.zone_size;
         let mut zones = self.zones.lock().unwrap();
         let z = &mut zones.zones[zid as usize];
@@ -307,12 +313,15 @@ impl BlockDevice for ZonedDev {
             off.bytes(),
             self.zone_size,
         )?;
+        if flags.contains(IoFlags::Fua) {
+            self.flush_sync()?;
+        }
         z.rel_wptr = 0;
         z.cond = ZoneCond::Empty;
         Ok(())
     }
 
-    async fn zone_reset_all(&self, _flags: IoFlags) -> Result<(), Errno> {
+    async fn zone_reset_all(&self, flags: IoFlags) -> Result<(), Errno> {
         let mut zones = self.zones.lock().unwrap();
         fallocate(
             &self.file,
@@ -321,6 +330,9 @@ impl BlockDevice for ZonedDev {
             self.size,
         )?;
         zones.zones.fill_with(ZoneState::default);
+        if flags.contains(IoFlags::Fua) {
+            self.flush_sync()?;
+        }
         Ok(())
     }
 
@@ -353,7 +365,7 @@ impl BlockDevice for ZonedDev {
         &self,
         off: Sector,
         buf: WriteBuf<'_>,
-        _flags: IoFlags,
+        flags: IoFlags,
     ) -> Result<Sector, Errno> {
         let zid = off.bytes() / self.zone_size;
         let mut zones = self.zones.lock().unwrap();
@@ -369,6 +381,9 @@ impl BlockDevice for ZonedDev {
         self.file
             .write_all_at(&buf2, old_wptr)
             .map_err(convert_err)?;
+        if flags.contains(IoFlags::Fua) {
+            self.flush_sync()?;
+        }
         z.rel_wptr = new_rel_wptr;
         if new_rel_wptr == self.zone_size {
             z.cond = ZoneCond::Full;
