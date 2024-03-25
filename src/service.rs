@@ -902,7 +902,7 @@ impl<B: Backend, const LOGICAL_SECTOR_SIZE: u32> BlockDevice for Frontend<B, LOG
 
     async fn flush(&self, _flags: IoFlags) -> Result<(), Errno> {
         // Wait for all committing tasks to complete.
-        let _fence = self.exclusive_write_fence.write().await;
+        let fence = self.exclusive_write_fence.write().await;
 
         let mut ret = Ok(());
 
@@ -938,7 +938,10 @@ impl<B: Backend, const LOGICAL_SECTOR_SIZE: u32> BlockDevice for Frontend<B, LOG
             })
             .collect::<Vec<_>>();
 
-        // XXX: Can we release the write fence here?
+        // We already retrieved all dirty zones up to now and their committing locks are held in
+        // `Future`s. Downgrade to read guard to allow writes on irrelevant zones. But other
+        // exclusive operations (ZONE_RESET_ALL) still cannot happen yet.
+        let _fence = fence.downgrade();
 
         let max_concurrent_commits = self.config.max_concurrent_commits.get() as usize;
         if commit_futs.is_empty() {
