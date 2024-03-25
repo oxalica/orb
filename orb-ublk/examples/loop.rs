@@ -18,6 +18,8 @@ use rustix::io::Errno;
 struct Cli {
     backing_file: PathBuf,
 
+    #[clap(long)]
+    dev_id: Option<u32>,
     #[clap(long, default_value = "512")]
     logical_block_size: u64,
     #[clap(long, default_value = "4096")]
@@ -58,6 +60,8 @@ fn main() -> anyhow::Result<()> {
         builder.user_copy();
     }
     let mut srv = builder
+        .name("ublk-loop")
+        .dev_id(cli.dev_id)
         .create_service(&ctl)
         .context("failed to create ublk device")?;
     let mut params = *DeviceParams::new()

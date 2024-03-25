@@ -26,6 +26,8 @@ const DEFAULT_IO_BUF_SIZE: u32 = 512 << 10;
 pub const CDEV_PREFIX: &str = "/dev/ublkc";
 pub const BDEV_PREFIX: &str = "/dev/ublkb";
 
+const DEV_ID_AUTO: u32 = !0;
+
 #[allow(warnings)]
 mod binding {
     include!(concat!(env!("OUT_DIR"), "/ublk_cmd.rs"));
@@ -226,7 +228,7 @@ impl ControlDevice {
     /// [`DeviceBuilder::create_service`] should be preferred instead.
     pub fn create_device(&self, builder: &DeviceBuilder) -> io::Result<DeviceInfo> {
         // `-1` for auto-allocation.
-        let dev_id = builder.id.unwrap_or(!0);
+        let dev_id = builder.dev_id;
         let pid = rustix::process::getpid();
         // SAFETY: Valid uring_cmd.
         unsafe {
@@ -381,7 +383,7 @@ impl AsFd for ControlDevice {
 #[derive(Debug)]
 pub struct DeviceBuilder {
     name: String,
-    id: Option<u32>,
+    dev_id: u32,
     nr_hw_queues: u16,
     queue_depth: u16,
     io_buf_bytes: u32,
@@ -402,7 +404,7 @@ impl DeviceBuilder {
     pub fn new() -> Self {
         Self {
             name: String::new(),
-            id: None,
+            dev_id: DEV_ID_AUTO,
             nr_hw_queues: 1,
             queue_depth: 64,
             io_buf_bytes: DEFAULT_IO_BUF_SIZE,
@@ -417,12 +419,16 @@ impl DeviceBuilder {
         self
     }
 
+    /// Set the expected ublk id to create, or `None` for auto-allocation.
+    ///
+    /// The device id is the numeric part in the end of block device path `/dev/ublkbX`.
+    ///
     /// # Panics
     ///
-    /// Panic if `id` is `u32::MAX` which coresponds to automatic id (which is the default).
-    pub fn id(&mut self, id: u32) -> &mut Self {
-        assert_ne!(id, !0);
-        self.id = Some(id);
+    /// Panic if `id` is `Some(u32::MAX)`.
+    pub fn dev_id(&mut self, id: Option<u32>) -> &mut Self {
+        assert_ne!(id, Some(DEV_ID_AUTO));
+        self.dev_id = id.unwrap_or(DEV_ID_AUTO);
         self
     }
 

@@ -215,10 +215,8 @@ fn serve<B: orb::service::Backend + Debug>(
     drop(chunks);
 
     let mut builder = DeviceBuilder::new();
+    builder.dev_id(u32::try_from(config.ublk.id).ok());
     let mut dev_params = frontend.dev_params();
-    if let Ok(id) = u32::try_from(config.ublk.id) {
-        builder.id(id);
-    }
     if config.ublk.unprivileged {
         builder.unprivileged();
     } else {

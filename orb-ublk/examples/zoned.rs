@@ -22,6 +22,8 @@ struct Cli {
     backing_file: PathBuf,
     metadata_file: PathBuf,
 
+    #[clap(long)]
+    dev_id: Option<u32>,
     #[clap(long, default_value = "512")]
     logical_block_size: ByteSize,
     #[clap(long, default_value = "4KiB")]
@@ -150,6 +152,7 @@ fn main() -> anyhow::Result<()> {
         .name("ublk-zoned")
         .zoned()
         .io_buf_size(u32::try_from(cli.io_buf_size.0).context("buffer size too large")?)
+        .dev_id(cli.dev_id)
         .create_service(&ctl)
         .context("failed to create ublk device")?;
     let zones_cnt_u32 = u32::try_from(zones_cnt).unwrap_or(u32::MAX);
