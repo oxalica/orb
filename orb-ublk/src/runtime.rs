@@ -92,6 +92,8 @@ mod sync {
 pub use tokio_support::Builder as TokioRuntimeBuilder;
 
 mod tokio_support {
+    use std::ptr::NonNull;
+
     use tokio::io::unix::AsyncFd;
     use tokio::io::Interest;
     use tokio::task::LocalSet;
@@ -123,7 +125,10 @@ mod tokio_support {
             let uring_fd = AsyncFd::with_interest(uring.as_raw_fd(), Interest::READABLE)?;
             // NB. This must be dropped before return. See more in `Spawner::spawn`.
             let local_set = LocalSet::new();
-            let spawner = Spawner(PhantomData);
+            let spawner = Spawner {
+                local_set: NonNull::from(&local_set),
+                _marker: PhantomData,
+            };
             local_set.block_on(self, async {
                 loop {
                     uring_fd.readable().await?.clear_ready();
@@ -135,19 +140,23 @@ mod tokio_support {
         }
     }
 
-    // Workaround: This is bounded by `'env` rather than `'scope`, so it's not possible to place a
-    // `&'scope LocalSet` inside. We go through global `spawn_local` instead.
     #[derive(Debug)]
-    pub struct Spawner<'env>(PhantomData<&'env mut &'env ()>);
+    pub struct Spawner<'env> {
+        // `&'scope LocalSet`
+        local_set: NonNull<LocalSet>,
+        _marker: PhantomData<&'env mut &'env ()>,
+    }
 
     impl<'env> AsyncScopeSpawner<'env> for Spawner<'env> {
         fn spawn<Fut>(&self, fut: Fut)
         where
             Fut: Future<Output = ()> + 'env,
         {
+            // SAFETY: Valid when `Spawner` is alive.
+            let local_set = unsafe { self.local_set.as_ref() };
             // SAFETY: All futures are spawned here are collected by `drive_uring` above and will
             // be either completed or dropped before its return.
-            tokio::task::spawn_local(unsafe {
+            local_set.spawn_local(unsafe {
                 std::mem::transmute::<
                     Pin<Box<dyn Future<Output = ()> + 'env>>,
                     Pin<Box<dyn Future<Output = ()> + 'static>>,
