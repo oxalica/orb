@@ -4,7 +4,6 @@ use std::marker::PhantomData;
 use std::mem::{ManuallyDrop, MaybeUninit};
 use std::ops::ControlFlow;
 use std::os::fd::{BorrowedFd, RawFd};
-use std::os::unix::fs::FileExt;
 use std::ptr::NonNull;
 use std::sync::Arc;
 use std::time::Duration;
@@ -13,7 +12,7 @@ use std::{fmt, io, mem, ptr, thread};
 use io_uring::types::{Fd, Fixed};
 use io_uring::{cqueue, opcode, squeue, IoUring, SubmissionQueue};
 use rustix::event::{EventfdFlags, PollFd, PollFlags};
-use rustix::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
+use rustix::fd::{AsFd, AsRawFd, OwnedFd};
 use rustix::io::Errno;
 use rustix::mm;
 use rustix::process::Pid;
@@ -1249,7 +1248,9 @@ impl<'r, B: BlockDevice, R: AsyncRuntime + 'r> IoWorker<'_, 'r, B, R> {
                     binding::UBLK_IO_OP_WRITE => {
                         log::trace!("WRITE offset={off} len={len} flags={flags:?}");
                         let buf = WriteBuf(get_buf(), PhantomData);
-                        spawn!(h.write(off, buf, flags).await);
+                        spawn!(h.write(off, buf, flags).await.inspect(|&written| {
+                            assert!(written <= len, "invalid written amount");
+                        }));
                     }
                     binding::UBLK_IO_OP_FLUSH => {
                         log::trace!("FLUSH flags={flags:?}");
@@ -1272,6 +1273,8 @@ impl<'r, B: BlockDevice, R: AsyncRuntime + 'r> IoWorker<'_, 'r, B, R> {
                             _not_send_invariant: PhantomData,
                         };
                         spawn!(h.report_zones(off, &mut buf, flags).await.map(|()| {
+                            // NB. Must calculated from the advance of offset, not
+                            // `remaining_zones`. See `ZoneBuf::report` for why.
                             let written = (buf.off - pwrite_off)
                                 .try_into()
                                 .expect("buffer size must not exceed i32");
@@ -1818,6 +1821,7 @@ impl<'buf> ReadBuf<'buf> {
             RawBuf::PreCopied(b) => {
                 b[..len].copy_from_slice(data);
                 *b = &mut mem::take(b)[len..];
+                Ok(())
             }
             RawBuf::UserCopy {
                 cdev,
@@ -1825,15 +1829,12 @@ impl<'buf> ReadBuf<'buf> {
                 remaining,
                 ..
             } => {
-                // SAFETY: The fd is valid and `ManuallyDrop` prevents its close.
-                let cdev = unsafe { ManuallyDrop::new(File::from_raw_fd(cdev.as_raw_fd())) };
-                cdev.write_all_at(data, *off)
-                    .map_err(|e| Errno::from_io_error(&e).unwrap())?;
-                *off += len as u64;
-                *remaining -= len as u32;
+                let prev_off = *off;
+                let ret = write_all_at(*cdev, data, off);
+                *remaining -= (*off - prev_off) as u32;
+                ret
             }
         }
-        Ok(())
     }
 }
 
@@ -1956,15 +1957,27 @@ impl<'buf> ZoneBuf<'buf> {
         let data = unsafe {
             std::slice::from_raw_parts(zones.as_ptr().cast::<u8>(), mem::size_of_val(zones))
         };
-        // SAFETY: The fd is valid and `ManuallyDrop` prevents its close.
-        let cdev = unsafe { ManuallyDrop::new(File::from_raw_fd(self.cdev.as_raw_fd())) };
-        // XXX: Should we handle partial write?
-        cdev.write_all_at(data, self.off)
-            .map_err(|e| Errno::from_io_error(&e).unwrap())?;
-        self.remaining_zones -= len as u32;
-        self.off += data.len() as u64;
-        Ok(len)
+        let prev_off = self.off;
+        let ret = write_all_at(self.cdev, data, &mut self.off);
+        let written = (self.off - prev_off) as usize;
+        if written % mem::size_of::<Zone>() == 0 {
+            self.remaining_zones -= (written / mem::size_of::<Zone>()) as u32;
+        } else {
+            // Forbid more writes when partially failed. The result written length is calculated by
+            // advance of `off`, which is still correct in that case.
+            self.remaining_zones = 0;
+        }
+        ret.and(Ok(len))
     }
+}
+
+fn write_all_at(fd: BorrowedFd<'_>, mut buf: &[u8], offset: &mut u64) -> Result<(), Errno> {
+    while !buf.is_empty() {
+        let written = rustix::io::pwrite(fd, buf, *offset)?;
+        buf = &buf[written..];
+        *offset += written as u64;
+    }
+    Ok(())
 }
 
 fn read_all_uninit_at<'a>(
