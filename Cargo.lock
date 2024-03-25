@@ -1082,6 +1082,7 @@ dependencies = [
  "reqwest",
  "rustix",
  "scoped-tls",
+ "scopeguard",
  "sd-notify",
  "serde",
  "serde-inline-default",

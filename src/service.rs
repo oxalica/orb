@@ -260,6 +260,28 @@ impl TailChunk {
     fn empty() -> Self {
         Self::Buffer(BytesMut::new())
     }
+
+    fn take_and_set_uploading(&mut self) -> Bytes {
+        // It is not documentated that `BytesMut::freeze` do not allocate. If it does and panics,
+        // buffered data would be lost and there is no way to handle that.
+        scopeguard::defer_on_unwind! {
+            log::error!("data left inconsistent on panic");
+            std::process::abort();
+        }
+        let buf = match std::mem::replace(self, TailChunk::Buffer(BytesMut::new())) {
+            TailChunk::Buffer(buf) => buf.freeze(),
+            TailChunk::Uploading(buf) => buf,
+        };
+        *self = TailChunk::Uploading(buf.clone());
+        buf
+    }
+
+    fn to_bytes(&self) -> Bytes {
+        match self {
+            TailChunk::Buffer(buf) => Bytes::copy_from_slice(buf),
+            TailChunk::Uploading(buf) => buf.clone(),
+        }
+    }
 }
 
 impl AsRef<[u8]> for TailChunk {
@@ -535,8 +557,7 @@ impl<B: Backend, const LOGICAL_SECTOR_SIZE: u32> Frontend<B, LOGICAL_SECTOR_SIZE
                 }
             }
 
-            let data = tail_buf.split().freeze();
-            *tail = TailChunk::Uploading(data.clone());
+            let data = tail.take_and_set_uploading();
             (tail_coff, data, prev_wp, true)
         };
 
@@ -753,8 +774,7 @@ impl<B: Backend, const LOGICAL_SECTOR_SIZE: u32> BlockDevice for Frontend<B, LOG
             // Mark zone finished.
             tail_buf.put_u8(0u8);
 
-            let data = tail_buf.split().freeze();
-            *tail = TailChunk::Uploading(data.clone());
+            let data = tail.take_and_set_uploading();
             *cond = ZoneCond::Full;
             (tail_coff, data)
         };
@@ -890,7 +910,7 @@ impl<B: Backend, const LOGICAL_SECTOR_SIZE: u32> BlockDevice for Frontend<B, LOG
             .dirty_zones
             .lock()
             .iter()
-            .filter_map(|&zid| {
+            .map(|&zid| {
                 let zone = &self.zones[zid as usize];
                 let zone_guard = zone
                     .commit_lock
@@ -901,27 +921,20 @@ impl<B: Backend, const LOGICAL_SECTOR_SIZE: u32> BlockDevice for Frontend<B, LOG
                 let mut tail = zone.tail.lock();
                 let tail_coff = chunks.last().copied().unwrap_or(0);
                 drop(chunks);
-                let TailChunk::Buffer(tail_buf) = &mut *tail else {
-                    log::error!("zone {zid} poisoned");
-                    ret = Err(Errno::IO);
-                    return None;
-                };
-                assert!(!tail_buf.is_empty());
-                let clear_tail = tail_buf.len() >= self.config.min_chunk_size;
+                let tail_buf_len = tail.as_ref().len();
+                assert_ne!(tail_buf_len, 0);
+                let clear_tail = tail_buf_len >= self.config.min_chunk_size;
                 let data = if clear_tail {
-                    let data = tail_buf.split().freeze();
-                    *tail = TailChunk::Uploading(data.clone());
-                    data
+                    tail.take_and_set_uploading()
                 } else {
                     // Small chunks can still grow. Do not freeze it.
-                    // This should not cause race because we are holding write locks.
-                    Bytes::copy_from_slice(tail_buf)
+                    tail.to_bytes()
                 };
-                Some(async move {
+                async move {
                     let _zone_guard = zone_guard;
                     self.commit_tail_chunk(zid, tail_coff, data, clear_tail)
                         .await
-                })
+                }
             })
             .collect::<Vec<_>>();
 
