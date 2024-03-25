@@ -82,9 +82,11 @@ fn main() -> anyhow::Result<()> {
         });
     }
     let handler = LoopDev { file };
-    srv.serve(&TokioRuntimeBuilder, &params, &handler)
-        .context("service error")?;
-    Ok(())
+    let ret = srv
+        .serve(&TokioRuntimeBuilder, &params, &handler)
+        .context("service error");
+    handler.file.sync_all().context("failed to sync file")?;
+    ret
 }
 
 struct LoopDev {

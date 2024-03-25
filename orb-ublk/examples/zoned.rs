@@ -180,9 +180,11 @@ fn main() -> anyhow::Result<()> {
         zones: Mutex::new(zones),
         metadata_path: cli.metadata_file,
     };
-    srv.serve(&TokioRuntimeBuilder, &params, &handler)
-        .context("service error")?;
-    Ok(())
+    let ret = srv
+        .serve(&TokioRuntimeBuilder, &params, &handler)
+        .context("service error");
+    handler.flush_sync().context("failed to sync")?;
+    ret
 }
 
 struct ZonedDev {
@@ -191,6 +193,17 @@ struct ZonedDev {
     zone_size: u64,
     zones: Mutex<ZonesMetadata>,
     metadata_path: PathBuf,
+}
+
+impl ZonedDev {
+    fn flush_sync(&self) -> Result<(), Errno> {
+        self.file.sync_data().map_err(convert_err)?;
+        let content = serde_json::to_vec(&*self.zones.lock().unwrap()).unwrap();
+        let tmp_path = self.metadata_path.with_extension("tmp");
+        fs::write(&tmp_path, content).map_err(convert_err)?;
+        fs::rename(&tmp_path, &self.metadata_path).map_err(convert_err)?;
+        Ok(())
+    }
 }
 
 impl BlockDevice for ZonedDev {
@@ -239,12 +252,7 @@ impl BlockDevice for ZonedDev {
     }
 
     async fn flush(&self, _flags: IoFlags) -> Result<(), Errno> {
-        self.file.sync_data().map_err(convert_err)?;
-        let content = serde_json::to_vec(&*self.zones.lock().unwrap()).unwrap();
-        let tmp_path = self.metadata_path.with_extension("tmp");
-        fs::write(&tmp_path, content).map_err(convert_err)?;
-        fs::rename(&tmp_path, &self.metadata_path).map_err(convert_err)?;
-        Ok(())
+        self.flush_sync()
     }
 
     async fn zone_open(&self, off: Sector, _flags: IoFlags) -> Result<(), Errno> {
