@@ -214,6 +214,8 @@ struct DownloadStream {
     reserved_remaining: u32,
     /// The zone-relative starting offset of this chunk.
     coff: u32,
+    /// The zone generation on stream creation. If it mismatches, the stream is outdated.
+    generation: u64,
     pos: watch::Receiver<u32>,
     state: Arc<Mutex<Option<StreamState>>>,
 }
@@ -240,6 +242,9 @@ struct Zone {
     /// The tail chunk is excluded.
     chunk_ends: Mutex<Vec<u32>>,
     tail: Mutex<TailChunk>,
+    /// The generation of content in this zone for cache invalidation.
+    /// It starts at 0 and increases by 1 on RESET.
+    generation: AtomicU64,
 }
 
 impl Zone {
@@ -250,6 +255,8 @@ impl Zone {
         *cond = ZoneCond::Empty;
         *chunks = Vec::new();
         *tail = TailChunk::empty();
+        // This should never overflow.
+        self.generation.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -315,6 +322,7 @@ impl Default for Zone {
             chunk_ends: Mutex::default(),
             cond: Mutex::new(ZoneCond::Empty),
             tail: Mutex::new(TailChunk::empty()),
+            generation: AtomicU64::new(0),
         }
     }
 }
@@ -627,11 +635,15 @@ impl<B: Backend, const LOGICAL_SECTOR_SIZE: u32> BlockDevice for Frontend<B, LOG
             let (stream, read_len) = {
                 let mut streams = self.streams.lock();
                 let mut stream = match streams.pop(&global_offset) {
-                    Some(stream) => {
+                    // Relaxed is enough since it's the user's fault to emit concurrent READ and
+                    // ZONE_RESET. In that case, the READ result does not matter.
+                    Some(stream)
+                        if stream.generation == zone.generation.load(Ordering::Relaxed) =>
+                    {
                         self.accounting.stream_hit.fetch_add(1, Ordering::Relaxed);
                         stream
                     }
-                    None => {
+                    _ => {
                         self.accounting.stream_miss.fetch_add(1, Ordering::Relaxed);
 
                         let chunks = zone.chunk_ends.lock();
@@ -670,6 +682,8 @@ impl<B: Backend, const LOGICAL_SECTOR_SIZE: u32> BlockDevice for Frontend<B, LOG
                         DownloadStream {
                             reserved_remaining: stream_len,
                             coff: chunk_start,
+                            // Re-fetch under zone.* locks to synchronize `Zone::reset`.
+                            generation: zone.generation.load(Ordering::Relaxed),
                             pos,
                             state: Arc::new(Mutex::new(Some(StreamState {
                                 stream: Box::pin(stream) as _,
@@ -924,7 +938,9 @@ impl<B: Backend, const LOGICAL_SECTOR_SIZE: u32> BlockDevice for Frontend<B, LOG
         for zone in self.zones.iter() {
             zone.reset();
         }
+        self.streams.lock().clear();
         self.dirty_zones.lock().clear();
+
         Ok(())
     }
 

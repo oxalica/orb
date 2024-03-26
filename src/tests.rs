@@ -482,6 +482,64 @@ async fn reset_all_zone() {
 }
 
 #[tokio::test]
+async fn stream_invalidate_on_reset() {
+    let dev = new_dev(&[
+        // [0, 8s)
+        (0, 0, vec![1u8; sec(8)]),
+    ])
+    .await;
+    // The first zone is full, thus no initial download.
+    assert_eq!(dev.backend().drain_log(), "");
+
+    // Read [0s, 2s), stream pos at 2s.
+    let got = dev.test_read(Sector(0), Sector(2)).await.unwrap();
+    let expect = [1u8; sec(2)];
+    assert_eq!(got, expect);
+    assert_eq!(dev.backend().drain_log(), "download(0, 0s, 0s);");
+
+    // Reset the zone.
+    dev.zone_reset(Sector(0), IoFlags::empty()).await.unwrap();
+    assert_eq!(dev.backend().drain_log(), "delete_zone(0);");
+
+    // Read [2s, 3s), no reuse.
+    let got = dev.test_read(Sector(2), Sector(2)).await.unwrap();
+    assert_eq!(got, [0u8; sec(2)]);
+    assert_eq!(dev.backend().drain_log(), "");
+}
+
+#[tokio::test]
+async fn stream_invalidate_on_reupload() {
+    let dev = new_dev(&[
+        // [0, 8s)
+        (0, 0, vec![1u8; sec(8)]),
+    ])
+    .await;
+    // The first zone is full, thus no initial download.
+    assert_eq!(dev.backend().drain_log(), "");
+
+    // Read [0s, 2s), stream pos at 2s.
+    let got = dev.test_read(Sector(0), Sector(2)).await.unwrap();
+    let expect = [1u8; sec(2)];
+    assert_eq!(got, expect);
+    assert_eq!(dev.backend().drain_log(), "download(0, 0s, 0s);");
+
+    // Reset the zone and replace content.
+    dev.zone_reset(Sector(0), IoFlags::empty()).await.unwrap();
+    dev.test_write_all(Sector(0), &mut [2u8; sec(8)])
+        .await
+        .unwrap();
+    assert_eq!(
+        dev.backend().drain_log(),
+        "delete_zone(0);upload(0, 0s, 8s);"
+    );
+
+    // Read [2s, 3s), no reuse, and got new data.
+    let got = dev.test_read(Sector(2), Sector(2)).await.unwrap();
+    assert_eq!(got, [2u8; sec(2)]);
+    assert_eq!(dev.backend().drain_log(), "download(0, 0s, 2s);");
+}
+
+#[tokio::test]
 async fn bufferred_read_write() {
     let dev = new_dev(&[]).await;
 
