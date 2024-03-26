@@ -1,6 +1,5 @@
 use std::fmt::Debug;
 use std::num::NonZeroU16;
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::{fs, io};
 
@@ -169,35 +168,30 @@ fn serve<B: orb::service::Backend + Debug>(
                     log::warn!("debug dumping states...");
                     let ts = SystemTime::now()
                         .duration_since(SystemTime::UNIX_EPOCH)
-                        .unwrap()
-                        .as_secs();
-                    // XXX: Is there a better way to retrieve this directory?
-                    let dir = std::env::var("STATE_DIRECTORY")
-                        .or_else(|_| std::env::var("TMPDIR"))
-                        .unwrap_or_else(|_| "/tmp".to_owned());
+                        .unwrap_or_default();
                     let debug_out = FRONTEND_PTR
                         // SAFETY: This must be the frontend reference set outside.
                         .with(|&ptr| format!("{:#?}", unsafe { &*ptr.cast::<Frontend<B>>() }));
-                    let path = PathBuf::from(dir).join(format!("orb-state-dump.{ts}"));
-                    let ret = tokio::task::spawn_blocking({
-                        let path = path.clone();
-                        move || {
-                            let mut file = std::fs::OpenOptions::new()
-                                .create(true)
-                                .truncate(true)
-                                .write(true)
-                                .mode(0o600) // rw-------
-                                .open(path)?;
-                            file.write_all(debug_out.as_bytes())?;
-                            file.sync_data()
+
+                    // Spawn detached. No need to join.
+                    tokio::task::spawn_blocking(move || {
+                        let path = std::env::temp_dir().join(format!(
+                            "orb-state-dump.{}.{:09}",
+                            ts.as_secs(),
+                            ts.subsec_nanos(),
+                        ));
+                        let ret = std::fs::OpenOptions::new()
+                            // Avoid blocking pipe traps.
+                            .create_new(true)
+                            .write(true)
+                            .mode(0o600) // rw-------
+                            .open(&path)
+                            .and_then(|mut f| f.write_all(debug_out.as_bytes()));
+                        match ret {
+                            Ok(()) => log::warn!("debug dump saved at: {}", path.display()),
+                            Err(err) => log::error!("failed to save debug dump: {err}"),
                         }
-                    })
-                    .await
-                    .unwrap();
-                    match ret {
-                        Ok(()) => log::warn!("debug dump saved at {}", path.display()),
-                        Err(err) => log::error!("failed to save debug dump: {err}"),
-                    }
+                    });
                 }
             });
         }
