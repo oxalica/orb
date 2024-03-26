@@ -36,6 +36,7 @@ use std::collections::BTreeSet;
 use std::future::Future;
 use std::num::{NonZeroU32, NonZeroUsize};
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::{fmt, io};
 
@@ -160,6 +161,19 @@ pub struct Frontend<B, const LOGICAL_SECTOR_SIZE: u32 = { Sector::SIZE }> {
     /// The global write fence for exclusive write operations (RESET_ALL) or synchronization
     /// (FLUSH). All remote modification holds a read-guard of this lock.
     exclusive_write_fence: tokio::sync::RwLock<()>,
+
+    accounting: Accounting,
+}
+
+#[derive(Debug, Default)]
+struct Accounting {
+    stream_hit: AtomicU64,
+    stream_miss: AtomicU64,
+    stream_hup: AtomicU64,
+    chunk_commit: AtomicU64,
+
+    zone_reset: AtomicU64,
+    zone_reset_all: AtomicU64,
 }
 
 impl<B: fmt::Debug, const LOGICAL_SECTOR_SIZE: u32> fmt::Debug
@@ -180,6 +194,7 @@ impl<B: fmt::Debug, const LOGICAL_SECTOR_SIZE: u32> fmt::Debug
             .field("zones", &Indexed(&self.zones))
             .field("dirty_zones", &self.dirty_zones)
             .field("exclusive_write_fence", &self.exclusive_write_fence)
+            .field("accounting", &self.accounting)
             .finish_non_exhaustive()
     }
 }
@@ -331,6 +346,7 @@ impl<B: Backend, const LOGICAL_SECTOR_SIZE: u32> Frontend<B, LOGICAL_SECTOR_SIZE
             ),
 
             config,
+            accounting: Accounting::default(),
         })
     }
 
@@ -575,6 +591,7 @@ impl<B: Backend, const LOGICAL_SECTOR_SIZE: u32> Frontend<B, LOGICAL_SECTOR_SIZE
     ) -> Result<(), Errno> {
         let zone = &self.zones[zid as usize];
         let len = data.len();
+        self.accounting.chunk_commit.fetch_add(1, Ordering::Relaxed);
         if let Err(err) = self.backend.upload_chunk(zid, coff, data).await {
             log::error!("failed to upload chunk at zid={zid} coff={coff} len={len}: {err}");
             // NB. Intentionally keep it in `TailChunk::Uploading` state,
@@ -610,8 +627,13 @@ impl<B: Backend, const LOGICAL_SECTOR_SIZE: u32> BlockDevice for Frontend<B, LOG
             let (stream, read_len) = {
                 let mut streams = self.streams.lock();
                 let mut stream = match streams.pop(&global_offset) {
-                    Some(stream) => stream,
+                    Some(stream) => {
+                        self.accounting.stream_hit.fetch_add(1, Ordering::Relaxed);
+                        stream
+                    }
                     None => {
+                        self.accounting.stream_miss.fetch_add(1, Ordering::Relaxed);
+
                         let chunks = zone.chunk_ends.lock();
                         let tail_start = chunks.last().copied().unwrap_or(0);
                         if let Some(offset_in_tail) = read_start.checked_sub(tail_start) {
@@ -677,7 +699,8 @@ impl<B: Backend, const LOGICAL_SECTOR_SIZE: u32> BlockDevice for Frontend<B, LOG
                 .ok()
                 .and_then(|_| stream.state.lock().take())
             else {
-                log::debug!("stream closed, retrying");
+                self.accounting.stream_hup.fetch_add(1, Ordering::Relaxed);
+                log::debug!("stream ended early, retrying");
                 if flags.contains(IoFlags::FailfastDev) {
                     return Err(Errno::AGAIN);
                 }
@@ -696,6 +719,7 @@ impl<B: Backend, const LOGICAL_SECTOR_SIZE: u32> BlockDevice for Frontend<B, LOG
             match state.stream.read_exact(&mut data).await {
                 Ok(()) => buf.put_slice(&data)?,
                 Err(err) if err.kind() == io::ErrorKind::UnexpectedEof => {
+                    self.accounting.stream_hup.fetch_add(1, Ordering::Relaxed);
                     log::debug!("stream ended early, retrying");
                     if flags.contains(IoFlags::FailfastDev) {
                         return Err(Errno::AGAIN);
@@ -874,6 +898,7 @@ impl<B: Backend, const LOGICAL_SECTOR_SIZE: u32> BlockDevice for Frontend<B, LOG
             }
         }
 
+        self.accounting.zone_reset.fetch_add(1, Ordering::Relaxed);
         if let Err(err) = self.backend.delete_zone(zid as u64).await {
             log::error!("failed to delete zone {zid}: {err}");
             return Err(Errno::IO);
@@ -889,6 +914,9 @@ impl<B: Backend, const LOGICAL_SECTOR_SIZE: u32> BlockDevice for Frontend<B, LOG
     async fn zone_reset_all(&self, _flags: IoFlags) -> Result<(), Errno> {
         let _fence = self.exclusive_write_fence.write().await;
 
+        self.accounting
+            .zone_reset_all
+            .fetch_add(1, Ordering::Relaxed);
         if let Err(err) = self.backend.delete_all_zones().await {
             log::error!("failed to delete all zones: {err}");
             return Err(Errno::IO);

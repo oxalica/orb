@@ -3,6 +3,7 @@ use std::future::{ready, Future};
 use std::hash::Hash;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 use std::{fmt, fs, mem};
@@ -520,6 +521,14 @@ pub struct Remote {
     config: Config,
     drive: Arc<AutoReloginOnedrive>,
     download_url_cache: Mutex<TimedCache<(u32, u32), CacheCell>>,
+
+    accounting: Accounting,
+}
+
+#[derive(Debug, Default)]
+struct Accounting {
+    url_cache_miss: AtomicU64,
+    url_cache_hit: AtomicU64,
 }
 
 /// In case of concurrent cache population, only one wins, to avoid redundant API calls.
@@ -539,6 +548,7 @@ impl Remote {
             config,
             drive,
             download_url_cache: Mutex::new(TimedCache::new(URL_CACHE_DURATION)),
+            accounting: Accounting::default(),
         }
     }
 
@@ -569,17 +579,21 @@ impl Backend for Remote {
         coff: u32,
         read_offset: u64,
     ) -> impl Stream<Item = Result<Bytes>> + Send + 'static {
-        let cell = {
+        let (cell, accounting) = {
             let mut cache = self.download_url_cache.lock();
             match cache.get(&(zid, coff)) {
-                Some(cell) => cell.clone(),
+                Some(cell) => (cell.clone(), &self.accounting.url_cache_hit),
                 None => {
+                    self.accounting
+                        .url_cache_miss
+                        .fetch_add(1, Ordering::Relaxed);
                     let cell = CacheCell(Arc::new(tokio::sync::OnceCell::new()));
                     cache.insert((zid, coff), cell.clone());
-                    cell
+                    (cell, &self.accounting.url_cache_miss)
                 }
             }
         };
+        accounting.fetch_add(1, Ordering::Relaxed);
 
         let drive = self.drive.clone();
         let path = self.chunk_path(zid, coff);
