@@ -69,13 +69,27 @@ pub struct StopCmd {
 /// buffered data will be lost!
 #[derive(Debug, clap::Args)]
 pub struct LoginCmd {
+    #[command(flatten)]
+    pub state_dir: StateDir,
+
+    /// The client ID for the registered application.
+    #[clap(
+        long,
+        name = "UUID",
+        value_parser = clap::builder::StringValueParser::new().try_map(uuid_checker),
+    )]
+    pub client_id: String,
+}
+
+#[derive(Debug, clap::Args)]
+#[group(required = true, multiple = false)]
+pub struct StateDir {
     /// Save credentials for systemd service `orb@<INSTANCE>.service`. This is a shortcut for
     /// `--state-dir /var/lib/orb/<INSTANCE>`.
     ///
     /// INSTANCE should be in systemd-escaped form.
     #[clap(
         long,
-        conflicts_with = "state_dir",
         name = "INSTANCE",
         value_parser = clap::builder::StringValueParser::new().try_map(systemd_name_checker),
     )]
@@ -84,10 +98,6 @@ pub struct LoginCmd {
     /// The state directory to store credentials.
     #[clap(long)]
     pub state_dir: Option<PathBuf>,
-
-    /// The client ID for the registered application.
-    #[clap(long)]
-    pub client_id: String,
 }
 
 fn systemd_name_checker(s: String) -> Result<String, &'static str> {
@@ -99,5 +109,33 @@ fn systemd_name_checker(s: String) -> Result<String, &'static str> {
         Ok(s)
     } else {
         Err("invalid escaped systemd instance name")
+    }
+}
+
+fn uuid_checker(s: String) -> Result<String, &'static str> {
+    const SAMPLE: &[u8] = b"00000000-1111-2222-3333-444444444444";
+    if s.len() == SAMPLE.len()
+        && s.bytes().zip(SAMPLE).all(|(lhs, &rhs)| {
+            if rhs == b'-' {
+                lhs == rhs
+            } else {
+                lhs.is_ascii_hexdigit()
+            }
+        })
+    {
+        Ok(s)
+    } else {
+        Err("invalid UUID")
+    }
+}
+
+impl StateDir {
+    pub fn to_path(&self) -> PathBuf {
+        match (&self.state_dir, &self.systemd) {
+            (Some(path), _) => path.clone(),
+            (None, Some(inst)) => format!("/var/lib/orb/{inst}").into(),
+            // Verified by clap.
+            _ => unreachable!(),
+        }
     }
 }

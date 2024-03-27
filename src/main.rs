@@ -270,9 +270,5 @@ fn open_ctl_dev() -> Result<ControlDevice> {
 }
 
 pub fn login_cmd(cmd: LoginCmd) -> Result<()> {
-    let state_dir = cmd.state_dir.unwrap_or_else(|| {
-        let inst = cmd.systemd.unwrap();
-        format!("/var/lib/orb/{inst}").into()
-    });
-    orb::onedrive_backend::login::interactive(&state_dir, cmd.client_id)
+    orb::onedrive_backend::login::interactive(&cmd.state_dir.to_path(), cmd.client_id)
 }
