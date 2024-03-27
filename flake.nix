@@ -21,8 +21,8 @@ rec {
 
         cargoLock.lockFile = ./Cargo.lock;
 
-        nativeBuildInputs = [ pkg-config rustPlatform.bindgenHook installShellFiles ];
-        buildInputs = [ linuxHeaders openssl ];
+        nativeBuildInputs = [ pkg-config installShellFiles ];
+        buildInputs = [ openssl ];
 
         buildFeatures = [ "completion" ];
 

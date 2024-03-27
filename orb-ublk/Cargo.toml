@@ -4,6 +4,10 @@ version = "0.1.0"
 edition = "2021"
 license = "MIT or Apache-2.0"
 
+[features]
+default = []
+generate-sys = ["dep:bindgen"]
+
 [dependencies]
 bitflags = "2.4.2"
 derive_more = "0.99"
@@ -15,7 +19,7 @@ strum = { version = "0.26", features = ["derive"] }
 tokio = { version = "1.35.1", features = ["net", "rt"] }
 
 [build-dependencies]
-bindgen = "0.69.2"
+bindgen = { version = "0.69.2", optional = true }
 
 [dev-dependencies]
 anyhow = "1"

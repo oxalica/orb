@@ -29,9 +29,9 @@ pub const BDEV_PREFIX: &str = "/dev/ublkb";
 const DEV_ID_AUTO: u32 = !0;
 
 #[allow(warnings)]
-mod binding {
-    include!(concat!(env!("OUT_DIR"), "/ublk_cmd.rs"));
-}
+#[rustfmt::skip]
+#[path = "./sys.rs"]
+mod binding;
 
 bitflags::bitflags! {
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
