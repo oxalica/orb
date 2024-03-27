@@ -7,7 +7,11 @@ rec {
 
   outputs = { self, nixpkgs }: let
     inherit (nixpkgs) lib;
-    eachSystem = lib.genAttrs lib.systems.flakeExposed;
+    eachSystem =
+      lib.genAttrs (
+        lib.filter
+          (lib.hasSuffix "-linux")
+          lib.systems.flakeExposed);
   in {
     packages = eachSystem (system: let
       pkgs = nixpkgs.legacyPackages.${system};
@@ -44,6 +48,7 @@ rec {
           homepage = "https://github.com/oxalica/orb";
           mainProgram = "orb";
           license = [ lib.licenses.gpl3Plus ];
+          platforms = lib.platforms.linux;
         };
       };
     });
