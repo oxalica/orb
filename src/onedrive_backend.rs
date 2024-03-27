@@ -581,16 +581,15 @@ impl Backend for Remote {
     ) -> impl Stream<Item = Result<Bytes>> + Send + 'static {
         let (cell, accounting) = {
             let mut cache = self.download_url_cache.lock();
-            match cache.get(&(zid, coff)) {
-                Some(cell) => (cell.clone(), &self.accounting.url_cache_hit),
-                None => {
-                    self.accounting
-                        .url_cache_miss
-                        .fetch_add(1, Ordering::Relaxed);
-                    let cell = CacheCell(Arc::new(tokio::sync::OnceCell::new()));
-                    cache.insert((zid, coff), cell.clone());
-                    (cell, &self.accounting.url_cache_miss)
-                }
+            if let Some(cell) = cache.get(&(zid, coff)) {
+                (cell.clone(), &self.accounting.url_cache_hit)
+            } else {
+                self.accounting
+                    .url_cache_miss
+                    .fetch_add(1, Ordering::Relaxed);
+                let cell = CacheCell(Arc::new(tokio::sync::OnceCell::new()));
+                cache.insert((zid, coff), cell.clone());
+                (cell, &self.accounting.url_cache_miss)
             }
         };
         accounting.fetch_add(1, Ordering::Relaxed);
@@ -609,7 +608,7 @@ impl Backend for Remote {
 
             log::debug!("downloading chunk {path} starting at {read_offset}B");
 
-            let range = format!("bytes={}-", read_offset);
+            let range = format!("bytes={read_offset}-");
             // No authentication required.
             let resp = retry_request(|| {
                 drive
@@ -826,13 +825,13 @@ where
     F: FnMut() -> Fut,
     Fut: Future<Output = onedrive_api::Result<T>>,
 {
-    let mut retry_num = 1usize;
-    let mut next_delay = SERVER_ERROR_RETRY_DEFAULT_DELAY;
-
     fn should_retry(st: StatusCode) -> bool {
         st == StatusCode::TOO_MANY_REQUESTS
             || !st.is_client_error() && !st.is_success() && !st.is_redirection()
     }
+
+    let mut retry_num = 1usize;
+    let mut next_delay = SERVER_ERROR_RETRY_DEFAULT_DELAY;
 
     loop {
         match f().await {

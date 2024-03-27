@@ -1485,7 +1485,7 @@ impl DeviceParams {
     /// Set zone parameters for zoned devices.
     ///
     /// The device must be created with [`FeatureFlags::Zoned`] set, and
-    /// [`DeviceParams::chunk_size`] must be set to the zone size.
+    /// [`DeviceParams::chunk_sectors`] must be set to the zone size.
     pub fn zoned(&mut self, params: ZonedParams) -> &mut Self {
         self.zoned = Some(params);
         self
@@ -1907,7 +1907,7 @@ impl<'buf> WriteBuf<'buf> {
     /// Try to get the internal buffer as a slice for manual usage.
     ///
     /// It will returns `None` if the device is created with [`FeatureFlags::UserCopy`].
-    /// Generally [`Self::copy_to`] should be preferred if applicatable.
+    /// Generally [`Self::copy_to_slice`] should be preferred if applicatable.
     ///
     /// The returned slice (if any) will have the same length as [`Self::len()`].
     #[must_use]

@@ -105,6 +105,8 @@ mod serde_sector {
             .ok_or_else(|| D::Error::custom(format_args!("not aligned to 512B sectors: {}", n.0)))
     }
 
+    // Required by serde interface.
+    #[allow(clippy::trivially_copy_pass_by_ref)]
     pub fn serialize<S: Serializer>(n: &Sector, ser: S) -> Result<S::Ok, S::Error> {
         ser.serialize_u64(n.bytes())
     }

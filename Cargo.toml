@@ -51,3 +51,23 @@ members = ["orb-ublk"]
 
 [profile.bench]
 debug = "full"
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+
+# Of course everything involving networks may fail.
+missing-errors-doc = "allow"
+# False positive: `rest` vs. `ret`, `off` vs. `coff`, etc.
+similar-names = "allow"
+# False positive on `unwrap` and `expect` for fail-means-bug semantics.
+missing-panics-doc = "allow"
+# Long sequential tasks (`login::interactive`, `onedrive_backend::init`) where
+# splitting fns can only increase the complexity.
+too-many-lines = "allow"
+
+# TODO: Caused by zid and coff are used as u32 and usize interchangably.
+cast-lossless = "allow"
+cast-possible-truncation = "allow"
+
+# WAIT: https://github.com/rust-lang/rust-clippy/issues/12279
+no-effect-underscore-binding = "allow"

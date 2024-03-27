@@ -248,7 +248,7 @@ fn stop_cmd(cmd: StopCmd) -> Result<()> {
             }
         }
     } else {
-        for &id in &cmd.dev_ids {
+        for id in cmd.dev_ids {
             ctl.delete_device(id)?;
         }
     }
@@ -274,5 +274,5 @@ pub fn login_cmd(cmd: LoginCmd) -> Result<()> {
         let inst = cmd.systemd.unwrap();
         format!("/var/lib/orb/{inst}").into()
     });
-    orb::onedrive_backend::login::interactive_login(state_dir, cmd.client_id)
+    orb::onedrive_backend::login::interactive(&state_dir, cmd.client_id)
 }

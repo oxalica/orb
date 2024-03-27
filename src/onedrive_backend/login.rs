@@ -1,6 +1,6 @@
 use std::io;
 use std::net::ToSocketAddrs;
-use std::path::PathBuf;
+use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{ensure, Context, Result};
@@ -28,11 +28,11 @@ This program is distributed in the hope that it will be useful, but WITHOUT ANY 
 You can run `orb --help` for license details. \
 ";
 
-pub fn interactive_login(state_dir: PathBuf, client_id: String) -> Result<()> {
+pub fn interactive(state_dir: &Path, client_id: String) -> Result<()> {
     // Fail fast on insufficient permission.
-    std::fs::create_dir_all(&state_dir).context("failed to create directory")?;
+    std::fs::create_dir_all(state_dir).context("failed to create directory")?;
     rustix::fs::access(
-        &state_dir,
+        state_dir,
         Access::READ_OK | Access::WRITE_OK | Access::EXEC_OK | Access::EXISTS,
     )?;
 

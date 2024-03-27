@@ -45,6 +45,7 @@ impl fmt::Debug for Memory {
 }
 
 impl Memory {
+    #[must_use]
     pub fn new(zone_cnt: usize) -> Self {
         let zones = (0..zone_cnt).map(|_| RwLock::new(HashMap::new())).collect();
         Self { zones }
