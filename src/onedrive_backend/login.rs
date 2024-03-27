@@ -2,6 +2,7 @@ use std::io;
 use std::net::ToSocketAddrs;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::SystemTime;
 
 use anyhow::{ensure, Context, Result};
 use futures_util::FutureExt;
@@ -14,7 +15,7 @@ use rustix::fs::Access;
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TrySendError;
 
-use super::{safe_write, Credential, CREDENTIAL_FILE_NAME, STATE_FILE_NAME, USER_AGENT};
+use super::{safe_write, Credential, STATE_FILE_NAME, USER_AGENT, USER_CREDENTIAL_FILE_NAME};
 
 const LOCALHOST: &str = "localhost";
 const LOCALHOST_ADDR: &str = "localhost:0";
@@ -131,6 +132,7 @@ pub fn interactive(state_dir: &Path, client_id: String) -> Result<()> {
     })?;
 
     let cred = Credential {
+        init_time: SystemTime::now(),
         read_write: true,
         refresh_token: tokens.refresh_token.unwrap(), // Checked in handler.
         redirect_uri: auth.redirect_uri().to_owned(),
@@ -145,7 +147,7 @@ pub fn interactive(state_dir: &Path, client_id: String) -> Result<()> {
         }
     }
 
-    let cred_path = state_dir.join(CREDENTIAL_FILE_NAME);
+    let cred_path = state_dir.join(USER_CREDENTIAL_FILE_NAME);
     safe_write(&cred_path, &cred).context("failed to save credentials")?;
 
     println!("credential saved");

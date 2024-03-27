@@ -57,7 +57,11 @@ const SESSION_UPLOAD_ALIGN: usize = 320 << 10; // 320KiB
 
 const USER_AGENT: &str = concat!(env!("CARGO_PKG_NAME"), "/", env!("CFG_RELEASE"));
 const XDG_STATE_DIR_NAME: &str = env!("CARGO_PKG_NAME");
-const CREDENTIAL_FILE_NAME: &str = "credential.json";
+/// User's initial refresh token. This is read-only.
+const USER_CREDENTIAL_FILE_NAME: &str = "credential.json";
+/// Auto-refreshed tokens. On starting, this is used instead if it's `init_time` is newer than
+/// `CREDENTIAL_FILE_NAME`'s one.
+const AUTO_CREDENTIAL_FILE_NAME: &str = "credential.auto.json";
 const STATE_FILE_NAME: &str = "state.json";
 
 const GEOMETRY_FILE_NAME: &str = "geometry.json";
@@ -107,9 +111,13 @@ fn default_state_dir() -> PathBuf {
         .join(XDG_STATE_DIR_NAME)
 }
 
+#[serde_inline_default]
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Credential {
+    // For compatibility.
+    #[serde_inline_default(SystemTime::UNIX_EPOCH)]
+    init_time: SystemTime,
     read_write: bool,
     refresh_token: String,
     redirect_uri: String,
@@ -262,18 +270,27 @@ pub fn init(
         .build()
         .context("failed to build reqwest client")?;
 
-    let cred_path = config.state_dir.join(CREDENTIAL_FILE_NAME);
-    let mut cred = (|| -> Result<Credential> {
-        let content = fs::read_to_string(&cred_path)?;
-        Ok(serde_json::from_str(&content)?)
-    })()
-    .context("failed to load credentials, have you manually it setup?")?;
+    let auto_cred_path = config.state_dir.join(AUTO_CREDENTIAL_FILE_NAME);
+    let mut cred = {
+        let user_cred = load_credential(&config.state_dir.join(USER_CREDENTIAL_FILE_NAME))
+            .context("failed to load user credentials, have you manually setup it?")?;
+        match load_credential(&auto_cred_path) {
+            Ok(auto_cred) if auto_cred.init_time == user_cred.init_time => {
+                log::info!("user credentials unchanged, use last auto saved tokens");
+                auto_cred
+            }
+            _ => {
+                log::info!("user credentials changed, use user's new tokens");
+                user_cred
+            }
+        }
+    };
 
     log::info!("logining...");
     let (access_token, _) = rt
         .block_on(cred.login(client.clone()))
         .context("failed to login with saved credential")?;
-    safe_write(&cred_path, &cred).context("failed to update refresh token")?;
+    safe_write(&auto_cred_path, &cred).context("failed to save new refresh token")?;
     let drive =
         OneDrive::new_with_client(client.clone(), access_token.clone(), DriveLocation::me());
 
@@ -382,12 +399,17 @@ pub fn init(
 
     let drive = Arc::new(AutoReloginOnedrive::new(
         cred,
-        cred_path,
+        config.state_dir.clone(),
         client,
         access_token,
     ));
     let remote = Remote::new(drive, config.clone());
     Ok((remote, chunks))
+}
+
+fn load_credential(path: &Path) -> Result<Credential> {
+    let content = fs::read_to_string(path)?;
+    Ok(serde_json::from_str::<Credential>(&content)?)
 }
 
 /// Write to the file with crash safety, and prevent non-owners from reading.
@@ -415,7 +437,7 @@ fn safe_write(path: &Path, data: &impl Serialize) -> Result<()> {
 pub struct AutoReloginOnedrive {
     state: tokio::sync::RwLock<LoginState>,
     client: Client,
-    cred_path: PathBuf,
+    state_dir: PathBuf,
 }
 
 struct LoginState {
@@ -433,7 +455,7 @@ impl fmt::Debug for LoginState {
 }
 
 impl AutoReloginOnedrive {
-    fn new(cred: Credential, cred_path: PathBuf, client: Client, access_token: String) -> Self {
+    fn new(cred: Credential, state_dir: PathBuf, client: Client, access_token: String) -> Self {
         Self {
             state: tokio::sync::RwLock::new(LoginState {
                 tick: 0,
@@ -441,7 +463,7 @@ impl AutoReloginOnedrive {
                 cred,
             }),
             client,
-            cred_path,
+            state_dir,
         }
     }
 
@@ -479,7 +501,6 @@ impl AutoReloginOnedrive {
                     return Err(req_err.into());
                 }
             };
-            let cred_path = self.cred_path.clone();
             let cred = state.cred.clone();
 
             // Update and release the lock before saving.
@@ -487,8 +508,9 @@ impl AutoReloginOnedrive {
             state.tick += 1;
 
             // Spawn non-delimited task for saveing. No ordering is required for it.
+            let auto_cred_path = self.state_dir.join(AUTO_CREDENTIAL_FILE_NAME);
             tokio::task::spawn_blocking(move || {
-                if let Err(save_err) = safe_write(&cred_path, &cred) {
+                if let Err(save_err) = safe_write(&auto_cred_path, &cred) {
                     log::error!("failed to save new refresh token: {save_err}");
                 }
             });
@@ -501,17 +523,23 @@ impl AutoReloginOnedrive {
     }
 
     pub async fn reload(&self) -> Result<()> {
-        let mut cred = (|| -> Result<Credential> {
-            let content = fs::read_to_string(&self.cred_path)?;
-            Ok(serde_json::from_str(&content)?)
-        })()
-        .context("failed to read credentials")?;
-        let (access_token, _) = cred.login(self.client.clone()).await?;
+        let mut user_cred = load_credential(&self.state_dir.join(USER_CREDENTIAL_FILE_NAME))
+            .context("failed to load user credentials")?;
+        let prev_init_time = self.state.read().await.cred.init_time;
+        if user_cred.init_time == prev_init_time {
+            log::info!("user credentials unchanged, do nothing");
+            return Ok(());
+        }
 
+        let (access_token, _) = user_cred.login(self.client.clone()).await?;
+
+        // Here, we may get a different `init_time` if another `reload` racing with us.
+        // But the SIGHUP handler prevents it. And even in racing case, there is no problem because
+        // either access token should be valid.
         let mut state = self.state.write().await;
         state.tick += 1;
         state.access_token = access_token;
-        state.cred = cred;
+        state.cred = user_cred;
         Ok(())
     }
 }
