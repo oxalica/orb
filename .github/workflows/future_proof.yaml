@@ -1,0 +1,68 @@
+name: Future proof tests
+on:
+  schedule:
+    - cron: '6 1 * * 0' # Sun *-*-* 01:06:00 UTC
+
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  RUST_BACKTRACE: full
+
+jobs:
+  outdated:
+    name: Outdated
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Install cargo-outdated
+        uses: dtolnay/install@cargo-outdated
+      - name: cargo-outdated
+        run: |
+          rm Cargo.lock # Ignore trivially updatable compatible versions.
+          cargo outdated --workspace --exit-code 1
+
+  test:
+    strategy:
+      matrix:
+        rust: [beta, nightly]
+    name: Test ${{ matrix.rust }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.rust }}
+      - name: Build
+        run: cargo build --workspace --all-targets
+      # Tests require ublk_drv driver which GitHub Actions do not have.
+      - name: Build Test
+        run: cargo test --workspace --all-targets --no-run
+
+
+  nix-flake-latest:
+    name: Flake package following latest
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Install Nix
+        uses: cachix/install-nix-action@v26
+        with:
+          github_access_token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Flake update
+        # https://github.com/actions/checkout/tree/v3.3.0#push-a-commit-using-the-built-in-token
+        run: |
+          git config user.name github-actions
+          git config user.email github-actions@github.com
+          nix flake update --commit-lock-file
+      - name: Flake check
+        run: nix flake check --no-update-lock-file --show-trace
+      - name: Flake build
+        run: nix build --no-update-lock-file --show-trace --print-build-logs
+

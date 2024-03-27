@@ -1,0 +1,62 @@
+name: CI
+on:
+  pull_request:
+  push:
+
+permissions:
+  contents: read
+
+env:
+  RUST_BACKTRACE: full
+
+jobs:
+  style:
+    name: Code style
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+      - name: cargo fmt
+        run: cargo fmt --all -- --check
+      - name: cargo clippy
+        run: cargo clippy --workspace --all-targets -- -Dwarnings
+      - name: cargo doc
+        run: cargo doc --workspace
+        env:
+          RUSTDOCFLAGS: -Dwarnings
+
+  test:
+    strategy:
+      matrix:
+        rust: [stable, '1.76'] # NB. Sync with Cargo.toml.
+    name: Test ${{ matrix.rust }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.rust }}
+      - name: Build
+        run: cargo build --workspace --all-targets
+      # orb-ublk tests require ublk_drv driver which GitHub Actions do not have.
+      - name: Test
+        run: cargo test --all-targets
+
+  nix-flake:
+    name: Flake package
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Install Nix
+        uses: cachix/install-nix-action@v26
+        with:
+          github_access_token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Flake check
+        run: nix flake check --no-update-lock-file --show-trace
+      - name: Flake build
+        run: nix build --no-update-lock-file --show-trace --print-build-logs
