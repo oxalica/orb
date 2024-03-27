@@ -18,7 +18,7 @@ use rustix::mm;
 use rustix::process::Pid;
 
 use crate::runtime::{AsyncRuntime, AsyncRuntimeBuilder, AsyncScopeSpawner};
-use crate::Sector;
+use crate::{sys, Sector};
 
 // This is mentioned in docs of `DeviceAttrs::io_max_sectors`.
 const DEFAULT_IO_BUF_SIZE: u32 = 512 << 10;
@@ -28,50 +28,45 @@ pub const BDEV_PREFIX: &str = "/dev/ublkb";
 
 const DEV_ID_AUTO: u32 = !0;
 
-#[allow(warnings)]
-#[rustfmt::skip]
-#[path = "./sys.rs"]
-mod binding;
-
 bitflags::bitflags! {
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub struct FeatureFlags: u64 {
-        const SupportZeroCopy = binding::UBLK_F_SUPPORT_ZERO_COPY as u64;
-        const UringCmdCompInTask = binding::UBLK_F_URING_CMD_COMP_IN_TASK as u64;
-        const NeedGetData = binding::UBLK_F_NEED_GET_DATA as u64;
-        const UserRecovery = binding::UBLK_F_USER_RECOVERY as u64;
-        const UserRecoveryReissue = binding::UBLK_F_USER_RECOVERY_REISSUE as u64;
-        const UnprivilegedDev = binding::UBLK_F_UNPRIVILEGED_DEV as u64;
-        const CmdIoctlEncode = binding::UBLK_F_CMD_IOCTL_ENCODE as u64;
-        const UserCopy = binding::UBLK_F_USER_COPY as u64;
-        const Zoned = binding::UBLK_F_ZONED as u64;
+        const SupportZeroCopy = sys::UBLK_F_SUPPORT_ZERO_COPY as u64;
+        const UringCmdCompInTask = sys::UBLK_F_URING_CMD_COMP_IN_TASK as u64;
+        const NeedGetData = sys::UBLK_F_NEED_GET_DATA as u64;
+        const UserRecovery = sys::UBLK_F_USER_RECOVERY as u64;
+        const UserRecoveryReissue = sys::UBLK_F_USER_RECOVERY_REISSUE as u64;
+        const UnprivilegedDev = sys::UBLK_F_UNPRIVILEGED_DEV as u64;
+        const CmdIoctlEncode = sys::UBLK_F_CMD_IOCTL_ENCODE as u64;
+        const UserCopy = sys::UBLK_F_USER_COPY as u64;
+        const Zoned = sys::UBLK_F_ZONED as u64;
     }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     struct DeviceParamsType: u32 {
-        const Basic = binding::UBLK_PARAM_TYPE_BASIC;
-        const Discard = binding::UBLK_PARAM_TYPE_DISCARD;
-        const Devt = binding::UBLK_PARAM_TYPE_DEVT;
-        const Zoned = binding::UBLK_PARAM_TYPE_ZONED;
+        const Basic = sys::UBLK_PARAM_TYPE_BASIC;
+        const Discard = sys::UBLK_PARAM_TYPE_DISCARD;
+        const Devt = sys::UBLK_PARAM_TYPE_DEVT;
+        const Zoned = sys::UBLK_PARAM_TYPE_ZONED;
     }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub struct DeviceAttrs: u32 {
-        const ReadOnly =  binding::UBLK_ATTR_READ_ONLY;
-        const Rotational = binding::UBLK_ATTR_ROTATIONAL;
-        const VolatileCache = binding::UBLK_ATTR_VOLATILE_CACHE;
-        const Fua = binding::UBLK_ATTR_FUA;
+        const ReadOnly =  sys::UBLK_ATTR_READ_ONLY;
+        const Rotational = sys::UBLK_ATTR_ROTATIONAL;
+        const VolatileCache = sys::UBLK_ATTR_VOLATILE_CACHE;
+        const Fua = sys::UBLK_ATTR_FUA;
     }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub struct IoFlags: u32 {
-        const FailfastDev = binding::UBLK_IO_F_FAILFAST_DEV;
-        const FailfastTransport = binding::UBLK_IO_F_FAILFAST_TRANSPORT;
-        const FailfastDriver = binding::UBLK_IO_F_FAILFAST_DRIVER;
-        const Meta = binding::UBLK_IO_F_META;
-        const Fua = binding::UBLK_IO_F_FUA;
-        const Nounmap = binding::UBLK_IO_F_NOUNMAP;
-        const Swap = binding::UBLK_IO_F_SWAP;
+        const FailfastDev = sys::UBLK_IO_F_FAILFAST_DEV;
+        const FailfastTransport = sys::UBLK_IO_F_FAILFAST_TRANSPORT;
+        const FailfastDriver = sys::UBLK_IO_F_FAILFAST_DRIVER;
+        const Meta = sys::UBLK_IO_F_META;
+        const Fua = sys::UBLK_IO_F_FUA;
+        const Nounmap = sys::UBLK_IO_F_NOUNMAP;
+        const Swap = sys::UBLK_IO_F_SWAP;
     }
 }
 
@@ -114,7 +109,7 @@ impl fmt::Debug for ControlDevice {
 #[repr(C)]
 union CtrlCmdBuf {
     cmd: [u8; 80],
-    data: binding::ublksrv_ctrl_cmd,
+    data: sys::ublksrv_ctrl_cmd,
 }
 
 impl ControlDevice {
@@ -140,7 +135,7 @@ impl ControlDevice {
         ioctl_op: u32,
         dev_id: u32,
         buf: T,
-        mut cmd: binding::ublksrv_ctrl_cmd,
+        mut cmd: sys::ublksrv_ctrl_cmd,
     ) -> io::Result<T> {
         #[repr(C)]
         struct Payload<T>(CdevPath, T);
@@ -160,7 +155,7 @@ impl ControlDevice {
         &self,
         ioctl_op: u32,
         mut buf: T,
-        mut cmd: binding::ublksrv_ctrl_cmd,
+        mut cmd: sys::ublksrv_ctrl_cmd,
     ) -> io::Result<T> {
         cmd.addr = ptr::addr_of_mut!(buf) as _;
         cmd.len = mem::size_of::<T>() as _;
@@ -202,7 +197,7 @@ impl ControlDevice {
     pub fn get_features(&self) -> io::Result<FeatureFlags> {
         // SAFETY: Valid uring_cmd.
         unsafe {
-            self.execute_ctrl_cmd(binding::UBLK_U_CMD_GET_FEATURES, 0u64, Default::default())
+            self.execute_ctrl_cmd(sys::UBLK_U_CMD_GET_FEATURES, 0u64, Default::default())
                 .map(FeatureFlags::from_bits_truncate)
         }
     }
@@ -210,10 +205,10 @@ impl ControlDevice {
     pub fn get_device_info(&self, dev_id: u32) -> io::Result<DeviceInfo> {
         // SAFETY: Valid uring_cmd.
         unsafe {
-            self.execute_ctrl_cmd_opt_cdev::<binding::ublksrv_ctrl_dev_info>(
+            self.execute_ctrl_cmd_opt_cdev::<sys::ublksrv_ctrl_dev_info>(
                 // Always include cdev_path.
                 true,
-                binding::UBLK_U_CMD_GET_DEV_INFO2,
+                sys::UBLK_U_CMD_GET_DEV_INFO2,
                 dev_id,
                 mem::zeroed(),
                 Default::default(),
@@ -233,8 +228,8 @@ impl ControlDevice {
         // SAFETY: Valid uring_cmd.
         unsafe {
             self.execute_ctrl_cmd(
-                binding::UBLK_U_CMD_ADD_DEV,
-                binding::ublksrv_ctrl_dev_info {
+                sys::UBLK_U_CMD_ADD_DEV,
+                sys::ublksrv_ctrl_dev_info {
                     nr_hw_queues: builder.nr_hw_queues,
                     queue_depth: builder.queue_depth,
                     max_io_buf_bytes: builder.io_buf_bytes,
@@ -249,7 +244,7 @@ impl ControlDevice {
                     owner_gid: 0,
                     ..Default::default()
                 },
-                binding::ublksrv_ctrl_cmd {
+                sys::ublksrv_ctrl_cmd {
                     queue_id: !0,
                     dev_id,
                     ..Default::default()
@@ -266,7 +261,7 @@ impl ControlDevice {
             self.execute_ctrl_cmd_opt_cdev(
                 // Carries no data, so just pass cdev_path anyway.
                 true,
-                binding::UBLK_U_CMD_DEL_DEV,
+                sys::UBLK_U_CMD_DEL_DEV,
                 dev_id,
                 [0u8; 0],
                 Default::default(),
@@ -285,10 +280,10 @@ impl ControlDevice {
             self.execute_ctrl_cmd_opt_cdev(
                 // Carries no data, so just pass cdev_path anyway.
                 true,
-                binding::UBLK_U_CMD_START_DEV,
+                sys::UBLK_U_CMD_START_DEV,
                 dev_id,
                 [0u8; 0],
-                binding::ublksrv_ctrl_cmd {
+                sys::ublksrv_ctrl_cmd {
                     data: [pid],
                     ..Default::default()
                 },
@@ -312,7 +307,7 @@ impl ControlDevice {
         let pid = pid.as_raw_nonzero().get().try_into().unwrap();
         let mut cmd_buf = CtrlCmdBuf { cmd: [0; 80] };
         // This ioctl carries no data, thus the layout the same for {un,}privileged devices.
-        cmd_buf.data = binding::ublksrv_ctrl_cmd {
+        cmd_buf.data = sys::ublksrv_ctrl_cmd {
             dev_id,
             len: CdevPath::MAX_LEN as _,
             dev_path_len: CdevPath::MAX_LEN as _,
@@ -322,7 +317,7 @@ impl ControlDevice {
         };
         log::trace!("start device {dev_id} on pid {pid}");
 
-        let sqe = opcode::UringCmd80::new(Fd(self.fd.as_raw_fd()), binding::UBLK_U_CMD_START_DEV)
+        let sqe = opcode::UringCmd80::new(Fd(self.fd.as_raw_fd()), sys::UBLK_U_CMD_START_DEV)
             .cmd(cmd_buf.cmd)
             .build();
         // SAFETY: Single-threaded and it is a valid uring_cmd.
@@ -338,7 +333,7 @@ impl ControlDevice {
             self.execute_ctrl_cmd_opt_cdev(
                 // Carries no data, so just pass cdev_path anyway.
                 true,
-                binding::UBLK_U_CMD_STOP_DEV,
+                sys::UBLK_U_CMD_STOP_DEV,
                 dev_id,
                 [0u8; 0],
                 Default::default(),
@@ -356,9 +351,9 @@ impl ControlDevice {
         log::trace!("set parameters of device {dev_id} to {params:?}");
         // SAFETY: Valid uring_cmd.
         unsafe {
-            self.execute_ctrl_cmd_opt_cdev::<binding::ublk_params>(
+            self.execute_ctrl_cmd_opt_cdev::<sys::ublk_params>(
                 unprivileged,
-                binding::UBLK_U_CMD_SET_PARAMS,
+                sys::UBLK_U_CMD_SET_PARAMS,
                 dev_id,
                 params.build(),
                 Default::default(),
@@ -436,7 +431,7 @@ impl DeviceBuilder {
     ///
     /// Panic if `nr_hw_queues` is zero or exceeds `UBLK_QID_BITS` bits, which is `1 << 12 = 4096`.
     pub fn queues(&mut self, nr_hw_queues: u16) -> &mut Self {
-        assert!((1..=(1 << binding::UBLK_QID_BITS)).contains(&nr_hw_queues));
+        assert!((1..=(1 << sys::UBLK_QID_BITS)).contains(&nr_hw_queues));
         self.nr_hw_queues = nr_hw_queues;
         self
     }
@@ -445,7 +440,7 @@ impl DeviceBuilder {
     ///
     /// Panic if `queue_depth` is zero or exceeds `UBLK_MAX_QUEUE_DEPTH` which is 4096.
     pub fn queue_depth(&mut self, queue_depth: u16) -> &mut Self {
-        assert!((1..=binding::UBLK_MAX_QUEUE_DEPTH as u16).contains(&queue_depth));
+        assert!((1..=sys::UBLK_MAX_QUEUE_DEPTH as u16).contains(&queue_depth));
         self.queue_depth = queue_depth;
         self
     }
@@ -454,7 +449,7 @@ impl DeviceBuilder {
     ///
     /// Panic if `bytes` exceeds `UBLK_IO_BUF_BITS` bits, which is `1 << 25` bytes or 32MiB.
     pub fn io_buf_size(&mut self, bytes: u32) -> &mut Self {
-        assert!((1..=(1 << binding::UBLK_IO_BUF_BITS)).contains(&bytes));
+        assert!((1..=(1 << sys::UBLK_IO_BUF_BITS)).contains(&bytes));
         self.io_buf_bytes = bytes;
         self
     }
@@ -543,7 +538,7 @@ impl DeviceBuilder {
 }
 
 #[derive(Clone, Copy)]
-pub struct DeviceInfo(binding::ublksrv_ctrl_dev_info);
+pub struct DeviceInfo(sys::ublksrv_ctrl_dev_info);
 
 impl fmt::Debug for DeviceInfo {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -565,9 +560,9 @@ impl fmt::Debug for DeviceInfo {
 #[non_exhaustive]
 #[repr(u8)]
 pub enum DevState {
-    Dead = binding::UBLK_S_DEV_DEAD as _,
-    Live = binding::UBLK_S_DEV_LIVE as _,
-    Quiesced = binding::UBLK_S_DEV_QUIESCED as _,
+    Dead = sys::UBLK_S_DEV_DEAD as _,
+    Live = sys::UBLK_S_DEV_LIVE as _,
+    Quiesced = sys::UBLK_S_DEV_QUIESCED as _,
     #[doc(hidden)]
     Unknown(u16),
 }
@@ -575,9 +570,9 @@ pub enum DevState {
 impl DevState {
     fn into_raw(self) -> u16 {
         match self {
-            DevState::Dead => binding::UBLK_S_DEV_DEAD as _,
-            DevState::Live => binding::UBLK_S_DEV_LIVE as _,
-            DevState::Quiesced => binding::UBLK_S_DEV_QUIESCED as _,
+            DevState::Dead => sys::UBLK_S_DEV_DEAD as _,
+            DevState::Live => sys::UBLK_S_DEV_LIVE as _,
+            DevState::Quiesced => sys::UBLK_S_DEV_QUIESCED as _,
             DevState::Unknown(x) => x,
         }
     }
@@ -597,9 +592,9 @@ impl DeviceInfo {
     #[must_use]
     pub fn state(&self) -> DevState {
         match self.0.state.into() {
-            binding::UBLK_S_DEV_DEAD => DevState::Dead,
-            binding::UBLK_S_DEV_LIVE => DevState::Live,
-            binding::UBLK_S_DEV_QUIESCED => DevState::Quiesced,
+            sys::UBLK_S_DEV_DEAD => DevState::Dead,
+            sys::UBLK_S_DEV_LIVE => DevState::Live,
+            sys::UBLK_S_DEV_QUIESCED => DevState::Quiesced,
             _ => DevState::Unknown(self.0.state),
         }
     }
@@ -621,7 +616,7 @@ impl DeviceInfo {
 }
 
 #[derive(Debug)]
-struct IoDescShm(NonNull<[binding::ublksrv_io_desc]>);
+struct IoDescShm(NonNull<[sys::ublksrv_io_desc]>);
 
 impl Drop for IoDescShm {
     fn drop(&mut self) {
@@ -633,18 +628,18 @@ impl Drop for IoDescShm {
 
 impl IoDescShm {
     fn new(cdev: BorrowedFd<'_>, dev_info: &DeviceInfo, thread_id: u16) -> io::Result<Self> {
-        let off = u64::try_from(mem::size_of::<binding::ublksrv_io_desc>())
+        let off = u64::try_from(mem::size_of::<sys::ublksrv_io_desc>())
             .unwrap()
-            .checked_mul(binding::UBLK_MAX_QUEUE_DEPTH.into())
+            .checked_mul(sys::UBLK_MAX_QUEUE_DEPTH.into())
             .unwrap()
             .checked_mul(thread_id.into())
             .unwrap()
-            .checked_add(binding::UBLKSRV_CMD_BUF_OFFSET.into())
+            .checked_add(sys::UBLKSRV_CMD_BUF_OFFSET.into())
             .unwrap();
 
         assert_ne!(dev_info.queue_depth(), 0);
         // `m{,un}map` will pad the length to the multiple of pages automatically.
-        let size = mem::size_of::<binding::ublksrv_io_desc>()
+        let size = mem::size_of::<sys::ublksrv_io_desc>()
             .checked_mul(dev_info.queue_depth().into())
             .unwrap();
 
@@ -659,13 +654,13 @@ impl IoDescShm {
             )?
         };
         let ptr = NonNull::slice_from_raw_parts(
-            NonNull::new(ptr.cast::<binding::ublksrv_io_desc>()).unwrap(),
+            NonNull::new(ptr.cast::<sys::ublksrv_io_desc>()).unwrap(),
             dev_info.queue_depth().into(),
         );
         Ok(IoDescShm(ptr))
     }
 
-    fn get(&self, tag: u16) -> binding::ublksrv_io_desc {
+    fn get(&self, tag: u16) -> sys::ublksrv_io_desc {
         unsafe { self.0.as_ref()[tag as usize] }
     }
 }
@@ -1079,23 +1074,23 @@ impl<'r, B: BlockDevice, R: AsyncRuntime + 'r> IoWorker<'_, 'r, B, R> {
 
         let refill_sqe =
             |sq: &mut SubmissionQueue<'_>, i: u16, result: Option<i32>, zone_append_lba: u64| {
-                let cmd = binding::ublksrv_io_cmd {
+                let cmd = sys::ublksrv_io_cmd {
                     q_id: self.thread_id,
                     tag: i,
                     result: result.unwrap_or(-1),
                     __bindgen_anon_1: match &io_bufs {
-                        Some(bufs) => binding::ublksrv_io_cmd__bindgen_ty_1 {
+                        Some(bufs) => sys::ublksrv_io_cmd__bindgen_ty_1 {
                             addr: bufs.get(i.into()).as_ptr().cast::<u8>() as _,
                         },
                         // If this is not ZONE_APPEND, this is zero and has the same repr as
                         // `{ addr: 0 }`, which is expected by the driver.
-                        None => binding::ublksrv_io_cmd__bindgen_ty_1 { zone_append_lba },
+                        None => sys::ublksrv_io_cmd__bindgen_ty_1 { zone_append_lba },
                     },
                 };
                 let cmd_op = if result.is_some() {
-                    binding::UBLK_IO_COMMIT_AND_FETCH_REQ
+                    sys::UBLK_IO_COMMIT_AND_FETCH_REQ
                 } else {
-                    binding::UBLK_IO_FETCH_REQ
+                    sys::UBLK_IO_FETCH_REQ
                 };
                 let sqe = opcode::UringCmd16::new(CDEV_FIXED_FD, cmd_op)
                     .cmd(unsafe { mem::transmute(cmd) })
@@ -1203,9 +1198,9 @@ impl<'r, B: BlockDevice, R: AsyncRuntime + 'r> IoWorker<'_, 'r, B, R> {
                 let zones = unsafe { iod.__bindgen_anon_1.nr_zones };
                 let len = unsafe { iod.__bindgen_anon_1.nr_sectors as usize }
                     .wrapping_mul(Sector::SIZE as usize);
-                let pwrite_off = u64::from(binding::UBLKSRV_IO_BUF_OFFSET)
-                    + (u64::from(self.thread_id) << binding::UBLK_QID_OFF)
-                    + (u64::from(tag) << binding::UBLK_TAG_OFF);
+                let pwrite_off = u64::from(sys::UBLKSRV_IO_BUF_OFFSET)
+                    + (u64::from(self.thread_id) << sys::UBLK_QID_OFF)
+                    + (u64::from(tag) << sys::UBLK_TAG_OFF);
                 let get_buf = || {
                     match &io_bufs {
                         // SAFETY: This buffer is exclusive for task of `tag`.
@@ -1241,7 +1236,7 @@ impl<'r, B: BlockDevice, R: AsyncRuntime + 'r> IoWorker<'_, 'r, B, R> {
                 }
 
                 match iod.op_flags & 0xFF {
-                    binding::UBLK_IO_OP_READ => {
+                    sys::UBLK_IO_OP_READ => {
                         log::trace!("READ offset={off} len={len} flags={flags:?}");
                         let mut buf = ReadBuf(get_buf(), PhantomData);
                         spawn!(h.read(off, &mut buf, flags).await.map(|()| {
@@ -1251,26 +1246,26 @@ impl<'r, B: BlockDevice, R: AsyncRuntime + 'r> IoWorker<'_, 'r, B, R> {
                             (read, 0)
                         }));
                     }
-                    binding::UBLK_IO_OP_WRITE => {
+                    sys::UBLK_IO_OP_WRITE => {
                         log::trace!("WRITE offset={off} len={len} flags={flags:?}");
                         let buf = WriteBuf(get_buf(), PhantomData);
                         spawn!(h.write(off, buf, flags).await.inspect(|&written| {
                             assert!(written <= len, "invalid written amount");
                         }));
                     }
-                    binding::UBLK_IO_OP_FLUSH => {
+                    sys::UBLK_IO_OP_FLUSH => {
                         log::trace!("FLUSH flags={flags:?}");
                         spawn!(h.flush(flags).await);
                     }
-                    binding::UBLK_IO_OP_DISCARD => {
+                    sys::UBLK_IO_OP_DISCARD => {
                         log::trace!("DISCARD offset={off} len={len} flags={flags:?}");
                         spawn!(h.discard(off, len, flags).await);
                     }
-                    binding::UBLK_IO_OP_WRITE_ZEROES => {
+                    sys::UBLK_IO_OP_WRITE_ZEROES => {
                         log::trace!("WRITE_ZEROES offset={off} len={len} flags={flags:?}");
                         spawn!(h.write_zeroes(off, len, flags).await);
                     }
-                    binding::UBLK_IO_OP_REPORT_ZONES => {
+                    sys::UBLK_IO_OP_REPORT_ZONES => {
                         log::trace!("REPORT_ZONES offset={off} zones={zones} flags={flags:?}");
                         let mut buf = ZoneBuf {
                             cdev: self.cdev,
@@ -1287,28 +1282,28 @@ impl<'r, B: BlockDevice, R: AsyncRuntime + 'r> IoWorker<'_, 'r, B, R> {
                             (written, 0)
                         }));
                     }
-                    binding::UBLK_IO_OP_ZONE_APPEND => {
+                    sys::UBLK_IO_OP_ZONE_APPEND => {
                         log::trace!("ZONE_APPEND offset={off} len={len} flags={flags:?}");
                         let buf = WriteBuf(get_buf(), PhantomData);
                         spawn!(h.zone_append(off, buf, flags).await.map(|lba| (0, lba.0)));
                     }
-                    binding::UBLK_IO_OP_ZONE_OPEN => {
+                    sys::UBLK_IO_OP_ZONE_OPEN => {
                         log::trace!("ZONE_OPEN offset={off} flags={flags:?}");
                         spawn!(h.zone_open(off, flags).await);
                     }
-                    binding::UBLK_IO_OP_ZONE_CLOSE => {
+                    sys::UBLK_IO_OP_ZONE_CLOSE => {
                         log::trace!("ZONE_CLOSE offset={off} flags={flags:?}");
                         spawn!(h.zone_close(off, flags).await);
                     }
-                    binding::UBLK_IO_OP_ZONE_FINISH => {
+                    sys::UBLK_IO_OP_ZONE_FINISH => {
                         log::trace!("ZONE_FINISH offset={off} flags={flags:?}");
                         spawn!(h.zone_finish(off, flags).await);
                     }
-                    binding::UBLK_IO_OP_ZONE_RESET => {
+                    sys::UBLK_IO_OP_ZONE_RESET => {
                         log::trace!("ZONE_RESET offset={off} flags={flags:?}");
                         spawn!(h.zone_reset(off, flags).await);
                     }
-                    binding::UBLK_IO_OP_ZONE_RESET_ALL => {
+                    sys::UBLK_IO_OP_ZONE_RESET_ALL => {
                         log::trace!("ZONE_RESET_ALL flags={flags:?}");
                         spawn!(h.zone_reset_all(flags).await);
                     }
@@ -1509,15 +1504,15 @@ pub struct ZonedParams {
 }
 
 impl DeviceParams {
-    fn build(&self) -> binding::ublk_params {
+    fn build(&self) -> sys::ublk_params {
         let mut attrs = DeviceParamsType::Basic;
         attrs.set(DeviceParamsType::Discard, self.discard.is_some());
         attrs.set(DeviceParamsType::Zoned, self.zoned.is_some());
 
-        binding::ublk_params {
-            len: mem::size_of::<binding::ublk_params>() as _,
+        sys::ublk_params {
+            len: mem::size_of::<sys::ublk_params>() as _,
             types: attrs.bits(),
-            basic: binding::ublk_param_basic {
+            basic: sys::ublk_param_basic {
                 attrs: self.attrs.bits(),
                 logical_bs_shift: self.logical_block_shift,
                 physical_bs_shift: self.physical_block_shift,
@@ -1530,7 +1525,7 @@ impl DeviceParams {
             },
             discard: self
                 .discard
-                .map_or(Default::default(), |p| binding::ublk_param_discard {
+                .map_or(Default::default(), |p| sys::ublk_param_discard {
                     discard_alignment: p.alignment,
                     discard_granularity: p.granularity,
                     max_discard_sectors: p.max_size.0.try_into().unwrap(),
@@ -1540,7 +1535,7 @@ impl DeviceParams {
                 }),
             zoned: self
                 .zoned
-                .map_or(Default::default(), |p| binding::ublk_param_zoned {
+                .map_or(Default::default(), |p| sys::ublk_param_zoned {
                     max_open_zones: p.max_open_zones,
                     max_active_zones: p.max_active_zones,
                     max_zone_append_sectors: p.max_zone_append_size.0.try_into().unwrap(),
@@ -1559,7 +1554,7 @@ impl DeviceParams {
 /// See: <https://elixir.bootlin.com/linux/v6.7/source/include/uapi/linux/blkzoned.h#L85>
 #[derive(Clone, Copy, PartialEq, Eq)]
 #[repr(transparent)]
-pub struct Zone(binding::blk_zone);
+pub struct Zone(sys::blk_zone);
 
 impl fmt::Debug for Zone {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -1582,7 +1577,7 @@ impl Zone {
         type_: ZoneType,
         cond: ZoneCond,
     ) -> Self {
-        Self(binding::blk_zone {
+        Self(sys::blk_zone {
             start: start.0,
             len: len.0,
             wp: start.0 + rel_write_pointer.0,
@@ -1640,11 +1635,11 @@ impl Zone {
 pub enum ZoneType {
     /// The zone has no write pointer and can be writen randomly. Zone reset has no effect on the
     /// zone.
-    Conventional = binding::BLK_ZONE_TYPE_CONVENTIONAL as u8,
+    Conventional = sys::BLK_ZONE_TYPE_CONVENTIONAL as u8,
     /// The zone must be written sequentially.
-    SeqWriteReq = binding::BLK_ZONE_TYPE_SEQWRITE_REQ as u8,
+    SeqWriteReq = sys::BLK_ZONE_TYPE_SEQWRITE_REQ as u8,
     /// The zone can be written non-sequentially.
-    SeqWritePref = binding::BLK_ZONE_TYPE_SEQWRITE_PREF as u8,
+    SeqWritePref = sys::BLK_ZONE_TYPE_SEQWRITE_PREF as u8,
 }
 
 /// Condition/state of a zone in a zoned device.
@@ -1656,21 +1651,21 @@ pub enum ZoneType {
 #[repr(u8)]
 pub enum ZoneCond {
     /// The zone has no write pointer, it is conventional.
-    NotWp = binding::BLK_ZONE_COND_NOT_WP as u8,
+    NotWp = sys::BLK_ZONE_COND_NOT_WP as u8,
     /// The zone is empty.
-    Empty = binding::BLK_ZONE_COND_EMPTY as u8,
+    Empty = sys::BLK_ZONE_COND_EMPTY as u8,
     /// The zone is open, but not explicitly opened.
-    ImpOpen = binding::BLK_ZONE_COND_IMP_OPEN as u8,
+    ImpOpen = sys::BLK_ZONE_COND_IMP_OPEN as u8,
     /// The zones was explicitly opened by an OPEN ZONE command.
-    ExpOpen = binding::BLK_ZONE_COND_EXP_OPEN as u8,
+    ExpOpen = sys::BLK_ZONE_COND_EXP_OPEN as u8,
     /// The zone was *explicitly* closed after writing.
-    Closed = binding::BLK_ZONE_COND_CLOSED as u8,
+    Closed = sys::BLK_ZONE_COND_CLOSED as u8,
     /// The zone is marked as full, possibly by a zone FINISH ZONE command.
-    Full = binding::BLK_ZONE_COND_FULL as u8,
+    Full = sys::BLK_ZONE_COND_FULL as u8,
     /// The zone is read-only.
-    Readonly = binding::BLK_ZONE_COND_READONLY as u8,
+    Readonly = sys::BLK_ZONE_COND_READONLY as u8,
     /// The zone is offline (sectors cannot be read/written).
-    Offline = binding::BLK_ZONE_COND_OFFLINE as u8,
+    Offline = sys::BLK_ZONE_COND_OFFLINE as u8,
 }
 
 trait IntoCResult {
