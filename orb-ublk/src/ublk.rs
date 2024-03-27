@@ -13,6 +13,7 @@ use io_uring::types::{Fd, Fixed};
 use io_uring::{cqueue, opcode, squeue, IoUring, SubmissionQueue};
 use rustix::event::{EventfdFlags, PollFd, PollFlags};
 use rustix::fd::{AsFd, AsRawFd, OwnedFd};
+use rustix::fs::{Gid, Uid};
 use rustix::io::Errno;
 use rustix::mm;
 use rustix::process::Pid;
@@ -612,6 +613,18 @@ impl DeviceInfo {
     #[must_use]
     pub fn flags(&self) -> FeatureFlags {
         FeatureFlags::from_bits_truncate(self.0.flags)
+    }
+
+    #[must_use]
+    pub fn owner_uid(&self) -> Uid {
+        // SAFETY: Retrieved from kernel.
+        unsafe { Uid::from_raw(self.0.owner_uid) }
+    }
+
+    #[must_use]
+    pub fn owner_gid(&self) -> Gid {
+        // SAFETY: Retrieved from kernel.
+        unsafe { Gid::from_raw(self.0.owner_gid) }
     }
 }
 

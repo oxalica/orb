@@ -14,7 +14,7 @@ bitflags = "2.4.2"
 derive_more = "0.99"
 io-uring = { version = "0.6.2", features = ["io_safety"] }
 log = "0.4.20"
-rustix = { version = "0.38.30", features = ["event", "mm", "process"] }
+rustix = { version = "0.38.30", features = ["event", "fs", "mm", "process"] }
 scopeguard = "1.2.0"
 strum = { version = "0.26", features = ["derive"] }
 tokio = { version = "1.35.1", features = ["net", "rt"] }

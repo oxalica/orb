@@ -51,6 +51,34 @@ rec {
           platforms = lib.platforms.linux;
         };
       };
+
+      ublk-chown-unprivileged = with pkgs; rustPlatform.buildRustPackage {
+        pname = "ublk-chown-unprivileged";
+        version = "git-${rev}";
+        src = self;
+
+        cargoLock.lockFile = ./Cargo.lock;
+
+        buildAndTestSubdir = "orb-ublk";
+        cargoBuildFlags = [ "--example=ublk-chown-unprivileged" ];
+
+        # Tests require ublk_drv.
+        doCheck = false;
+
+        postInstall = ''
+          install -Dm755 -t $out/libexec target/*/release/examples/ublk-chown-unprivileged
+          mkdir -p $out/etc/udev/rules.d
+          substitute ./orb-ublk/19-ublk-unprivileged.example.rules $out/etc/udev/rules.d/19-ublk-unprivileged.rules \
+            --replace-fail '/usr/libexec/' "$out/libexec/"
+        '';
+
+        meta = {
+          description = "udev rules to enable unprivileged ublk usage";
+          homepage = "https://github.com/oxalica/orb";
+          license = with lib.licenses; [ mit asl20 ];
+          platforms = lib.platforms.linux;
+        };
+      };
     });
 
     devShells = eachSystem (system: {

@@ -1,0 +1,2 @@
+KERNEL=="ublk-control", MODE="0666", OPTIONS+="static_node=ublk-control"
+ACTION=="add",KERNEL=="ublk[bc]*",RUN+="/usr/libexec/ublk-chown-unprivileged %k"
