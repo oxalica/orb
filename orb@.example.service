@@ -9,7 +9,11 @@ ExecStart=/usr/bin/orb serve --config-file "${CONFIGURATION_DIRECTORY}/%i.toml"
 StateDirectory="orb/%i"
 StateDirectoryMode=0700
 ConfigurationDirectory=orb
-Environment="RUST_BACKTRACE=1"
+# Save debug dumps in the cache directory, unified, because they have timestamp
+# suffixes. TMPDIR is otherwise readonly because of PrivateTmp.
+CacheDirectory=orb
+CacheDirectoryMode=0700
+Environment="RUST_BACKTRACE=1" "TMPDIR=%C/orb"
 
 CapabilityBoundingSet=CAP_SYS_ADMIN CAP_SYS_RESOURCE
 DeviceAllow=/dev/ublk-control rw
@@ -17,7 +21,7 @@ DeviceAllow=char-ublk-char rw
 LockPersonality=yes
 MemoryDenyWriteExecute=yes
 NoNewPrivileges=yes
-# PrivateTmp=yes # Temp dir is used for debug dump on SIGUSR1.
+PrivateTmp=yes
 ProtectClock=yes
 ProtectControlGroups=yes
 ProtectHome=yes

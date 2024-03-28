@@ -188,8 +188,12 @@ fn serve<B: orb::service::Backend + Debug>(
                             .open(&path)
                             .and_then(|mut f| f.write_all(debug_out.as_bytes()));
                         match ret {
-                            Ok(()) => log::warn!("debug dump saved at: {}", path.display()),
-                            Err(err) => log::error!("failed to save debug dump: {err}"),
+                            Ok(()) => log::warn!("debug dump saved at {}", path.display()),
+                            Err(err) => log::error!(
+                                "failed to save debug dump to {}: {}",
+                                path.display(),
+                                err,
+                            ),
                         }
                     });
                 }
