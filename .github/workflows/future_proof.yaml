@@ -42,7 +42,7 @@ jobs:
           toolchain: ${{ matrix.rust }}
       - name: Build
         run: cargo build --workspace --all-targets
-      # Tests require ublk_drv driver which GitHub Actions do not have.
+      # orb-ublk tests hang for unknow reasons.
       - name: Build Test
         run: cargo test --workspace --all-targets --no-run
 
