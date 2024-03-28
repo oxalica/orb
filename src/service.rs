@@ -71,7 +71,7 @@ pub trait Backend: Send + Sync + 'static {
         coff: u32,
         data: Bytes,
     ) -> impl Future<Output = Result<()>> + Send + '_;
-    fn delete_zone(&self, zid: u64) -> impl Future<Output = Result<()>> + Send + '_;
+    fn delete_zone(&self, zid: u32) -> impl Future<Output = Result<()>> + Send + '_;
     fn delete_all_zones(&self) -> impl Future<Output = Result<()>> + Send + '_;
 }
 
@@ -150,6 +150,15 @@ impl Config {
 
 type OnReady = Box<dyn FnOnce(&DeviceInfo, Stopper) -> io::Result<()> + Send>;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+struct Zid(u32);
+
+impl fmt::Display for Zid {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
 /// TODO: Improve concurrency.
 pub struct Frontend<B, const LOGICAL_SECTOR_SIZE: u32 = { Sector::SIZE }> {
     config: Config,
@@ -159,7 +168,7 @@ pub struct Frontend<B, const LOGICAL_SECTOR_SIZE: u32 = { Sector::SIZE }> {
     /// See docs of `DownloadStream`.
     streams: Mutex<LruCache<u64, DownloadStream>>,
     zones: Box<[Zone]>,
-    dirty_zones: Mutex<BTreeSet<u32>>,
+    dirty_zones: Mutex<BTreeSet<Zid>>,
     /// The global write fence for exclusive write operations (RESET_ALL) or synchronization
     /// (FLUSH). All remote modification holds a read-guard of this lock.
     exclusive_write_fence: tokio::sync::RwLock<()>,
@@ -391,10 +400,7 @@ impl<B: Backend, const LOGICAL_SECTOR_SIZE: u32> Frontend<B, LOGICAL_SECTOR_SIZE
                             global_off == expect_global_off,
                             "offset not continous, expected to be {expect_global_off}",
                         );
-                        ensure!(
-                            *coff as u64 % LOGICAL_SECTOR_SIZE as u64 == 0,
-                            "offset not aligned",
-                        );
+                        ensure!(*coff % LOGICAL_SECTOR_SIZE == 0, "offset not aligned",);
                         ensure!(len != 0, "chunk is empty");
                         *coff = u64::from(*coff)
                             .checked_add(len)
@@ -473,7 +479,7 @@ impl<B: Backend, const LOGICAL_SECTOR_SIZE: u32> Frontend<B, LOGICAL_SECTOR_SIZE
         let mut params = DeviceParams::new();
         params
             .dev_sectors(self.config.dev_secs)
-            .logical_block_size(LOGICAL_SECTOR_SIZE as u64)
+            .logical_block_size(LOGICAL_SECTOR_SIZE.into())
             // XXX: Chunks should have a 2^k alignment.
             // .physical_block_size(self.config.min_chunk_size.bytes())
             // .io_min_size(self.config.min_chunk_size.bytes())
@@ -490,28 +496,32 @@ impl<B: Backend, const LOGICAL_SECTOR_SIZE: u32> Frontend<B, LOGICAL_SECTOR_SIZE
         params
     }
 
-    fn to_zone_id(&self, off: Sector) -> Result<usize, Errno> {
-        usize::try_from(off / self.config.zone_secs)
-            .ok()
-            .filter(|&zid| zid < self.zones.len())
-            .ok_or_else(|| {
-                log::error!("invalid offset {off}");
-                Errno::INVAL
-            })
+    fn zone(&self, zid: Zid) -> &Zone {
+        &self.zones[zid.0 as usize]
     }
 
-    fn check_zone_and_range(&self, off: Sector, len: usize) -> Result<(usize, u32), Errno> {
+    fn to_zone_id(&self, off: Sector) -> Result<Zid, Errno> {
+        match u32::try_from(off / self.config.zone_secs) {
+            Ok(zid) if (zid as usize) < self.zones.len() => Ok(Zid(zid)),
+            _ => {
+                log::error!("invalid offset {off}");
+                Err(Errno::INVAL)
+            }
+        }
+    }
+
+    fn check_zone_and_range(&self, off: Sector, len: usize) -> Result<(Zid, u32), Errno> {
         let zid = self.to_zone_id(off)?;
         (|| {
-            let zone_offset = (off % self.config.zone_secs).bytes() as u32;
+            let coff = (off % self.config.zone_secs).bytes() as u32;
             let max_len = Ord::min(
                 MAX_READ_LEN as u64,
-                self.config.zone_secs.bytes() - zone_offset as u64,
+                self.config.zone_secs.bytes() - coff as u64,
             );
             if len as u64 > max_len {
                 return None;
             }
-            Some((zid, zone_offset))
+            Some((zid, coff))
         })()
         .ok_or_else(|| {
             log::error!("invalid range: offset={off}, length={len}");
@@ -521,12 +531,12 @@ impl<B: Backend, const LOGICAL_SECTOR_SIZE: u32> Frontend<B, LOGICAL_SECTOR_SIZE
 
     async fn zone_append_impl(
         &self,
-        zid: usize,
+        zid: Zid,
         coff: Option<u32>,
         buf: &WriteBuf<'_>,
         fua: bool,
     ) -> Result<u32, Errno> {
-        let zone = &self.zones[zid];
+        let zone = self.zone(zid);
         let _fence = self.exclusive_write_fence.read().await;
         let _zone_guard = zone.commit_lock.lock().await;
 
@@ -562,7 +572,7 @@ impl<B: Backend, const LOGICAL_SECTOR_SIZE: u32> Frontend<B, LOGICAL_SECTOR_SIZE
             unsafe { tail_buf.set_len(tail_buf.len() + buf.len()) };
 
             // Always dirty the zone. It will be cleared after inline-committed or flushed.
-            self.dirty_zones.lock().insert(zid as u32);
+            self.dirty_zones.lock().insert(zid);
 
             let new_wp = tail_coff + tail_buf.len() as u32;
             if new_wp as u64 == self.config.zone_secs.bytes() {
@@ -587,22 +597,22 @@ impl<B: Backend, const LOGICAL_SECTOR_SIZE: u32> Frontend<B, LOGICAL_SECTOR_SIZE
             (tail_coff, data, prev_wp, true)
         };
 
-        self.commit_tail_chunk(zid as u32, tail_coff, data, clear_tail)
+        self.commit_tail_chunk(zid, tail_coff, data, clear_tail)
             .await?;
         Ok(prev_wp)
     }
 
     async fn commit_tail_chunk(
         &self,
-        zid: u32,
+        zid: Zid,
         coff: u32,
         data: Bytes,
         clear_tail: bool,
     ) -> Result<(), Errno> {
-        let zone = &self.zones[zid as usize];
+        let zone = self.zone(zid);
         let len = data.len();
         self.accounting.chunk_commit.fetch_add(1, Ordering::Relaxed);
-        if let Err(err) = self.backend.upload_chunk(zid, coff, data).await {
+        if let Err(err) = self.backend.upload_chunk(zid.0, coff, data).await {
             log::error!("failed to upload chunk at zid={zid} coff={coff} len={len}: {err}");
             // NB. Intentionally keep it in `TailChunk::Uploading` state,
             // poison all following writes.
@@ -628,11 +638,11 @@ impl<B: Backend, const LOGICAL_SECTOR_SIZE: u32> BlockDevice for Frontend<B, LOG
 
     async fn read(&self, off: Sector, buf: &mut ReadBuf<'_>, flags: IoFlags) -> Result<(), Errno> {
         let (zid, mut read_start) = self.check_zone_and_range(off, buf.remaining())?;
-        let zone = &self.zones[zid];
+        let zone = self.zone(zid);
 
         // It's rare to read across chunks which are typically >1MiB. Simply loop for that case.
         while buf.remaining() != 0 {
-            let global_offset = self.config.zone_secs.bytes() * zid as u64 + read_start as u64;
+            let global_offset = self.config.zone_secs.bytes() * zid.0 as u64 + read_start as u64;
 
             let (stream, read_len) = {
                 let mut streams = self.streams.lock();
@@ -677,7 +687,7 @@ impl<B: Backend, const LOGICAL_SECTOR_SIZE: u32> BlockDevice for Frontend<B, LOG
                         let stream_len = chunk_end - read_start;
                         let stream = self
                             .backend
-                            .download_chunk(zid as u32, chunk_start, offset_in_chunk as u64)
+                            .download_chunk(zid.0, chunk_start, offset_in_chunk as u64)
                             .map_err(io::Error::other)
                             .into_async_read();
                         let (pos_tx, pos) = watch::channel(offset_in_chunk);
@@ -784,14 +794,14 @@ impl<B: Backend, const LOGICAL_SECTOR_SIZE: u32> BlockDevice for Frontend<B, LOG
         let prev_wp = self
             .zone_append_impl(zid, None, &buf, flags.contains(IoFlags::Fua))
             .await?;
-        let prev_abs_wp = self.config.zone_secs * zid as u64 + Sector::from_bytes(prev_wp.into());
+        let prev_abs_wp = self.config.zone_secs * zid.0 as u64 + Sector::from_bytes(prev_wp.into());
         Ok(prev_abs_wp)
     }
 
     // This always commits, thus obeys FUA semantic.
     async fn zone_finish(&self, off: Sector, _flags: IoFlags) -> Result<(), Errno> {
         let zid = self.to_zone_id(off)?;
-        let zone = &self.zones[zid];
+        let zone = self.zone(zid);
         let _fence = self.exclusive_write_fence.read().await;
         let _zone_guard = zone.commit_lock.lock().await;
 
@@ -819,8 +829,7 @@ impl<B: Backend, const LOGICAL_SECTOR_SIZE: u32> BlockDevice for Frontend<B, LOG
             (tail_coff, data)
         };
 
-        self.commit_tail_chunk(zid as u32, tail_coff, data, true)
-            .await?;
+        self.commit_tail_chunk(zid, tail_coff, data, true).await?;
         Ok(())
     }
 
@@ -830,9 +839,9 @@ impl<B: Backend, const LOGICAL_SECTOR_SIZE: u32> BlockDevice for Frontend<B, LOG
         buf: &mut ZoneBuf<'_>,
         _flags: IoFlags,
     ) -> Result<(), Errno> {
-        let zid_start = self.to_zone_id(off)?;
+        let zid_start = self.to_zone_id(off)?.0;
 
-        let zones = self.zones[zid_start..]
+        let zones = self.zones[zid_start as usize..]
             .iter()
             .zip(zid_start..)
             .take(buf.remaining())
@@ -865,7 +874,7 @@ impl<B: Backend, const LOGICAL_SECTOR_SIZE: u32> BlockDevice for Frontend<B, LOG
 
     async fn zone_open(&self, off: Sector, _flags: IoFlags) -> Result<(), Errno> {
         let zid = self.to_zone_id(off)?;
-        let mut cond = self.zones[zid].cond.lock();
+        let mut cond = self.zone(zid).cond.lock();
         match *cond {
             ZoneCond::Empty | ZoneCond::ImpOpen | ZoneCond::Closed => {}
             ZoneCond::ExpOpen => return Ok(()),
@@ -878,7 +887,7 @@ impl<B: Backend, const LOGICAL_SECTOR_SIZE: u32> BlockDevice for Frontend<B, LOG
 
     async fn zone_close(&self, off: Sector, _flags: IoFlags) -> Result<(), Errno> {
         let zid = self.to_zone_id(off)?;
-        let zone = &self.zones[zid];
+        let zone = self.zone(zid);
         let mut cond = zone.cond.lock();
         match *cond {
             ZoneCond::ImpOpen | ZoneCond::ExpOpen => {}
@@ -899,7 +908,7 @@ impl<B: Backend, const LOGICAL_SECTOR_SIZE: u32> BlockDevice for Frontend<B, LOG
     // This always commits, thus obeys FUA semantic.
     async fn zone_reset(&self, off: Sector, _flags: IoFlags) -> Result<(), Errno> {
         let zid = self.to_zone_id(off)?;
-        let zone = &self.zones[zid];
+        let zone = self.zone(zid);
         let _fence = self.exclusive_write_fence.read().await;
         let _zone_guard = zone.commit_lock.lock().await;
 
@@ -915,13 +924,13 @@ impl<B: Backend, const LOGICAL_SECTOR_SIZE: u32> BlockDevice for Frontend<B, LOG
         }
 
         self.accounting.zone_reset.fetch_add(1, Ordering::Relaxed);
-        if let Err(err) = self.backend.delete_zone(zid as u64).await {
+        if let Err(err) = self.backend.delete_zone(zid.0).await {
             log::error!("failed to delete zone {zid}: {err}");
             return Err(Errno::IO);
         }
 
         zone.reset();
-        self.dirty_zones.lock().remove(&(zid as u32));
+        self.dirty_zones.lock().remove(&zid);
 
         Ok(())
     }
@@ -957,7 +966,7 @@ impl<B: Backend, const LOGICAL_SECTOR_SIZE: u32> BlockDevice for Frontend<B, LOG
             .lock()
             .iter()
             .map(|&zid| {
-                let zone = &self.zones[zid as usize];
+                let zone = self.zone(zid);
                 let zone_guard = zone
                     .commit_lock
                     .try_lock()

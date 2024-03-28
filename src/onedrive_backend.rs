@@ -769,8 +769,8 @@ impl Backend for Remote {
         Ok(())
     }
 
-    async fn delete_zone(&self, zid: u64) -> Result<()> {
-        let path = self.zone_path(zid as u32);
+    async fn delete_zone(&self, zid: u32) -> Result<()> {
+        let path = self.zone_path(zid);
         log::debug!("deleting {path}");
         let path = ItemLocation::from_path(&path).unwrap();
         self.drive

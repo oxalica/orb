@@ -76,7 +76,7 @@ impl Backend for Memory {
         ready(Ok(()))
     }
 
-    fn delete_zone(&self, zid: u64) -> impl Future<Output = Result<()>> + Send + '_ {
+    fn delete_zone(&self, zid: u32) -> impl Future<Output = Result<()>> + Send + '_ {
         self.zones[zid as usize].write().clear();
         ready(Ok(()))
     }

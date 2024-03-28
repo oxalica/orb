@@ -111,7 +111,7 @@ impl Backend for TestBackend {
         }
     }
 
-    fn delete_zone(&self, zid: u64) -> impl Future<Output = Result<()>> + Send + '_ {
+    fn delete_zone(&self, zid: u32) -> impl Future<Output = Result<()>> + Send + '_ {
         act!(self, "delete_zone({zid})");
         async move {
             self.delay().await;
