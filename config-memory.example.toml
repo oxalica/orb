@@ -1,0 +1,20 @@
+# This is an example configuration for a virtual block device in memory,
+# which is mainly for testing and benchmarking the chunking implementation
+# (frontend).
+
+# `[device]` and `[ublk]` section is the same for all backends.
+# See `config-onedrive.example.toml` for details.
+[device]
+dev_size = "1GiB"
+zone_size = "8MiB"
+min_chunk_size = "1MiB"
+max_chunk_size = "8MiB"
+
+[ublk]
+unprivileged = true
+
+# Use 'memory' backend.
+# Exact one backend must be chosen.
+[backend.memory]
+# This backend has no sub-configurations currently, but the section header must
+# not be omitted.

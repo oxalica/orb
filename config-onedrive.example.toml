@@ -1,5 +1,5 @@
-# This is an example configuration for a virtual block device in memory,
-# which is mainly for testing and benchmarking.
+# This is an example configuration serving OneDrive storage as a block device.
+# Note that login credentials are not passed here, see README.md for details.
 #
 # Commented options are not required and have default values as in the comment.
 # Uncommented options are required and values are given as examples.
@@ -50,10 +50,10 @@ max_chunk_size = "128MiB"
 # https://man7.org/linux/man-pages/man2/prctl.2.html
 #unprivileged = false
 
-# The max concurrency of each queue.
+# The max concurrency of the request queue.
 #queue_depth = 64
 
-# Use 'onedrive' backend. This backend has no sub-configurations.
+# Use 'onedrive' backend.
 # Exact one backend must be chosen.
 [backend.onedrive]
 
