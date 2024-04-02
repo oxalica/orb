@@ -1,11 +1,12 @@
 use std::fmt::Debug;
 use std::num::NonZeroU16;
+use std::path::Path;
 use std::sync::Arc;
 use std::{fs, io};
 
 use anyhow::{bail, Context, Result};
 use clap::Parser;
-use cli::{Cli, LoginCmd, ServeCmd, StopCmd};
+use cli::{Cli, LoginCmd, ServeCmd, StopCmd, VerifyCmd};
 use orb_ublk::{ControlDevice, DeviceBuilder, DeviceInfo};
 use serde::Deserialize;
 use serde_inline_default::serde_inline_default;
@@ -25,7 +26,8 @@ fn main() -> Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
     match Cli::parse() {
-        Cli::Serve(cmd) => serve_main(cmd),
+        Cli::Verify(cmd) => verify_main(&cmd),
+        Cli::Serve(cmd) => serve_main(&cmd),
         Cli::Stop(cmd) => stop_cmd(cmd),
         Cli::Login(cmd) => login_cmd(cmd),
     }
@@ -59,14 +61,20 @@ struct UblkConfig {
     queue_depth: NonZeroU16,
 }
 
-fn serve_main(cmd: ServeCmd) -> Result<()> {
-    let config = {
-        let buf = fs::read_to_string(cmd.config_file).context("failed to read config file")?;
-        toml::from_str::<Config>(&buf).context("failed to parse config file")?
-    };
-
-    // Fail fast.
+fn load_and_verify_config(path: &Path) -> Result<Config> {
+    let buf = fs::read_to_string(path).context("failed to read config file")?;
+    let config = toml::from_str::<Config>(&buf).context("failed to parse config file")?;
     config.device.validate().context("invalid device config")?;
+    Ok(config)
+}
+
+fn verify_main(cmd: &VerifyCmd) -> Result<()> {
+    load_and_verify_config(&cmd.config_file)?;
+    Ok(())
+}
+
+fn serve_main(cmd: &ServeCmd) -> Result<()> {
+    let config = load_and_verify_config(&cmd.config_file)?;
 
     let mut rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()

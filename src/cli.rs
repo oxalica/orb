@@ -20,9 +20,22 @@ use clap::builder::TypedValueParser;
 #[derive(Debug, clap::Parser)]
 #[clap(about, version = env!("CFG_RELEASE"))]
 pub enum Cli {
+    Verify(VerifyCmd),
     Serve(ServeCmd),
     Stop(StopCmd),
     Login(LoginCmd),
+}
+
+/// Verify the validity of a given configuration file for `orb serve`.
+///
+/// This can catch static errors, including syntax errors and invalid option types or values. It
+/// cannot catch runtime errors like invalid or non-existing credentials or non-existing remote
+/// directory.
+#[derive(Debug, clap::Args)]
+pub struct VerifyCmd {
+    /// The configuration file path.
+    #[clap(long, short)]
+    pub config_file: PathBuf,
 }
 
 /// Start and run the service in the foreground.
@@ -35,6 +48,7 @@ pub enum Cli {
 /// control devices.
 #[derive(Debug, clap::Args)]
 pub struct ServeCmd {
+    /// The configuration file path.
     #[clap(long, short)]
     pub config_file: PathBuf,
 }
