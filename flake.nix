@@ -93,5 +93,12 @@ rec {
           };
         };
     });
+
+    nixosModules = rec {
+      default = orb;
+      orb = import ./orb.nix {
+        inherit self;
+      };
+    };
   };
 }
