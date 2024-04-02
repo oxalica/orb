@@ -34,7 +34,7 @@ rec {
 
         postInstall = ''
           mkdir -p $out/etc/systemd/system
-          substitute ./orb@.example.service $out/etc/systemd/system/orb@.service \
+          substitute ./contrib/orb@.example.service $out/etc/systemd/system/orb@.service \
             --replace-fail '/usr/bin/orb' "$out/bin/orb"
 
           installShellCompletion \
@@ -68,7 +68,7 @@ rec {
         postInstall = ''
           install -Dm755 -t $out/libexec target/*/release/examples/ublk-chown-unprivileged
           mkdir -p $out/etc/udev/rules.d
-          substitute ./orb-ublk/19-ublk-unprivileged.example.rules $out/etc/udev/rules.d/19-ublk-unprivileged.rules \
+          substitute ./contrib/19-ublk-unprivileged.example.rules $out/etc/udev/rules.d/19-ublk-unprivileged.rules \
             --replace-fail '/usr/libexec/' "$out/libexec/"
         '';
 
@@ -96,7 +96,7 @@ rec {
 
     nixosModules = rec {
       default = orb;
-      orb = import ./orb.nix {
+      orb = import ./contrib/orb.nix {
         inherit self;
       };
     };

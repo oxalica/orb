@@ -74,7 +74,7 @@ Now you can use the module in your `configuration.nix`:
         # This creates block device `/dev/ublkb80`.
         ublk.id = 80; 
         # Other settings and their defaults can be seen in
-        # ./config-onedrive.example.toml
+        # ./contrib/config-onedrive.example.toml
         device = {
           dev_size = "1TiB";
           zone_size = "256MiB";
@@ -120,10 +120,11 @@ You need following dependencies to be installed with your package manager:
 
 Build command: `cargo build --release`
 
-`orb@.example.service` is the example template systemd service to install.
+[`contrib/orb@.example.service`](./contrib/orb@.example.service)
+is the example template systemd service to install.
 The instance configurations locate at `/etc/orb/<name>.toml`, whose format is
 documented in
-[`./config-onedrive.example.toml`](./config-onedrive.example.toml).
+[`./contrib/config-onedrive.example.toml`](./contrib/config-onedrive.example.toml).
 Once configured and logined (see the next section), run
 `systemctl start orb@<name>.service` to start the service.
 
