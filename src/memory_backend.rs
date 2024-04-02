@@ -46,7 +46,8 @@ impl fmt::Debug for Memory {
 
 impl Memory {
     #[must_use]
-    pub fn new(zone_cnt: usize) -> Self {
+    pub fn new(dev_config: &crate::service::Config) -> Self {
+        let zone_cnt = dev_config.dev_secs / dev_config.zone_secs;
         let zones = (0..zone_cnt).map(|_| RwLock::new(HashMap::new())).collect();
         Self { zones }
     }

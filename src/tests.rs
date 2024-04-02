@@ -27,9 +27,9 @@ pub struct TestBackend {
 }
 
 impl TestBackend {
-    pub fn new_empty(zone_cnt: usize) -> Self {
+    pub fn new_empty(config: &Config) -> Self {
         Self {
-            inner: Memory::new(zone_cnt),
+            inner: Memory::new(config),
             log: Mutex::default(),
             delay: Mutex::new(Duration::ZERO),
         }
@@ -37,11 +37,11 @@ impl TestBackend {
 
     #[track_caller]
     pub fn new_with_chunks(
-        nr_zones: usize,
+        config: &Config,
         // (zid, cid, data) where cid := coff / SECTOR_SIZE.
         chunks: impl IntoIterator<Item = (u32, u32, Vec<u8>)>,
     ) -> Self {
-        let mut this = Self::new_empty(nr_zones);
+        let mut this = Self::new_empty(config);
         for (zid, cid, data) in chunks {
             let coff = cid * Sector::SIZE;
             let prev = this.inner.zones[zid as usize]
@@ -220,7 +220,7 @@ const CONFIG: Config = Config {
 
 /// Accept `[(zid, cid, data)]`, where `cid := coff / SECTOR_SIZE`.
 async fn new_dev(chunks: &[(u32, u32, Vec<u8>)]) -> Frontend<TestBackend> {
-    let backend = TestBackend::new_with_chunks(NR_ZONES, chunks.iter().cloned());
+    let backend = TestBackend::new_with_chunks(&CONFIG, chunks.iter().cloned());
     let chunk_meta = chunks
         .iter()
         .map(|(zid, cid, data)| {

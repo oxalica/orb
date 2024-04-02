@@ -67,7 +67,6 @@ fn serve_main(cmd: ServeCmd) -> Result<()> {
 
     // Fail fast.
     config.device.validate().context("invalid device config")?;
-    let ctl = open_ctl_dev()?;
 
     let mut rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -76,10 +75,8 @@ fn serve_main(cmd: ServeCmd) -> Result<()> {
 
     match &config.backend {
         BackendConfig::Memory(_) => {
-            let zone_cnt = config.device.dev_secs / config.device.zone_secs;
-            let zone_cnt = zone_cnt.try_into().context("zone count overflow")?;
-            let memory = orb::memory_backend::Memory::new(zone_cnt);
-            serve(&ctl, &mut rt, &config, memory, Vec::new())?;
+            let memory = orb::memory_backend::Memory::new(&config.device);
+            serve(&mut rt, &config, memory, Vec::new())?;
         }
         BackendConfig::Onedrive(backend_config) => {
             let (remote, chunks) =
@@ -89,7 +86,7 @@ fn serve_main(cmd: ServeCmd) -> Result<()> {
                 let _guard = rt.enter();
                 register_reload_signal(drive)?;
             }
-            let frontend = serve(&ctl, &mut rt, &config, remote, chunks)?;
+            let frontend = serve(&mut rt, &config, remote, chunks)?;
 
             log::info!("flushing buffers before exit...");
             rt.block_on(orb_ublk::BlockDevice::flush(
@@ -132,12 +129,13 @@ fn register_reload_signal(
 }
 
 fn serve<B: orb::service::Backend + Debug>(
-    ctl: &ControlDevice,
     rt: &mut Runtime,
     config: &Config,
     backend: B,
     chunks: Vec<(u64, u64)>,
 ) -> Result<Frontend<B>> {
+    let ctl = ControlDevice::open()?;
+
     // Workaround: This is very ugly since scoped_tls support neither fat pointers nor !Sized
     // types. There is a PR but the crate is inactive.
     // See: https://github.com/alexcrichton/scoped-tls/pull/27
@@ -227,7 +225,7 @@ fn serve<B: orb::service::Backend + Debug>(
             .queues(1)
             .queue_depth(config.ublk.queue_depth.get())
             .zoned()
-            .create_service(ctl)
+            .create_service(&ctl)
             .context("failed to create ublk device")?
             .serve_local(rt, &dev_params, &frontend)
             .context("service failed")
