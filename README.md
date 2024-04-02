@@ -34,6 +34,7 @@ This project is packaged in Nix flake. Here's the simplified output graph:
     ├───x86_64-linux
     │   ├───default: Alias to `orb`.
     │   ├───orb: The main program with systemd units.
+    │   ├───btrfs-progs-fix-zoned-bgt: btrfs-progs with block-group-tree+zoned issue fixed.
     │   └───ublk-chown-unprivileged: The optional utility for unprivileged ublk.
     [..more Linux platforms are supported..]
 ```
@@ -248,9 +249,10 @@ It is recommended to format BTRFS with `block-group-tree` feature enabled, to
 dramastically reduce mounting time (~50s to ~2s). But unfortunately btrfs-progs
 currently had [a bug](https://github.com/kdave/btrfs-progs/issues/765) on it
 with zoned device.
-
-If you have a local build of btrfs-progs's [`devel`
-branch](https://github.com/kdave/btrfs-progs/tree/devel), you can format with:
+If you have a build of btrfs-progs's
+[`devel` branch](https://github.com/kdave/btrfs-progs/tree/devel), or patched
+version from flake output `btrfs-progs-fix-zoned-bgt` (used as `nix shell
+github:oxalica/orb#btrfs-progs-fix-zoned-bgt`), you can format with:
 ```console
 # mkfs.btrfs /dev/ublkb<ID> -O block-group-tree
 ```

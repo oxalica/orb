@@ -79,6 +79,13 @@ rec {
           platforms = lib.platforms.linux;
         };
       };
+
+      btrfs-progs-fix-zoned-bgt = with pkgs; btrfs-progs.overrideAttrs (old: {
+        version = old.version + "-fix-zoned-bgt";
+        patches = old.patches or [ ] ++ [
+          ./contrib/btrfs-progs-pr-767-zoned-bgt.patch
+        ];
+      });
     });
 
     devShells = eachSystem (system: {
