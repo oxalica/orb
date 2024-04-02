@@ -35,6 +35,7 @@ This project is packaged in Nix flake. Here's the simplified output graph:
     │   ├───default: Alias to `orb`.
     │   ├───orb: The main program with systemd units.
     │   ├───btrfs-progs-fix-zoned-bgt: btrfs-progs with block-group-tree+zoned issue fixed.
+    │   ├───cryptsetup-format-zoned: workaround script for cryptsetup-luksFormat on zoned devices.
     │   └───ublk-chown-unprivileged: The optional utility for unprivileged ublk.
     [..more Linux platforms are supported..]
 ```
