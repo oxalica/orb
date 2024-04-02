@@ -232,8 +232,60 @@ consistency and your data may be lost.
 
 ### Example: setup encryption via LUKS/dm-crypt
 
-TODO: cryptsetup has trouble formatting zoned devices, though dm-crypt supports
-it.
+<details>
+<summary>
+Details
+</summary>
+
+:warning: Of course, this will destroy all of your data on the emulated device,
+aka. the remote directory in OneDrive holding the data.
+
+Unforunately cryptsetup does not support formatting zoned devices currently
+(see [this issue](https://gitlab.com/cryptsetup/cryptsetup/-/issues/877)),
+though dm-crypt supports it. We need some extra steps for formatting, and then
+it can be opened and/or closed in the normal way.
+
+For convenience, there is a script under
+[`./contrib/cryptsetup-format-zoned.sh`](./contrib/cryptsetup-format-zoned.sh)
+to mimic `cryptsetup luksFormat` as a workaround. Run:
+```console
+# ./contrib/cryptsetup-format-zoned.sh /dev/ublkb<ID> # Use a a password.
+OR
+# ./contrib/cryptsetup-format-zoned.sh /dev/ublkb<ID> /path/to/key/file # Use a key file.
+```
+
+Alternatively, you can run the script via flake package:
+```console
+$ nix shell github:oxalica/orb#cryptsetup-format-zoned -c sudo cryptsetup-format-zoned /dev/ublkb<ID>
+```
+
+After formatting the block device, you can open and/or close it in the normal
+way:
+```console
+# cryptsetup luksOpen /dev/ublkb<ID> my-device-unencrypted
+# cryptsetup close my-device-unencrypted
+```
+
+If you are using key files, you can also use systemd-cryptsetup services to
+manage dm-crypt. This is useful when you want to specify dependencies to
+`orb@<instance>.service` and downstream services, eg. backup services.
+```nix
+{ ... }:
+{
+  environment.etc."crypttab".text = ''
+    mydecrypteddev /dev/ublkb<ID> /path/to/key/file noauto
+  '';
+  systemd.services."systemd-cryptsetup@mydecrypteddev" = {
+    # Inform Nix that this is an overriding units for auto-generated ones.
+    overrideStrategy = "asDropin";
+    # Specify dependencies to the orb service.
+    bindsTo = [ "orb@my-instance.service" ];
+    after = [ "orb@my-instance.service" ];
+  };
+}
+```
+
+</details>
 
 ### Example: format it as BTRFS
 

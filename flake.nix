@@ -86,6 +86,17 @@ rec {
           ./contrib/btrfs-progs-pr-767-zoned-bgt.patch
         ];
       });
+
+      cryptsetup-format-zoned = with pkgs; writeShellApplication rec {
+        name = "cryptsetup-format-zoned";
+        runtimeInputs = [ coreutils util-linux cryptsetup ];
+        text = builtins.readFile ./contrib/cryptsetup-format-zoned.sh;
+        meta = {
+          description = "Workaround script for cryptsetup-luksFormat on zoned devices";
+          mainProgram = name;
+          license = with lib.licenses; [ gpl3Plus ];
+        };
+      };
     });
 
     devShells = eachSystem (system: {
