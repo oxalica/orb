@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 description = "OneDrive as a block device"
 license = "GPL-3.0-or-later"
-# NB. Sync with CI.
+# NB. Sync with CI and README.
 rust-version = "1.76" # orb-ublk
 
 [features]
