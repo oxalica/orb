@@ -2,6 +2,18 @@
 
 :warning: This project is in alpha stage.
 
+## Audience
+
+If you are not sure whether this project fits your need, then it does not. You
+are probably looking for
+[OneDrive Online](https://onedrive.live.com/) or sync and FUSE implementations
+like [rclone](https://github.com/rclone/rclone).
+
+This project may be helpful for :penguin: *real nerds* :penguin: who enjoy
+wacky block device stacking, intend to leverage block level encryption or their
+existing BTRFS backup infrastructure, or explore fresh new bugs in BTRFS zoned
+mode, with the cost of *everything*.
+
 ## Installation
 
 System requirements:
