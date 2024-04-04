@@ -475,6 +475,10 @@ impl<B: Backend, const LOGICAL_SECTOR_SIZE: u32> Frontend<B, LOGICAL_SECTOR_SIZE
         &self.backend
     }
 
+    pub fn into_backend(self) -> B {
+        self.backend
+    }
+
     pub fn dev_params(&self) -> DeviceParams {
         let mut params = DeviceParams::new();
         params

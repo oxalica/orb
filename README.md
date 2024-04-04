@@ -198,7 +198,7 @@ long offline time (seems to be >1month, but is determined by Microsoft).
     :warning:
     You must not serve the same remote directory simultaneously in multiple
     instances (or machines), or it will cause data race and your data will be
-    corrupted.
+    corrupted. orb will try its best to detect and prevent such racing serving.
 
 4.  On success, the web page will redirect to a mostly empty page with only one line:
     ```text

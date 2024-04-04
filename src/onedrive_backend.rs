@@ -15,8 +15,8 @@ use futures_util::{Stream, StreamExt, TryFutureExt, TryStreamExt};
 use onedrive_api::option::{CollectionOption, DriveItemPutOption};
 use onedrive_api::resource::DriveItemField;
 use onedrive_api::{
-    Auth, ClientCredential, ConflictBehavior, DriveLocation, ItemLocation, OneDrive, Permission,
-    Tenant, TrackChangeFetcher,
+    Auth, ClientCredential, ConflictBehavior, DriveLocation, ItemId, ItemLocation, OneDrive,
+    Permission, Tag, Tenant, TrackChangeFetcher,
 };
 use parking_lot::Mutex;
 use reqwest::{header, Client, StatusCode};
@@ -65,6 +65,7 @@ const AUTO_CREDENTIAL_FILE_NAME: &str = "credential.auto.json";
 const STATE_FILE_NAME: &str = "state.json";
 
 const GEOMETRY_FILE_NAME: &str = "geometry.json";
+const LOCK_FILE_NAME: &str = "lock.json";
 
 #[serde_inline_default]
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -294,6 +295,16 @@ pub fn init(
     let drive =
         OneDrive::new_with_client(client.clone(), access_token.clone(), DriveLocation::me());
 
+    let remote_lock = rt
+        .block_on(RemoteLock::lock(&drive, &config.remote_dir))
+        .context("failed to acquire remote lock")?;
+    let remote_lock = scopeguard::guard(remote_lock, |lock| {
+        log::info!("releasing remote lock...");
+        if let Err(err) = rt.block_on(lock.unlock(&drive)) {
+            log::error!("failed to release remote lock: {err}");
+        }
+    });
+
     // Geometry validation.
     let geometry = Geometry {
         dev_size: dev_config.dev_secs.bytes(),
@@ -403,7 +414,11 @@ pub fn init(
         client,
         access_token,
     ));
-    let remote = Remote::new(drive, config.clone());
+    let remote = Remote::new(
+        drive,
+        config.clone(),
+        scopeguard::ScopeGuard::into_inner(remote_lock),
+    );
     Ok((remote, chunks))
 }
 
@@ -431,6 +446,122 @@ fn safe_write(path: &Path, data: &impl Serialize) -> Result<()> {
     }
     fs::rename(tmp_path, path)?;
     Ok(())
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct RemoteLockInfo {
+    hostname: String,
+    timestamp: SystemTime,
+    // For human consumption.
+    timestamp_str: String,
+}
+
+impl RemoteLockInfo {
+    fn new() -> Self {
+        let timestamp = SystemTime::now();
+        let hostname = match hostname::get() {
+            Ok(name) => name.to_string_lossy().into_owned(),
+            Err(err) => {
+                log::error!("failed to get hostname: {err}");
+                "<unknown>".to_owned()
+            }
+        };
+        Self {
+            hostname,
+            timestamp,
+            timestamp_str: humantime::format_rfc3339(timestamp).to_string(),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct RemoteLock {
+    item_id: ItemId,
+    tag: Tag,
+}
+
+impl RemoteLock {
+    async fn lock(drive: &OneDrive, remote_dir: &str) -> Result<Self> {
+        let lock_file_path_str = format!("{remote_dir}/{LOCK_FILE_NAME}");
+        let lock_file_path = ItemLocation::from_path(&lock_file_path_str).unwrap();
+        let lock_info =
+            serde_json::to_vec(&RemoteLockInfo::new()).expect("serialization cannot fail");
+
+        // Only the session upload API supports conflict behavior.
+        let size = lock_info.len() as u64;
+        let ret = drive
+            .new_upload_session_with_option(
+                lock_file_path,
+                DriveItemPutOption::new().conflict_behavior(ConflictBehavior::Fail),
+            )
+            .await;
+        let upload_err = match ret {
+            Ok((sess, _)) => match sess
+                .upload_part(lock_info, 0..size, size, drive.client())
+                .await
+            {
+                Ok(item) => {
+                    let item = item.context("unexpected empty response")?;
+                    let item_id = item.id.context("missing item id")?;
+                    // NB. Using eTag for DELETE somehow always fail with 412 PRECONDITION FAILED,
+                    // we have to use cTag here.
+                    let tag = item.c_tag.context("missing c_tag")?;
+                    return Ok(Self { item_id, tag });
+                }
+                Err(upload_err) => {
+                    if let Err(err) = sess.delete(drive.client()).await {
+                        log::error!("failed to delete upload session: {err}");
+                    }
+                    upload_err
+                }
+            },
+            Err(err) => err,
+        };
+        if upload_err.status_code() != Some(StatusCode::CONFLICT) {
+            return Err(upload_err.into());
+        }
+
+        // Here we got a conflict. Try to get more information for diagnose.
+        let info = async {
+            let url = drive.get_item_download_url(lock_file_path).await?;
+            let data = drive.client().get(url).send().await?.bytes().await?;
+            let info = serde_json::from_slice::<RemoteLockInfo>(&data)?;
+            anyhow::Ok(info)
+        }
+        .await;
+        let info = match info {
+            Ok(info) => format!("{:?} at {:?}", info.hostname, info.timestamp_str),
+            Err(err) => {
+                log::error!("failed to read remote lock info: {err}");
+                "<unknown>".to_owned()
+            }
+        };
+        bail!(
+            "The remote directory is locked by {info}. You cannot serve the same directory \
+            without risking data corruption. If you are sure it's a false positive and the \
+            previous service instance have crashed, please delete {lock_file_path_str:?} \
+            manually via OneDrive online <https://onedrive.live.com/>, and then retry.\
+            ",
+        );
+    }
+
+    async fn unlock(&self, drive: &OneDrive) -> onedrive_api::Result<()> {
+        match drive
+            .delete_with_option(&self.item_id, DriveItemPutOption::new().if_match(&self.tag))
+            .await
+        {
+            Ok(()) => Ok(()),
+            Err(err) if err.status_code() == Some(StatusCode::NOT_FOUND) => {
+                log::warn!("Skip deleting remote lock file because it is already gone: {err}");
+                Ok(())
+            }
+            Err(err) if err.status_code() == Some(StatusCode::PRECONDITION_FAILED) => {
+                log::warn!("Skip deleting remote lock file since it is not locked by us: {err}");
+                Ok(())
+            }
+            Err(err) => Err(err),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -549,6 +680,7 @@ pub struct Remote {
     config: Config,
     drive: Arc<AutoReloginOnedrive>,
     download_url_cache: Mutex<TimedCache<(u32, u32), CacheCell>>,
+    remote_lock: RemoteLock,
 
     accounting: Accounting,
 }
@@ -570,18 +702,28 @@ impl fmt::Debug for CacheCell {
 }
 
 impl Remote {
-    fn new(drive: Arc<AutoReloginOnedrive>, config: Config) -> Self {
+    fn new(drive: Arc<AutoReloginOnedrive>, config: Config, remote_lock: RemoteLock) -> Self {
         assert!(config.remote_dir.starts_with('/') && !config.remote_dir.ends_with('/'));
         Self {
             config,
             drive,
             download_url_cache: Mutex::new(TimedCache::new(URL_CACHE_DURATION)),
+            remote_lock,
             accounting: Accounting::default(),
         }
     }
 
     pub fn get_drive(&self) -> Arc<AutoReloginOnedrive> {
         self.drive.clone()
+    }
+
+    pub async fn unlock(self) -> Result<()> {
+        self.drive
+            .with(|drive| {
+                let lock = &self.remote_lock;
+                async move { lock.unlock(&drive).await }
+            })
+            .await
     }
 
     fn chunk_path(&self, zid: u32, coff: u32) -> String {

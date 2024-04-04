@@ -95,10 +95,16 @@ fn serve_main(cmd: &ServeCmd) -> Result<()> {
                 register_reload_signal(drive)?;
             }
             let frontend = serve(&mut rt, &config, remote, chunks)?;
+            let frontend = scopeguard::guard(frontend, |frontend| {
+                log::info!("releasing remote lock...");
+                if let Err(err) = rt.block_on(frontend.into_backend().unlock()) {
+                    log::error!("failed to release remote lock: {err}");
+                }
+            });
 
             log::info!("flushing buffers before exit...");
             rt.block_on(orb_ublk::BlockDevice::flush(
-                &frontend,
+                &*frontend,
                 orb_ublk::IoFlags::empty(),
             ))
             // Error reasons should be reported inside `flush`, the returned error here is
