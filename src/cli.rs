@@ -56,7 +56,8 @@ pub struct ServeCmd {
 /// Stop and clean up ublk control and block devices `/dev/ublk{c,b}*`.
 ///
 /// This can be either used to stop a running service, or release resources when the service
-/// aborted unexpectedly without a correct clean up.
+/// aborted unexpectedly without a correct clean up. Foreign ublk devices not created by orb
+/// will be skipped from deleting.
 ///
 /// If the coresponding devices are created by privileged process, this command also requires
 /// root privilege to clean them up.
@@ -68,6 +69,10 @@ pub struct StopCmd {
     /// The integer device ids to clean up, ie. the number in the tail of `/dev/ublk{b,c}*`.
     #[clap(required = true)]
     pub dev_ids: Vec<u32>,
+
+    /// Disable magic checks and force to delete devices.
+    #[clap(short, long)]
+    pub force: bool,
 }
 
 /// Interactive login Microsoft account and save credential for service use.

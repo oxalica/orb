@@ -4,7 +4,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::{fs, io};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, ensure, Context, Result};
 use clap::Parser;
 use cli::{Cli, LoginCmd, ServeCmd, StopCmd, VerifyCmd};
 use orb_ublk::{ControlDevice, DeviceBuilder, DeviceInfo};
@@ -17,6 +17,9 @@ use tokio::signal::unix as signal;
 compile_error!("Only Linux is supported because of ublk driver");
 
 mod cli;
+
+/// The magic user data for ublk to recognize in `stop` subcommand.
+const ORB_MAGIC: u64 = u64::from_le_bytes(*b"orb\0\0\0\0\0");
 
 const LOGICAL_SECTOR_SIZE: u32 = 4 << 10; // Typical page size.
 
@@ -248,6 +251,7 @@ fn serve<B: orb::service::Backend + Debug>(
     FRONTEND_PTR.set(&std::ptr::from_ref(&frontend).cast(), || {
         builder
             .name("orb")
+            .user_data(ORB_MAGIC)
             .queues(1)
             .queue_depth(config.ublk.queue_depth.get())
             .io_buf_size(orb::service::MAX_READ_SECTORS.bytes().try_into().unwrap())
@@ -262,6 +266,8 @@ fn serve<B: orb::service::Backend + Debug>(
 }
 
 fn stop_cmd(cmd: StopCmd) -> Result<()> {
+    use orb_ublk::CDEV_PREFIX;
+
     let ctl = open_ctl_dev()?;
     if cmd.all {
         for ent in fs::read_dir("/dev").context("failed to read /dev")? {
@@ -273,12 +279,36 @@ fn stop_cmd(cmd: StopCmd) -> Result<()> {
                     .parse::<u32>()
                     .ok()
             })() {
-                ctl.delete_device(dev_id)?;
+                if !cmd.force {
+                    let info = match ctl.get_device_info(dev_id) {
+                        Ok(info) => info,
+                        Err(err) => {
+                            eprintln!("skipped {CDEV_PREFIX}{dev_id}: failed to get info: {err}");
+                            continue;
+                        }
+                    };
+                    if info.user_data() != ORB_MAGIC {
+                        eprintln!("skipped {CDEV_PREFIX}{dev_id}: not created by orb");
+                        continue;
+                    }
+                }
+                ctl.delete_device(dev_id)
+                    .with_context(|| format!("failed to delete {CDEV_PREFIX}{dev_id}"))?;
             }
         }
     } else {
-        for id in cmd.dev_ids {
-            ctl.delete_device(id)?;
+        for dev_id in cmd.dev_ids {
+            if !cmd.force {
+                let info = ctl
+                    .get_device_info(dev_id)
+                    .with_context(|| format!("failed to get info of {CDEV_PREFIX}{dev_id}"))?;
+                ensure!(
+                    info.user_data() == ORB_MAGIC,
+                    "refused to delete {CDEV_PREFIX}{dev_id}: not created by orb",
+                );
+            }
+            ctl.delete_device(dev_id)
+                .with_context(|| format!("failed to delete {CDEV_PREFIX}{dev_id}"))?;
         }
     }
     Ok(())
