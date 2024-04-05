@@ -717,11 +717,17 @@ impl Drop for Service<'_> {
         unsafe { ManuallyDrop::drop(&mut self.cdev) }
         let dev_id = self.dev_info().dev_id();
         if let Err(err) = self.ctl.delete_device(dev_id) {
-            if err.kind() != io::ErrorKind::NotFound {
+            // Ignore errors if already deleted.
+            if !is_device_gone(&err) {
                 log::error!("failed to delete device {dev_id}: {err}");
             }
         }
     }
+}
+
+/// Check whether the error is caused by that the device is gone by external forces.
+fn is_device_gone(err: &io::Error) -> bool {
+    matches!(Errno::from_io_error(err), Some(Errno::NOENT | Errno::NODEV))
 }
 
 /// Signal all threads when something goes wrong somewhere.
@@ -821,7 +827,7 @@ impl Service<'_> {
             }
             if let Err(err) = self.ctl.stop_device(dev_id) {
                 // Ignore errors if already deleted.
-                if err.kind() != io::ErrorKind::NotFound {
+                if !is_device_gone(&err) {
                     log::error!("failed to stop device {dev_id}: {err}");
                 }
             }
@@ -966,7 +972,9 @@ impl Service<'_> {
             }
 
             if let Err(err) = self.ctl.stop_device(self.dev_info.dev_id()) {
-                log::error!("failed to stop device {} {}", self.dev_info.dev_id(), err);
+                if !is_device_gone(&err) {
+                    log::error!("failed to stop device {} {}", self.dev_info.dev_id(), err);
+                }
             }
         });
         let pid = rustix::process::getpid();
@@ -1207,7 +1215,11 @@ impl<'r, B: BlockDevice, R: AsyncRuntime + 'r> IoWorker<'_, 'r, B, R> {
                 // Here it must be a FETCH request.
                 if cqe.result() < 0 {
                     let err = io::Error::from_raw_os_error(-cqe.result());
-                    log::debug!("failed to fetch ublk events: {err}");
+                    if is_device_gone(&err) {
+                        log::warn!("device gone by external forces, stopping: {err}");
+                        return Ok(ControlFlow::Break(()));
+                    }
+                    log::error!("failed to fetch ublk events: {err}");
                     return Err(err);
                 }
 
