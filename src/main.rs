@@ -89,7 +89,9 @@ fn verify_main(cmd: &VerifyCmd) -> Result<()> {
 }
 
 fn serve_main(cmd: &ServeCmd) -> Result<()> {
+    // Fail fast.
     let config = load_and_verify_config(&cmd.config_file)?;
+    let ctl = ControlDevice::open()?;
 
     let mut rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -99,7 +101,12 @@ fn serve_main(cmd: &ServeCmd) -> Result<()> {
     match &config.backend {
         BackendConfig::Memory(_) => {
             let memory = orb::memory_backend::Memory::new(&config.device);
-            serve(&mut rt, &config, memory, Vec::new())?;
+            // SAFETY: `DEBUG_PTR` is set correctly in `serve`.
+            let frontend = Frontend::new(config.device, memory, |info, stopper| unsafe {
+                on_ready::<Frontend<orb::memory_backend::Memory>>(info, stopper)
+            })
+            .expect("config is validated");
+            serve(&ctl, &mut rt, &config, &frontend)?;
         }
         BackendConfig::Onedrive(backend_config) => {
             let (remote, chunks) =
@@ -109,13 +116,25 @@ fn serve_main(cmd: &ServeCmd) -> Result<()> {
                 let _guard = rt.enter();
                 register_reload_signal(drive)?;
             }
-            let frontend = serve(&mut rt, &config, remote, chunks)?;
-            let frontend = scopeguard::guard(frontend, |frontend| {
+
+            // SAFETY: `DEBUG_PTR` is set correctly in `serve`.
+            let frontend = Frontend::new(config.device, remote, |info, stopper| unsafe {
+                on_ready::<Frontend<orb::onedrive_backend::Remote>>(info, stopper)
+            })
+            .expect("config is validated");
+            let (frontend, rt) = &mut *scopeguard::guard((frontend, rt), |(frontend, rt)| {
                 log::info!("releasing remote lock");
                 if let Err(err) = rt.block_on(frontend.into_backend().unlock()) {
                     log::error!("failed to release remote lock: {err}");
                 }
             });
+
+            rt.block_on(frontend.init_chunks(&chunks))
+                .context("failed to initialize chunks")?;
+            // Free memory.
+            drop(chunks);
+
+            serve(&ctl, rt, &config, frontend)?;
 
             log::info!("flushing buffers before exit");
             rt.block_on(orb_ublk::BlockDevice::flush(
@@ -157,88 +176,17 @@ fn register_reload_signal(
     Ok(())
 }
 
+// Workaround: This is very ugly since scoped_tls support neither fat pointers nor !Sized
+// types. There is a PR but the crate is inactive.
+// See: https://github.com/alexcrichton/scoped-tls/pull/27
+scoped_tls::scoped_thread_local!(static DEBUG_PTR: *const ());
+
 fn serve<B: orb::service::Backend + Debug>(
+    ctl: &ControlDevice,
     rt: &mut Runtime,
     config: &Config,
-    backend: B,
-    chunks: Vec<(u64, u64)>,
-) -> Result<Frontend<B>> {
-    let ctl = ControlDevice::open()?;
-
-    // Workaround: This is very ugly since scoped_tls support neither fat pointers nor !Sized
-    // types. There is a PR but the crate is inactive.
-    // See: https://github.com/alexcrichton/scoped-tls/pull/27
-    scoped_tls::scoped_thread_local!(static FRONTEND_PTR: *const ());
-
-    let on_ready = |dev_info: &DeviceInfo, stopper: orb_ublk::Stopper| {
-        let mut sigint = signal::signal(signal::SignalKind::interrupt())?;
-        let mut sigterm = signal::signal(signal::SignalKind::terminate())?;
-        tokio::task::spawn(async move {
-            tokio::select! {
-                v = sigint.recv() => v,
-                v = sigterm.recv() => v,
-            }
-            .unwrap();
-            log::info!("signaled to stop");
-            let _ = sd_notify::notify(false, &[sd_notify::NotifyState::Stopping]);
-            stopper.stop();
-        });
-
-        let mut sigusr1 = signal::signal(signal::SignalKind::user_defined1())?;
-        if FRONTEND_PTR.is_set() {
-            tokio::task::spawn(async move {
-                use std::io::Write;
-                use std::os::unix::fs::OpenOptionsExt;
-                use std::time::SystemTime;
-
-                while let Some(()) = sigusr1.recv().await {
-                    log::warn!("debug dumping states");
-                    let ts = SystemTime::now()
-                        .duration_since(SystemTime::UNIX_EPOCH)
-                        .unwrap_or_default();
-                    let debug_out = FRONTEND_PTR
-                        // SAFETY: This must be the frontend reference set outside.
-                        .with(|&ptr| format!("{:#?}", unsafe { &*ptr.cast::<Frontend<B>>() }));
-
-                    // Spawn detached. No need to join.
-                    tokio::task::spawn_blocking(move || {
-                        let path = std::env::temp_dir().join(format!(
-                            "orb-state-dump.{}.{:09}",
-                            ts.as_secs(),
-                            ts.subsec_nanos(),
-                        ));
-                        let ret = std::fs::OpenOptions::new()
-                            // Avoid blocking pipe traps.
-                            .create_new(true)
-                            .write(true)
-                            .mode(0o600) // rw-------
-                            .open(&path)
-                            .and_then(|mut f| f.write_all(debug_out.as_bytes()));
-                        match ret {
-                            Ok(()) => log::warn!("debug dump saved at {}", path.display()),
-                            Err(err) => log::error!(
-                                "failed to save debug dump to {}: {}",
-                                path.display(),
-                                err,
-                            ),
-                        }
-                    });
-                }
-            });
-        }
-
-        log::info!("block device ready at /dev/ublkb{}", dev_info.dev_id());
-        let _ = sd_notify::notify(false, &[sd_notify::NotifyState::Ready]);
-        Ok(())
-    };
-
-    let mut frontend =
-        Frontend::new(config.device, backend, on_ready).expect("config is validated");
-    rt.block_on(frontend.init_chunks(&chunks))
-        .context("failed to initialize chunks")?;
-    // Free memory.
-    drop(chunks);
-
+    frontend: &Frontend<B>,
+) -> Result<()> {
     let mut builder = DeviceBuilder::new();
     builder.dev_id(u32::try_from(config.ublk.id).ok());
     let mut dev_params = frontend.dev_params();
@@ -248,7 +196,7 @@ fn serve<B: orb::service::Backend + Debug>(
         dev_params.set_io_flusher(true);
     }
 
-    FRONTEND_PTR.set(&std::ptr::from_ref(&frontend).cast(), || {
+    DEBUG_PTR.set(&std::ptr::from_ref(&frontend).cast(), || {
         builder
             .name("orb")
             .user_data(ORB_MAGIC)
@@ -256,13 +204,73 @@ fn serve<B: orb::service::Backend + Debug>(
             .queue_depth(config.ublk.queue_depth.get())
             .io_buf_size(orb::service::MAX_READ_SECTORS.bytes().try_into().unwrap())
             .zoned()
-            .create_service(&ctl)
+            .create_service(ctl)
             .context("failed to create ublk device")?
-            .serve_local(rt, &dev_params, &frontend)
+            .serve_local(rt, &dev_params, frontend)
             .context("service failed")
-    })?;
+    })
+}
 
-    Ok(frontend)
+// # Safety
+// Must be called with `DEBUG_PTR` holding a valid `*const T`.
+unsafe fn on_ready<T: Debug>(dev_info: &DeviceInfo, stopper: orb_ublk::Stopper) -> io::Result<()> {
+    let mut sigint = signal::signal(signal::SignalKind::interrupt())?;
+    let mut sigterm = signal::signal(signal::SignalKind::terminate())?;
+    tokio::task::spawn(async move {
+        tokio::select! {
+            v = sigint.recv() => v,
+            v = sigterm.recv() => v,
+        }
+        .unwrap();
+        log::info!("signaled to stop");
+        let _ = sd_notify::notify(false, &[sd_notify::NotifyState::Stopping]);
+        stopper.stop();
+    });
+
+    if DEBUG_PTR.is_set() {
+        let mut sigusr1 = signal::signal(signal::SignalKind::user_defined1())?;
+        tokio::task::spawn(async move {
+            use std::io::Write;
+            use std::os::unix::fs::OpenOptionsExt;
+            use std::time::SystemTime;
+
+            while let Some(()) = sigusr1.recv().await {
+                log::warn!("debug dumping states");
+                let ts = SystemTime::now()
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .unwrap_or_default();
+                let debug_out = DEBUG_PTR
+                    // SAFETY: Guaranteed by the caller.
+                    .with(|&ptr| format!("{:#?}", unsafe { &*ptr.cast::<T>() }));
+
+                // Spawn detached. No need to join.
+                tokio::task::spawn_blocking(move || {
+                    let path = std::env::temp_dir().join(format!(
+                        "orb-state-dump.{}.{:09}",
+                        ts.as_secs(),
+                        ts.subsec_nanos(),
+                    ));
+                    let ret = std::fs::OpenOptions::new()
+                        // Avoid blocking pipe traps.
+                        .create_new(true)
+                        .write(true)
+                        .mode(0o600) // rw-------
+                        .open(&path)
+                        .and_then(|mut f| f.write_all(debug_out.as_bytes()));
+                    match ret {
+                        Ok(()) => log::warn!("debug dump saved at {}", path.display()),
+                        Err(err) => {
+                            log::error!("failed to save debug dump to {}: {}", path.display(), err);
+                        }
+                    }
+                });
+            }
+        });
+    }
+
+    log::info!("block device ready at /dev/ublkb{}", dev_info.dev_id());
+    let _ = sd_notify::notify(false, &[sd_notify::NotifyState::Ready]);
+    Ok(())
 }
 
 fn stop_cmd(cmd: StopCmd) -> Result<()> {
