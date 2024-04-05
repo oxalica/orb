@@ -8,7 +8,7 @@ use anyhow::{bail, Context, Result};
 use clap::Parser;
 use cli::{Cli, LoginCmd, ServeCmd, StopCmd, VerifyCmd};
 use orb_ublk::{ControlDevice, DeviceBuilder, DeviceInfo};
-use serde::Deserialize;
+use serde::{de, Deserialize};
 use serde_inline_default::serde_inline_default;
 use tokio::runtime::Runtime;
 use tokio::signal::unix as signal;
@@ -56,9 +56,21 @@ struct UblkConfig {
     id: i32,
     #[serde(default)]
     unprivileged: bool,
-    // TODO: Validate these.
     #[serde_inline_default(NonZeroU16::new(64).unwrap())]
+    #[serde(deserialize_with = "de_queue_depth")]
     queue_depth: NonZeroU16,
+}
+
+fn de_queue_depth<'de, D: de::Deserializer<'de>>(de: D) -> Result<NonZeroU16, D::Error> {
+    let v = NonZeroU16::deserialize(de)?;
+    if v.get() <= DeviceBuilder::MAX_QUEUE_DEPTH {
+        Ok(v)
+    } else {
+        Err(de::Error::custom(format_args!(
+            "invalid queue depth exceeding {}",
+            DeviceBuilder::MAX_QUEUE_DEPTH,
+        )))
+    }
 }
 
 fn load_and_verify_config(path: &Path) -> Result<Config> {

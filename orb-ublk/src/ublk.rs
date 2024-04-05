@@ -396,6 +396,15 @@ impl Default for DeviceBuilder {
 }
 
 impl DeviceBuilder {
+    /// The maximal allowed queue depth.
+    pub const MAX_QUEUE_DEPTH: u16 = sys::UBLK_MAX_QUEUE_DEPTH as u16;
+
+    /// The maximal allowed number of queues.
+    pub const MAX_NR_QUEUES: u16 = sys::UBLK_MAX_NR_QUEUES as u16;
+
+    /// The maximal IO buffer size in bytes.
+    pub const MAX_IO_BUF_SIZE: u32 = 1 << sys::UBLK_IO_BUF_BITS;
+
     #[must_use]
     pub fn new() -> Self {
         Self {
@@ -430,27 +439,27 @@ impl DeviceBuilder {
 
     /// # Panics
     ///
-    /// Panic if `nr_hw_queues` is zero or exceeds `UBLK_QID_BITS` bits, which is `1 << 12 = 4096`.
+    /// Panic if `nr_hw_queues` is zero or exceeds [`Self::MAX_NR_QUEUES`].
     pub fn queues(&mut self, nr_hw_queues: u16) -> &mut Self {
-        assert!((1..=(1 << sys::UBLK_QID_BITS)).contains(&nr_hw_queues));
+        assert!((1..=Self::MAX_NR_QUEUES).contains(&nr_hw_queues));
         self.nr_hw_queues = nr_hw_queues;
         self
     }
 
     /// # Panics
     ///
-    /// Panic if `queue_depth` is zero or exceeds `UBLK_MAX_QUEUE_DEPTH` which is 4096.
+    /// Panic if `queue_depth` is zero or exceeds [`Self::MAX_QUEUE_DEPTH`].
     pub fn queue_depth(&mut self, queue_depth: u16) -> &mut Self {
-        assert!((1..=sys::UBLK_MAX_QUEUE_DEPTH as u16).contains(&queue_depth));
+        assert!((1..=Self::MAX_QUEUE_DEPTH).contains(&queue_depth));
         self.queue_depth = queue_depth;
         self
     }
 
     /// # Panics
     ///
-    /// Panic if `bytes` exceeds `UBLK_IO_BUF_BITS` bits, which is `1 << 25` bytes or 32MiB.
+    /// Panic if `bytes` exceeds [`Self::MAX_IO_BUF_SIZE`] bytes.
     pub fn io_buf_size(&mut self, bytes: u32) -> &mut Self {
-        assert!((1..=(1 << sys::UBLK_IO_BUF_BITS)).contains(&bytes));
+        assert!((1..=Self::MAX_IO_BUF_SIZE).contains(&bytes));
         self.io_buf_bytes = bytes;
         self
     }
