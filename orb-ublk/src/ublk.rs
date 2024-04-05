@@ -238,8 +238,7 @@ impl ControlDevice {
                     ublksrv_pid: pid.as_raw_nonzero().get() as _,
                     flags: builder.features.bits(),
                     state: DevState::Dead.into_raw(),
-                    // Unused.
-                    ublksrv_flags: 0,
+                    ublksrv_flags: builder.user_data,
                     // Does not matter here and will always be set by the driver.
                     owner_uid: 0,
                     owner_gid: 0,
@@ -384,6 +383,7 @@ pub struct DeviceBuilder {
     queue_depth: u16,
     io_buf_bytes: u32,
     features: FeatureFlags,
+    user_data: u64,
 
     max_retries: u16,
     retry_delay: Duration,
@@ -414,6 +414,7 @@ impl DeviceBuilder {
             queue_depth: 64,
             io_buf_bytes: DEFAULT_IO_BUF_SIZE,
             features: FeatureFlags::empty(),
+            user_data: 0,
             max_retries: 10,
             retry_delay: Duration::from_millis(100),
         }
@@ -499,6 +500,14 @@ impl DeviceBuilder {
         self
     }
 
+    /// Custom data to store in but invisible to the driver.
+    ///
+    /// It is stored in `ublksrv_flags` field of `ublksrv_ctrl_dev_info`.
+    pub fn user_data(&mut self, data: u64) -> &mut Self {
+        self.user_data = data;
+        self
+    }
+
     pub fn max_retries(&mut self, n: u16) -> &mut Self {
         self.max_retries = n;
         self
@@ -560,6 +569,7 @@ impl fmt::Debug for DeviceInfo {
             .field("dev_id", &self.0.dev_id)
             .field("ublksrv_pid", &self.0.ublksrv_pid)
             .field("flags", &self.flags())
+            .field("user_data", &self.user_data())
             .field("owner_uid", &self.0.owner_uid)
             .field("owner_gid", &self.0.owner_gid)
             .finish()
@@ -622,6 +632,11 @@ impl DeviceInfo {
     #[must_use]
     pub fn flags(&self) -> FeatureFlags {
         FeatureFlags::from_bits_truncate(self.0.flags)
+    }
+
+    #[must_use]
+    pub fn user_data(&self) -> u64 {
+        self.0.ublksrv_flags
     }
 
     #[must_use]

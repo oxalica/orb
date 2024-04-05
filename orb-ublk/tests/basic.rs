@@ -89,12 +89,15 @@ fn get_features(ctl: ControlDevice) {
 
 #[rstest]
 fn create_info_delete(ctl: ControlDevice) {
+    const USER_DATA: u64 = 0xDEAD_BEEF_1234_5678;
+
     let mut builder = DeviceBuilder::new();
     builder
         .name("ublk-test")
         .queues(3)
         .queue_depth(6)
         .io_buf_size(12 << 10)
+        .user_data(USER_DATA)
         .unprivileged();
     let info = ctl.create_device(&builder).unwrap();
     scopeguard::defer_on_unwind! {
@@ -112,6 +115,7 @@ fn create_info_delete(ctl: ControlDevice) {
     assert_eq!(info.queue_depth(), 6);
     assert_eq!(info.io_buf_size(), 12 << 10);
     assert_eq!(info.state(), DevState::Dead);
+    assert_eq!(info.user_data(), USER_DATA);
 
     let info2 = retry_on_perm(|| ctl.get_device_info(info.dev_id())).unwrap();
     assert_eq!(info.dev_id(), info2.dev_id());
@@ -119,6 +123,7 @@ fn create_info_delete(ctl: ControlDevice) {
     assert_eq!(info.queue_depth(), info2.queue_depth());
     assert_eq!(info.io_buf_size(), info2.io_buf_size());
     assert_eq!(info.state(), info2.state());
+    assert_eq!(info.user_data(), info2.user_data());
 
     ctl.delete_device(info.dev_id()).unwrap();
 }
