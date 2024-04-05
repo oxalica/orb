@@ -287,7 +287,7 @@ pub fn init(
         }
     };
 
-    log::info!("logining...");
+    log::info!("logining");
     let (access_token, _) = rt
         .block_on(cred.login(client.clone()))
         .context("failed to login with saved credential")?;
@@ -295,11 +295,14 @@ pub fn init(
     let drive =
         OneDrive::new_with_client(client.clone(), access_token.clone(), DriveLocation::me());
 
+    log::info!("preparing remote directory");
+
+    // Acquire the lock before any change.
     let remote_lock = rt
         .block_on(RemoteLock::lock(&drive, &config.remote_dir))
         .context("failed to acquire remote lock")?;
     let remote_lock = scopeguard::guard(remote_lock, |lock| {
-        log::info!("releasing remote lock...");
+        log::info!("releasing remote lock");
         if let Err(err) = rt.block_on(lock.unlock(&drive)) {
             log::error!("failed to release remote lock: {err}");
         }
@@ -335,7 +338,6 @@ pub fn init(
                 item.parent_reference
             }
             Err(err) if err.status_code() == Some(StatusCode::NOT_FOUND) => {
-                log::info!("initializing remote directory...");
                 drive
                     .upload_small(geometry_file_path, new_data())
                     .await?
@@ -360,7 +362,7 @@ pub fn init(
     .context("failed to read chunks state file")?;
     let state = rt.block_on(async {
         if let Some(mut state) = state {
-            log::info!("fetching remote changes...");
+            log::info!("fetching remote changes");
             match drive
                 .track_root_changes_from_delta_url(&state.delta_url)
                 .await
@@ -376,7 +378,7 @@ pub fn init(
             }
         }
 
-        log::info!("enumerating remote files...");
+        log::info!("enumerating remote files");
         let mut fetcher = drive
             .track_root_changes_from_initial_with_option(
                 CollectionOption::new()
@@ -552,11 +554,11 @@ impl RemoteLock {
         {
             Ok(()) => Ok(()),
             Err(err) if err.status_code() == Some(StatusCode::NOT_FOUND) => {
-                log::warn!("Skip deleting remote lock file because it is already gone: {err}");
+                log::warn!("skip deleting remote lock file because it is already gone: {err}");
                 Ok(())
             }
             Err(err) if err.status_code() == Some(StatusCode::PRECONDITION_FAILED) => {
-                log::warn!("Skip deleting remote lock file since it is not locked by us: {err}");
+                log::warn!("skip deleting remote lock file since it is not locked by us: {err}");
                 Ok(())
             }
             Err(err) => Err(err),
@@ -624,7 +626,7 @@ impl AutoReloginOnedrive {
         let mut state = self.state.write().await;
         // If relogin happened between observations, treat it as done.
         if tick == state.tick {
-            log::info!("token expired, relogining...");
+            log::info!("token expired, relogining");
             let (access_token, _) = match state.cred.login(self.client.clone()).await {
                 Ok(resp) => resp,
                 Err(login_err) => {
@@ -871,7 +873,7 @@ impl Backend for Remote {
                     (Err(err), _)
                         if err.status_code() == Some(StatusCode::RANGE_NOT_SATISFIABLE) =>
                     {
-                        log::warn!("upload session for {path} is out of sync, re-syncing...");
+                        log::warn!("upload session for {path} is out of sync, re-syncing");
                         let new_meta = retry_request(|| sess.get_meta(&self.drive.client))
                             .await
                             .context("failed to get out of sync")?;

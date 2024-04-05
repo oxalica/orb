@@ -125,7 +125,7 @@ impl Config {
         ensure!(
             self.zone_secs.0.is_power_of_two()
                 && self.zone_secs.0.trailing_zeros() + Sector::SHIFT < 31,
-            "Zone size must be a power of two less than i32::MAX",
+            "zone size must be a power of two less than i32::MAX",
         );
         ensure!(
             self.dev_secs % self.zone_secs == Sector(0),
@@ -133,7 +133,7 @@ impl Config {
         );
         ensure!(
             i32::try_from(self.dev_secs / self.zone_secs).is_ok(),
-            "Number of zones must not exceed i32::MAX",
+            "number of zones must not exceed i32::MAX",
         );
         ensure!(
             1 <= self.min_chunk_size && self.min_chunk_size <= self.max_chunk_size,

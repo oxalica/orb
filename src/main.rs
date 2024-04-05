@@ -108,13 +108,13 @@ fn serve_main(cmd: &ServeCmd) -> Result<()> {
             }
             let frontend = serve(&mut rt, &config, remote, chunks)?;
             let frontend = scopeguard::guard(frontend, |frontend| {
-                log::info!("releasing remote lock...");
+                log::info!("releasing remote lock");
                 if let Err(err) = rt.block_on(frontend.into_backend().unlock()) {
                     log::error!("failed to release remote lock: {err}");
                 }
             });
 
-            log::info!("flushing buffers before exit...");
+            log::info!("flushing buffers before exit");
             rt.block_on(orb_ublk::BlockDevice::flush(
                 &*frontend,
                 orb_ublk::IoFlags::empty(),
@@ -143,7 +143,7 @@ fn register_reload_signal(
                     sd_notify::NotifyState::Custom(&format!("MONOTONIC_USEC={ts_usec}")),
                 ],
             );
-            log::info!("signaled to reload...");
+            log::info!("signaled to reload");
             match drive.reload().await {
                 Ok(()) => log::info!("reloaded successfully"),
                 Err(err) => log::error!("failed to reload credentials: {err}"),
@@ -176,7 +176,7 @@ fn serve<B: orb::service::Backend + Debug>(
                 v = sigterm.recv() => v,
             }
             .unwrap();
-            log::info!("Signaled to stop, exiting");
+            log::info!("signaled to stop");
             let _ = sd_notify::notify(false, &[sd_notify::NotifyState::Stopping]);
             stopper.stop();
         });
@@ -189,7 +189,7 @@ fn serve<B: orb::service::Backend + Debug>(
                 use std::time::SystemTime;
 
                 while let Some(()) = sigusr1.recv().await {
-                    log::warn!("debug dumping states...");
+                    log::warn!("debug dumping states");
                     let ts = SystemTime::now()
                         .duration_since(SystemTime::UNIX_EPOCH)
                         .unwrap_or_default();
@@ -224,7 +224,7 @@ fn serve<B: orb::service::Backend + Debug>(
             });
         }
 
-        log::info!("Block device ready at /dev/ublkb{}", dev_info.dev_id());
+        log::info!("block device ready at /dev/ublkb{}", dev_info.dev_id());
         let _ = sd_notify::notify(false, &[sd_notify::NotifyState::Ready]);
         Ok(())
     };
