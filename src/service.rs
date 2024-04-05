@@ -55,8 +55,8 @@ use serde::{Deserialize, Serialize};
 use serde_inline_default::serde_inline_default;
 use tokio::sync::watch;
 
-const MAX_READ_LEN: usize = 1 << 20;
-static ZEROES: &[u8] = &[0u8; MAX_READ_LEN];
+pub const MAX_READ_SECTORS: Sector = Sector::from_bytes(1 << 20);
+static ZEROES: &[u8] = &[0u8; MAX_READ_SECTORS.bytes() as usize];
 
 pub trait Backend: Send + Sync + 'static {
     fn download_chunk(
@@ -484,10 +484,10 @@ impl<B: Backend, const LOGICAL_SECTOR_SIZE: u32> Frontend<B, LOGICAL_SECTOR_SIZE
         params
             .dev_sectors(self.config.dev_secs)
             .logical_block_size(LOGICAL_SECTOR_SIZE.into())
-            // XXX: Chunks should have a 2^k alignment.
-            // .physical_block_size(self.config.min_chunk_size.bytes())
-            // .io_min_size(self.config.min_chunk_size.bytes())
-            // .io_opt_size(self.config.min_chunk_size.bytes())
+            // We cannot assume chunks to be aligned to `min_chunk_size`,
+            // in case of medium WRITE + FLUSH.
+            .physical_block_size(LOGICAL_SECTOR_SIZE.into())
+            .io_max_sectors(MAX_READ_SECTORS)
             .chunk_sectors(self.config.zone_secs)
             // Simulate a rotational device to minimize random I/O (seeks).
             .attrs(DeviceAttrs::Rotational | DeviceAttrs::VolatileCache | DeviceAttrs::Fua)
@@ -519,7 +519,7 @@ impl<B: Backend, const LOGICAL_SECTOR_SIZE: u32> Frontend<B, LOGICAL_SECTOR_SIZE
         (|| {
             let coff = (off % self.config.zone_secs).bytes() as u32;
             let max_len = Ord::min(
-                MAX_READ_LEN as u64,
+                MAX_READ_SECTORS.bytes(),
                 self.config.zone_secs.bytes() - coff as u64,
             );
             if len as u64 > max_len {

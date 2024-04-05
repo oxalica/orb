@@ -250,6 +250,7 @@ fn serve<B: orb::service::Backend + Debug>(
             .name("orb")
             .queues(1)
             .queue_depth(config.ublk.queue_depth.get())
+            .io_buf_size(orb::service::MAX_READ_SECTORS.bytes().try_into().unwrap())
             .zoned()
             .create_service(&ctl)
             .context("failed to create ublk device")?
