@@ -102,10 +102,8 @@ fn serve_main(cmd: &ServeCmd) -> Result<()> {
         BackendConfig::Memory(_) => {
             let memory = orb::memory_backend::Memory::new(&config.device);
             // SAFETY: `DEBUG_PTR` is set correctly in `serve`.
-            let frontend = Frontend::new(config.device, memory, |info, stopper| unsafe {
-                on_ready::<Frontend<orb::memory_backend::Memory>>(info, stopper)
-            })
-            .expect("config is validated");
+            let frontend =
+                Frontend::new(config.device, memory, on_ready).expect("config is validated");
             serve(&ctl, &mut rt, &config, &frontend)?;
         }
         BackendConfig::Onedrive(backend_config) => {
@@ -118,10 +116,8 @@ fn serve_main(cmd: &ServeCmd) -> Result<()> {
             }
 
             // SAFETY: `DEBUG_PTR` is set correctly in `serve`.
-            let frontend = Frontend::new(config.device, remote, |info, stopper| unsafe {
-                on_ready::<Frontend<orb::onedrive_backend::Remote>>(info, stopper)
-            })
-            .expect("config is validated");
+            let frontend =
+                Frontend::new(config.device, remote, on_ready).expect("config is validated");
             let (frontend, rt) = &mut *scopeguard::guard((frontend, rt), |(frontend, rt)| {
                 log::info!("releasing remote lock");
                 if let Err(err) = rt.block_on(frontend.into_backend().unlock()) {
@@ -179,7 +175,9 @@ fn register_reload_signal(
 // Workaround: This is very ugly since scoped_tls support neither fat pointers nor !Sized
 // types. There is a PR but the crate is inactive.
 // See: https://github.com/alexcrichton/scoped-tls/pull/27
-scoped_tls::scoped_thread_local!(static DEBUG_PTR: *const ());
+//
+// Invariant: pointer stored here must be valid for the lifetime of itself.
+scoped_tls::scoped_thread_local!(static DEBUG_PTR: *const dyn Debug);
 
 fn serve<B: orb::service::Backend + Debug>(
     ctl: &ControlDevice,
@@ -196,7 +194,8 @@ fn serve<B: orb::service::Backend + Debug>(
         dev_params.set_io_flusher(true);
     }
 
-    DEBUG_PTR.set(&std::ptr::from_ref(&frontend).cast(), || {
+    // Invariant of `DEBUG_PTR`: `frontend` is valid during this `set` call.
+    DEBUG_PTR.set(&std::ptr::from_ref(frontend as &dyn Debug), || {
         builder
             .name("orb")
             .user_data(ORB_MAGIC)
@@ -211,9 +210,7 @@ fn serve<B: orb::service::Backend + Debug>(
     })
 }
 
-// # Safety
-// Must be called with `DEBUG_PTR` holding a valid `*const T`.
-unsafe fn on_ready<T: Debug>(dev_info: &DeviceInfo, stopper: orb_ublk::Stopper) -> io::Result<()> {
+fn on_ready(dev_info: &DeviceInfo, stopper: orb_ublk::Stopper) -> io::Result<()> {
     let mut sigint = signal::signal(signal::SignalKind::interrupt())?;
     let mut sigterm = signal::signal(signal::SignalKind::terminate())?;
     tokio::task::spawn(async move {
@@ -239,9 +236,8 @@ unsafe fn on_ready<T: Debug>(dev_info: &DeviceInfo, stopper: orb_ublk::Stopper) 
                 let ts = SystemTime::now()
                     .duration_since(SystemTime::UNIX_EPOCH)
                     .unwrap_or_default();
-                let debug_out = DEBUG_PTR
-                    // SAFETY: Guaranteed by the caller.
-                    .with(|&ptr| format!("{:#?}", unsafe { &*ptr.cast::<T>() }));
+                // SAFETY: By the invariant of `DEBUG_PTR`.
+                let debug_out = DEBUG_PTR.with(|&ptr| format!("{:#?}", unsafe { &*ptr }));
 
                 // Spawn detached. No need to join.
                 tokio::task::spawn_blocking(move || {
