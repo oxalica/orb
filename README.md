@@ -110,11 +110,9 @@ Now you can use the module in your `configuration.nix`:
       # Do not forget dependencies.
       requires = [ "orb@my-device.service" ];
       after = [ "orb@my-device.service" ];
-      # It's recommended to set `noatime` and `commit=300` to reduce write
-      # frequency and amplification, but longer `commit` time risks rollbacking
-      # more data on network issues if not `sync`ed. It will not break
-      # filesystem consistency though. Set at your own risk.
-      options = "noatime,commit=300,compress=zstd:7";
+      # It's recommended to set `noatime` and `compress` to reduce write
+      # frequency and amplification.
+      options = "noatime,compress=zstd:7";
     }
   ];
 }
@@ -331,9 +329,9 @@ Otherwise, for released btrfs-progs, do:
 specification.
 
 Now you can mount it and do read/write operations. These are recommended mount
-options (disable atime, 5min commit time, high level zstd compression enabled):
+options (disable atime, high level zstd compression enabled):
 ```console
-sudo mount -t btrfs -o noatime,commit=300,compress=zstd:7 /dev/ublkb<ID> /mnt/my-mount-point
+sudo mount -t btrfs -o noatime,compress=zstd:7 /dev/ublkb<ID> /mnt/my-mount-point
 ```
 
 </details>
