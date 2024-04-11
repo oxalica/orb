@@ -11,7 +11,7 @@ use std::{fmt, io, mem, ptr, thread};
 
 use io_uring::types::{Fd, Fixed};
 use io_uring::{cqueue, opcode, squeue, IoUring, SubmissionQueue};
-use rustix::event::{EventfdFlags, PollFd, PollFlags};
+use rustix::event::{EventfdFlags, PollFlags};
 use rustix::fd::{AsFd, AsRawFd, OwnedFd};
 use rustix::fs::{Gid, Uid};
 use rustix::io::Errno;
@@ -265,28 +265,6 @@ impl ControlDevice {
                 dev_id,
                 [0u8; 0],
                 Default::default(),
-            )?;
-        }
-        Ok(())
-    }
-
-    // This cannot be start alone. IO handlers must be started before it,
-    // or this would block indefinitely.
-    fn start_device(&self, dev_id: u32, pid: Pid) -> io::Result<()> {
-        let pid = pid.as_raw_nonzero().get().try_into().unwrap();
-        log::trace!("start device {dev_id} on pid {pid}");
-        // SAFETY: Valid uring_cmd.
-        unsafe {
-            self.execute_ctrl_cmd_opt_cdev(
-                // Carries no data, so just pass cdev_path anyway.
-                true,
-                sys::UBLK_U_CMD_START_DEV,
-                dev_id,
-                [0u8; 0],
-                sys::ublksrv_ctrl_cmd {
-                    data: [pid],
-                    ..Default::default()
-                },
             )?;
         }
         Ok(())
@@ -836,9 +814,6 @@ impl Service<'_> {
         // No one is actually `read` it, so no need to be a semaphore.
         let exit_fd = Arc::new(rustix::event::eventfd(0, EventfdFlags::CLOEXEC)?);
         thread::scope(|s| {
-            // One element gets produced once a thread is initialized and ready for events.
-            let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel::<()>(nr_queues.into());
-
             // This will be dropped inside the scope, so all threads are signaled to exit
             // during force join.
             let thread_stop_guard = SignalStopOnDrop(exit_fd.as_fd());
@@ -847,7 +822,6 @@ impl Service<'_> {
                 .map(|thread_id| {
                     let cdev = self.cdev.as_fd();
                     let dev_info = self.dev_info;
-                    let ready_tx = ready_tx.clone();
                     let stop_guard = thread_stop_guard.clone();
                     thread::Builder::new()
                         .name(format!("io-worker-{thread_id}"))
@@ -855,7 +829,6 @@ impl Service<'_> {
                             let mut runtime = runtime_builder.build()?;
                             let mut worker = IoWorker {
                                 thread_id,
-                                ready_tx: Some(ready_tx),
                                 cdev,
                                 dev_info: &dev_info,
                                 handler,
@@ -869,25 +842,57 @@ impl Service<'_> {
                 })
                 .collect::<io::Result<Vec<_>>>()?;
 
-            // NB. Wait for all handler threads to be initialized and ready, or `start_device` will
-            // block indefinitely.
-            // If the channel gets closed early, there must be some thread failed. Error messages
-            // will be collected by the join loop below.
-            drop(ready_tx);
-            if let Ok(()) = (0..nr_queues).try_for_each(|_| ready_rx.recv()) {
-                self.ctl.start_device(dev_id, rustix::process::getpid())?;
+            // Wait for device starting and IO worker exit events, concurrently.
+            {
+                const USER_DATA_POLL_EXIT: u64 = 1;
 
-                // Now device is started, and `/dev/ublkbX` appears.
-                *stop_device_guard = true;
-                handler.ready(self.dev_info(), Stopper(Arc::clone(&exit_fd)))?;
+                let mut buf = MaybeUninit::uninit();
+                let ctl = scopeguard::guard(self.ctl, |ctl| {
+                    // Cancel and reset the ring to make state consistent.
+                    sync_cancel_all(&ctl.uring);
+                    unsafe {
+                        ctl.uring.completion_shared().for_each(|_| {});
+                    }
+                });
 
-                let ret = rustix::io::retry_on_intr(|| {
-                    rustix::event::poll(
-                        &mut [PollFd::new(&exit_fd, PollFlags::IN)],
-                        -1, // INFINITE
-                    )
-                })?;
-                assert_eq!(ret, 1);
+                // SAFETY: `ctl` is only used in this thread.
+                unsafe {
+                    let sqe =
+                        opcode::PollAdd::new(Fd(exit_fd.as_raw_fd()), PollFlags::IN.bits().into())
+                            .build()
+                            .user_data(USER_DATA_POLL_EXIT)
+                            .into();
+                    ctl.uring.submission_shared().push(&sqe).unwrap();
+                    ctl.submit_start_device(dev_id, rustix::process::getpid(), &mut buf)
+                        .unwrap();
+                }
+
+                ctl.uring.submit_and_wait(1)?;
+                // SAFETY: `ctl` is only used in this thread.
+                let cqe = unsafe { ctl.uring.completion_shared().next().unwrap() };
+                if cqe.user_data() == USER_DATA_POLL_EXIT {
+                    // Early failure in IO workers during starting.
+                    // The start request will be canceled and cleaned up by scopeguard.
+                    // Error reasons will be collected later.
+                    log::debug!("worker unexpectedly exited during device starting");
+                    assert!(cqe.result() >= 0);
+                } else if cqe.result() < 0 {
+                    // Start failed.
+                    return Err(io::Error::from_raw_os_error(-cqe.result()));
+                } else {
+                    // Device started, and `/dev/ublkbX` should appear now.
+                    *stop_device_guard = true;
+                    handler.ready(self.dev_info(), Stopper(Arc::clone(&exit_fd)))?;
+
+                    // Wait for `exit_fd`.
+                    ctl.uring.submit_and_wait(1)?;
+                    // SAFETY: `ctl` is only used in this thread.
+                    let poll_ret =
+                        unsafe { ctl.uring.completion_shared().next().unwrap().result() };
+                    // Control ring is empty now.
+                    scopeguard::ScopeGuard::into_inner(ctl);
+                    assert!(poll_ret >= 0);
+                }
             }
 
             // Collect panics and errors.
@@ -949,7 +954,6 @@ impl Service<'_> {
 
         let mut worker = IoWorker {
             thread_id: 0,
-            ready_tx: None,
             cdev: self.cdev.as_fd(),
             dev_info: &self.dev_info,
             handler,
@@ -1051,8 +1055,6 @@ fn sync_cancel_all<S: squeue::EntryMarker, C: cqueue::EntryMarker>(uring: &IoUri
 
 struct IoWorker<'a, 'r, B, R> {
     thread_id: u16,
-    // Signal the main thread for service readiness. `None` for `serve_local`.
-    ready_tx: Option<std::sync::mpsc::SyncSender<()>>,
     cdev: BorrowedFd<'a>,
     dev_info: &'a DeviceInfo,
     handler: &'a B,
@@ -1164,12 +1166,6 @@ impl<'r, B: BlockDevice, R: AsyncRuntime + 'r> IoWorker<'_, 'r, B, R> {
         io_ring.submit()?;
 
         log::debug!("IO worker {} initialized", self.thread_id);
-        if let Some(ready_tx) = self.ready_tx.take() {
-            if ready_tx.send(()).is_err() {
-                // Stopping.
-                return Ok(());
-            }
-        }
 
         self.runtime.drive_uring(&io_ring, |spawner| {
             // SAFETY: This is the only place to modify the CQ.
