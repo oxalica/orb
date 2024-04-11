@@ -627,6 +627,11 @@ fn zoned(ctl: ControlDevice) {
     const MAX_ACTIVE_ZONES: u32 = ZONES as u32;
     const MAX_ZONE_APPEND_SECTORS: Sector = Sector::from_bytes(1 << 10);
 
+    if !ctl.get_features().unwrap().contains(FeatureFlags::Zoned) {
+        eprintln!("skipped zoned tests because this kernel does not support it");
+        return;
+    }
+
     let zones = (0..ZONES)
         .map(|i| {
             if i < 2 {
