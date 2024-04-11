@@ -1133,9 +1133,9 @@ impl<'r, B: BlockDevice, R: AsyncRuntime + 'r> IoWorker<'_, 'r, B, R> {
                     },
                 };
                 let cmd_op = if result.is_some() {
-                    sys::UBLK_IO_COMMIT_AND_FETCH_REQ
+                    sys::UBLK_U_IO_COMMIT_AND_FETCH_REQ
                 } else {
-                    sys::UBLK_IO_FETCH_REQ
+                    sys::UBLK_U_IO_FETCH_REQ
                 };
                 let sqe = opcode::UringCmd16::new(CDEV_FIXED_FD, cmd_op)
                     .cmd(unsafe { mem::transmute(cmd) })
