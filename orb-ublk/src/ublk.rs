@@ -1152,9 +1152,7 @@ impl<'r, B: BlockDevice, R: AsyncRuntime + 'r> IoWorker<'_, 'r, B, R> {
         {
             let mut sq = io_ring.submission();
             let fd = if let Some((ctl_uring, _)) = &self.wait_device_start {
-                // Workaround: https://github.com/tokio-rs/io-uring/pull/254
-                // SAFETY: `ctl_uring` is valid.
-                unsafe { BorrowedFd::borrow_raw(ctl_uring.as_raw_fd()) }
+                ctl_uring.as_fd()
             } else {
                 self.stop_guard.0
             };
