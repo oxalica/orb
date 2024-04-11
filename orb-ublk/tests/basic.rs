@@ -130,7 +130,7 @@ fn create_info_delete(ctl: ControlDevice) {
 
 #[rstest]
 #[case::local(1)]
-#[case::threaded(1)]
+#[case::threaded(2)]
 fn device_attrs(ctl: ControlDevice, #[case] queues: u16) {
     const DEV_SECTORS: Sector = Sector::from_bytes(42 << 10);
     let params = *DeviceParams::new()
@@ -367,7 +367,7 @@ fn error(ctl: ControlDevice) {
 #[ignore = "spam dmesg"]
 #[case::local(1)]
 #[ignore = "spam dmesg"]
-#[case::threaded(1)]
+#[case::threaded(2)]
 fn handler_panic(ctl: ControlDevice, #[case] queues: u16) {
     const SIZE_SECTORS: Sector = Sector(1);
     const TEST_ROUNDS: u16 = QUEUE_DEPTH * 2;
