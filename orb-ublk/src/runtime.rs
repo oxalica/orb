@@ -31,6 +31,9 @@ pub trait AsyncScopeSpawner<'env> {
 pub use sync::{Builder as SyncRuntimeBuilder, Runtime as SyncRuntime};
 
 mod sync {
+    use std::cell::RefCell;
+    use std::collections::VecDeque;
+    use std::fmt;
     use std::sync::Arc;
     use std::task::{Context, Poll, Wake};
 
@@ -43,48 +46,60 @@ mod sync {
         type Runtime = Runtime;
 
         fn build(&self) -> io::Result<Self::Runtime> {
-            Ok(Runtime)
+            Ok(Runtime::default())
         }
     }
 
-    #[derive(Debug)]
-    pub struct Runtime;
+    #[derive(Debug, Default)]
+    pub struct Runtime(());
+
+    type TaskQueue<'env> = VecDeque<Pin<Box<dyn Future<Output = ()> + 'env>>>;
 
     impl AsyncRuntime for Runtime {
-        type Spawner<'env> = Spawner;
+        type Spawner<'env> = Spawner<'env>;
 
         fn drive_uring<'env, T, F>(&mut self, uring: &IoUring, mut on_cqe: F) -> io::Result<T>
         where
             F: for<'scope> FnMut(&'scope Self::Spawner<'env>) -> io::Result<ControlFlow<T>>,
         {
+            struct NoopWaker;
+            impl Wake for NoopWaker {
+                fn wake(self: Arc<Self>) {}
+            }
+            let waker = Arc::new(NoopWaker).into();
+            let mut cx = Context::from_waker(&waker);
+
+            let spawner = Spawner(RefCell::new(VecDeque::new()));
             loop {
                 uring.submit_and_wait(1)?;
-                if let ControlFlow::Break(v) = on_cqe(&Spawner)? {
+                if let ControlFlow::Break(v) = on_cqe(&spawner)? {
                     break Ok(v);
+                }
+
+                while let Some(fut) = spawner.0.borrow_mut().pop_front() {
+                    match std::pin::pin!(fut).poll(&mut cx) {
+                        Poll::Ready(()) => {}
+                        Poll::Pending => panic!("sync runtime does not support yielding"),
+                    }
                 }
             }
         }
     }
 
-    #[derive(Debug)]
-    pub struct Spawner;
+    pub struct Spawner<'env>(RefCell<TaskQueue<'env>>);
 
-    impl<'env> AsyncScopeSpawner<'env> for Spawner {
+    impl<'env> fmt::Debug for Spawner<'env> {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.debug_struct("Spawner").finish_non_exhaustive()
+        }
+    }
+
+    impl<'env> AsyncScopeSpawner<'env> for Spawner<'env> {
         fn spawn<Fut>(&self, fut: Fut)
         where
             Fut: Future<Output = ()> + 'env,
         {
-            struct NoopWaker;
-            impl Wake for NoopWaker {
-                fn wake(self: Arc<Self>) {}
-            }
-
-            let waker = Arc::new(NoopWaker).into();
-            let mut cx = Context::from_waker(&waker);
-            match std::pin::pin!(fut).poll(&mut cx) {
-                Poll::Ready(()) => {}
-                Poll::Pending => panic!("sync runtime does not support yielding"),
-            }
+            self.0.borrow_mut().push_back(Box::pin(fut) as _);
         }
     }
 }
