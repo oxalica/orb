@@ -947,7 +947,7 @@ impl Service<'_> {
         let exit_fd = Arc::new(rustix::event::eventfd(0, EventfdFlags::CLOEXEC)?);
         let stopper = Stopper(Arc::clone(&exit_fd));
 
-        let worker = IoWorker {
+        let mut worker = IoWorker {
             thread_id: 0,
             ready_tx: None,
             cdev: self.cdev.as_fd(),
@@ -958,12 +958,7 @@ impl Service<'_> {
             wait_device_start: Some((&self.ctl.uring, stopper)),
             stop_guard: SignalStopOnDrop(exit_fd.as_fd()),
         };
-        let mut worker = scopeguard::guard(worker, |worker| {
-            if worker.wait_device_start.is_some() {
-                // If the service fails before getting ready, no cleanup is needed.
-                return;
-            }
-
+        scopeguard::defer! {
             // Cancel the device starting request, and reset it to empty.
             sync_cancel_all(&self.ctl.uring);
             // SAFETY: `ctl` is held only by the current thread, thus it's exclusively to us here.
@@ -976,7 +971,7 @@ impl Service<'_> {
                     log::error!("failed to stop device {} {}", self.dev_info.dev_id(), err);
                 }
             }
-        });
+        }
         let pid = rustix::process::getpid();
         let mut buf = MaybeUninit::uninit();
         // SAFETY: The `Drop` of `worker` ensures the command get completed or cancelled before
