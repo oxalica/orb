@@ -34,6 +34,11 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
+      - name: Load kernel module ublk_drv
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends --yes "linux-modules-extra-$(uname -r)"
+          sudo modprobe ublk_drv
       - name: Checkout
         uses: actions/checkout@v4
       - name: Install Rust stable
@@ -42,9 +47,10 @@ jobs:
           toolchain: ${{ matrix.rust }}
       - name: Build
         run: cargo build --workspace --all-targets
-      # orb-ublk tests hang for unknow reasons.
-      - name: Build Test
-        run: cargo test --workspace --all-targets --no-run
+      - name: Test
+        run: cargo test --workspace --all-targets -- --include-ignored
+        env:
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER: sudo
 
 
   nix-flake-latest:
