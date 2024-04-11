@@ -256,7 +256,7 @@ fn read_write(ctl: ControlDevice, #[case] flags: FeatureFlags, #[case] queues: u
                     let sector_offset_s = sector_offset.to_string();
                     cmd!(
                         sh,
-                        "dd if=/dev/stdin of={dev_path} bs=512 count=1 oseek={sector_offset_s}"
+                        "dd if=/dev/stdin of={dev_path} bs=512 count=1 seek={sector_offset_s}"
                     )
                     .ignore_stderr()
                     .stdin(buf)
