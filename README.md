@@ -46,7 +46,7 @@ This project is packaged in Nix flake. Here's the simplified output graph:
     ├───x86_64-linux
     │   ├───default: Alias to `orb`.
     │   ├───orb: The main program with systemd units.
-    │   ├───btrfs-progs-fix-zoned-bgt: btrfs-progs with block-group-tree+zoned issue fixed.
+    │   ├───btrfs-progs: btrfs-progs 6.8.1 with block-group-tree+zoned issue fixed.
     │   ├───cryptsetup-format-zoned: workaround script for cryptsetup-luksFormat on zoned devices.
     │   └───ublk-chown-unprivileged: The optional utility for unprivileged ublk.
     [..more Linux platforms are supported..]
@@ -248,17 +248,23 @@ consistency and your data may be lost.
 Details
 </summary>
 
+:warning: cryptsetup does not and probably will not support zoned devices
+natively, because of non-trivial handling logic, see
+[this issue](https://gitlab.com/cryptsetup/cryptsetup/-/issues/877) and
+[this merge request](https://gitlab.com/cryptsetup/cryptsetup/-/merge_requests/638).
+Generally you should avoid this unsupported usage, unless there is no other way
+around.
+
 :warning: Of course, this will destroy all of your data on the emulated device,
 aka. the remote directory in OneDrive holding the data.
 
-Unforunately cryptsetup does not support formatting zoned devices currently
-(see [this issue](https://gitlab.com/cryptsetup/cryptsetup/-/issues/877)),
-though dm-crypt supports it. We need some extra steps for formatting, and then
-it can be opened and/or closed in the normal way.
-
-For convenience, there is a script under
+cryptsetup does not support formatting zoned devices, but dm-crypt supports it.
+We need to format and place the LUKS2 header manually, and then it can be
+opened and/or closed in the normal way. For convenience, there is a script
+under
 [`./contrib/cryptsetup-format-zoned.sh`](./contrib/cryptsetup-format-zoned.sh)
 to mimic `cryptsetup luksFormat` as a workaround. Run:
+
 ```console
 # ./contrib/cryptsetup-format-zoned.sh /dev/ublkb<ID> # Use a a password.
 OR
@@ -269,6 +275,9 @@ Alternatively, you can run the script via flake package:
 ```console
 $ nix shell github:oxalica/orb#cryptsetup-format-zoned -c sudo cryptsetup-format-zoned /dev/ublkb<ID>
 ```
+
+Note that editing header, ie. adding or removing keys, also requires careful
+manual operations. You need do it yourself when needed.
 
 After formatting the block device, you can open and/or close it in the normal
 way:
@@ -309,20 +318,15 @@ Details
 aka. the remote directory in OneDrive holding the data.
 
 It is recommended to format BTRFS with `block-group-tree` feature enabled, to
-dramastically reduce mounting time (~50s to ~2s). But unfortunately btrfs-progs
-currently had [a bug](https://github.com/kdave/btrfs-progs/issues/765) on it
-with zoned device.
-If you have a build of btrfs-progs's
-[`devel` branch](https://github.com/kdave/btrfs-progs/tree/devel), or patched
-version from flake output `btrfs-progs-fix-zoned-bgt` (used as `nix shell
-github:oxalica/orb#btrfs-progs-fix-zoned-bgt`), you can format with:
+dramastically reduce mounting time (~50s to ~2s). You need btrfs-progs >= 6.8.1
+with [a relevant bug](https://github.com/kdave/btrfs-progs/issues/765) getting fixed.
+Since the btrfs-progs in nixpkgs is not updated to that yet, for convenience,
+we provide package btrfs-progs 6.8.1 in flake output
+`btrfs-progs` (used as `nix shell github:oxalica/orb#btrfs-progs`), then you
+can format using it with:
+
 ```console
 # mkfs.btrfs /dev/ublkb<ID> -O block-group-tree
-```
-
-Otherwise, for released btrfs-progs, do:
-```console
-# mkfs.btrfs /dev/ublkb<ID>
 ```
 
 `zoned` feature will be automatically detected and enabled without manual
