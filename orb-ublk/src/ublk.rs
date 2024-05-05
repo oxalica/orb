@@ -152,6 +152,15 @@ impl ControlDevice {
         }
     }
 
+    fn wait_cqe_with_retry(&self, want: usize) -> io::Result<usize> {
+        rustix::io::retry_on_intr(|| {
+            self.uring
+                .submit_and_wait(want)
+                .map_err(|err| Errno::from_io_error(&err).expect("invalid errno"))
+        })
+        .map_err(Into::into)
+    }
+
     unsafe fn execute_ctrl_cmd<T>(
         &self,
         ioctl_op: u32,
@@ -174,12 +183,8 @@ impl ControlDevice {
                 .push(&sqe)
                 .expect("squeue full");
         }
-        rustix::io::retry_on_intr(|| {
-            self.uring
-                .submit_and_wait(1)
-                .map_err(|err| Errno::from_io_error(&err).expect("invalid errno"))
-        })
-        .expect("failed to submit uring_cmd");
+        self.wait_cqe_with_retry(1)
+            .expect("failed to submit uring_cmd");
         // SAFETY: Single-threaded. See above.
         let ret = unsafe {
             self.uring
@@ -867,7 +872,8 @@ impl Service<'_> {
                         .unwrap();
                 }
 
-                ctl.uring.submit_and_wait(1)?;
+                ctl.wait_cqe_with_retry(1)?;
+
                 // SAFETY: `ctl` is only used in this thread.
                 let cqe = unsafe { ctl.uring.completion_shared().next().unwrap() };
                 if cqe.user_data() == USER_DATA_POLL_EXIT {
@@ -885,7 +891,8 @@ impl Service<'_> {
                     handler.ready(self.dev_info(), Stopper(Arc::clone(&exit_fd)))?;
 
                     // Wait for `exit_fd`.
-                    ctl.uring.submit_and_wait(1)?;
+                    ctl.wait_cqe_with_retry(1)?;
+
                     // SAFETY: `ctl` is only used in this thread.
                     let poll_ret =
                         unsafe { ctl.uring.completion_shared().next().unwrap().result() };

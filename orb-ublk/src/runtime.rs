@@ -37,6 +37,8 @@ mod sync {
     use std::sync::Arc;
     use std::task::{Context, Poll, Wake};
 
+    use rustix::io::Errno;
+
     use super::*;
 
     #[derive(Debug)]
@@ -71,7 +73,13 @@ mod sync {
 
             let spawner = Spawner(RefCell::new(VecDeque::new()));
             loop {
-                uring.submit_and_wait(1)?;
+                // Treat EINTR as a success.
+                if let Err(err) = uring.submit_and_wait(1) {
+                    if err.raw_os_error() != Some(Errno::INTR.raw_os_error()) {
+                        return Err(err);
+                    }
+                }
+
                 if let ControlFlow::Break(v) = on_cqe(&spawner)? {
                     break Ok(v);
                 }

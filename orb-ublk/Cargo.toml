@@ -9,6 +9,10 @@ rust-version = "1.76" # result_option_inspect
 default = []
 generate-sys = ["dep:bindgen"]
 
+[[test]]
+name = "interrupt"
+harness = false
+
 [dependencies]
 bitflags = "2.4.2"
 derive_more = "0.99"
@@ -28,6 +32,7 @@ bytesize = "1.3.0"
 clap = { version = "4.4.18", features = ["derive"] }
 ctrlc = "3.4.2"
 env_logger = "0.11"
+libtest-mimic = "0.7.2"
 rand = "0.8.5"
 rstest = "0.19"
 rustix = { version = "0.38.30", features = ["fs"] }
