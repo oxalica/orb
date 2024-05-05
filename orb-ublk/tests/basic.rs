@@ -198,6 +198,95 @@ fn device_attrs(ctl: ControlDevice, #[case] queues: u16) {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+enum StopMethod {
+    InternalStop,
+    ExternalStop,
+    ExternalDelete,
+}
+
+#[rstest]
+fn stop(
+    ctl: ControlDevice,
+    #[values(1, 2)] queues: u16,
+    #[values(
+        StopMethod::InternalStop,
+        StopMethod::ExternalStop,
+        StopMethod::ExternalDelete
+    )]
+    stop_method: StopMethod,
+) {
+    const DELAY: Duration = Duration::from_millis(100);
+
+    let params = *DeviceParams::new()
+        .dev_sectors(Sector(1))
+        .attrs(DeviceAttrs::Rotational);
+
+    let inst = Instant::now();
+    test_service(
+        &ctl,
+        FeatureFlags::empty(),
+        queues,
+        &params,
+        SyncRuntimeBuilder,
+        |tested| Handler {
+            tested,
+            stop_method,
+        },
+    );
+    let elapsed = inst.elapsed();
+    assert!(elapsed > DELAY);
+
+    #[derive(Clone)]
+    struct Handler {
+        tested: Arc<AtomicBool>,
+        stop_method: StopMethod,
+    }
+    impl BlockDevice for Handler {
+        fn ready(&self, dev_info: &DeviceInfo, stop: Stopper) -> io::Result<()> {
+            let Self {
+                tested,
+                stop_method,
+            } = self.clone();
+            let id = dev_info.dev_id();
+            std::thread::spawn(move || {
+                std::thread::sleep(DELAY);
+                tested.store(true, Ordering::Relaxed);
+                match stop_method {
+                    StopMethod::InternalStop => {
+                        stop.stop();
+                    }
+                    StopMethod::ExternalStop => {
+                        ControlDevice::open().unwrap().stop_device(id).unwrap();
+                    }
+                    StopMethod::ExternalDelete => {
+                        ControlDevice::open().unwrap().delete_device(id).unwrap();
+                    }
+                }
+            });
+            Ok(())
+        }
+
+        async fn read(
+            &self,
+            _off: Sector,
+            _buf: &mut ReadBuf<'_>,
+            _flags: IoFlags,
+        ) -> Result<(), Errno> {
+            Err(Errno::IO)
+        }
+
+        async fn write(
+            &self,
+            _off: Sector,
+            _buf: WriteBuf<'_>,
+            _flags: IoFlags,
+        ) -> Result<usize, Errno> {
+            Err(Errno::IO)
+        }
+    }
+}
+
 #[rstest]
 #[case::default_local(FeatureFlags::empty(), 1)]
 #[case::default_threaded(FeatureFlags::empty(), 2)]
