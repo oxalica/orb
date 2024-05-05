@@ -294,7 +294,7 @@ impl ControlDevice {
             dev_id,
             len: CdevPath::MAX_LEN as _,
             dev_path_len: CdevPath::MAX_LEN as _,
-            addr: buf.write(CdevPath::from_id(dev_id)) as *mut _ as u64,
+            addr: ptr::from_mut(buf.write(CdevPath::from_id(dev_id))) as u64,
             data: [pid],
             ..Default::default()
         };
