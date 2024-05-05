@@ -1,1 +1,5 @@
-doc-valid-idents = ["OneDrive", ".."]
+doc-valid-idents = [
+    "OneDrive",
+    "READ", "WRITE", "ZONE_RESET", "ZONE_RESET_ALL", "ZONE_APPEND",
+    "..",
+]

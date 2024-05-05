@@ -234,10 +234,10 @@ impl ChunksState {
                 .with_context(|| format!("failed to process item: {item:?}"))?;
             }
         }
-        self.delta_url = fetcher
+        fetcher
             .delta_url()
             .context("missing final delta url")?
-            .to_owned();
+            .clone_into(&mut self.delta_url);
         Ok(())
     }
 }

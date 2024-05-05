@@ -169,7 +169,7 @@ pub struct Frontend<B, const LOGICAL_SECTOR_SIZE: u32 = { Sector::SIZE }> {
     streams: Mutex<LruCache<u64, DownloadStream>>,
     zones: Box<[Zone]>,
     dirty_zones: Mutex<BTreeSet<Zid>>,
-    /// The global write fence for exclusive write operations (RESET_ALL) or synchronization
+    /// The global write fence for exclusive write operations (ZONE_RESET_ALL) or synchronization
     /// (FLUSH). All remote modification holds a read-guard of this lock.
     exclusive_write_fence: tokio::sync::RwLock<()>,
 

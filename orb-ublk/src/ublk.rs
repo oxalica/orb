@@ -1142,7 +1142,7 @@ impl<'r, B: BlockDevice, R: AsyncRuntime + 'r> IoWorker<'_, 'r, B, R> {
                     sys::UBLK_U_IO_FETCH_REQ
                 };
                 let sqe = opcode::UringCmd16::new(CDEV_FIXED_FD, cmd_op)
-                    .cmd(unsafe { mem::transmute(cmd) })
+                    .cmd(unsafe { mem::transmute::<sys::ublksrv_io_cmd, [u8; 16]>(cmd) })
                     .build()
                     .user_data(i.into());
                 unsafe {
