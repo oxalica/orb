@@ -46,7 +46,6 @@ This project is packaged in Nix flake. Here's the simplified output graph:
     ├───x86_64-linux
     │   ├───default: Alias to `orb`.
     │   ├───orb: The main program with systemd units.
-    │   ├───btrfs-progs: btrfs-progs 6.8.1 with block-group-tree+zoned issue fixed.
     │   ├───cryptsetup-format-zoned: workaround script for cryptsetup-luksFormat on zoned devices.
     │   └───ublk-chown-unprivileged: The optional utility for unprivileged ublk.
     [..more Linux platforms are supported..]
@@ -320,10 +319,6 @@ aka. the remote directory in OneDrive holding the data.
 It is recommended to format BTRFS with `block-group-tree` feature enabled, to
 dramastically reduce mounting time (~50s to ~2s). You need btrfs-progs >= 6.8.1
 with [a relevant bug](https://github.com/kdave/btrfs-progs/issues/765) getting fixed.
-Since the btrfs-progs in nixpkgs is not updated to that yet, for convenience,
-we provide package btrfs-progs 6.8.1 in flake output
-`btrfs-progs` (used as `nix shell github:oxalica/orb#btrfs-progs`), then you
-can format using it with:
 
 ```console
 # mkfs.btrfs /dev/ublkb<ID> -O block-group-tree

@@ -80,15 +80,6 @@ rec {
         };
       };
 
-      btrfs-progs = pkgs.btrfs-progs.overrideAttrs (old: rec {
-        version = "6.8.1";
-        src = pkgs.fetchurl {
-          url = "mirror://kernel/linux/kernel/people/kdave/btrfs-progs/btrfs-progs-v${version}.tar.xz";
-          hash = "sha256-DkCgaKJsKWnLAqlbqf74iNemNW4/RX/5KtJHfQhzVng=";
-        };
-        meta = old.meta // { maintainers = []; };
-      });
-
       cryptsetup-format-zoned = with pkgs; writeShellApplication rec {
         name = "cryptsetup-format-zoned";
         runtimeInputs = [ coreutils util-linux cryptsetup ];
