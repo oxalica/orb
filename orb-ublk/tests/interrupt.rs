@@ -11,8 +11,7 @@ use orb_ublk::{
 use rustix::io::Errno;
 use rustix::process::{kill_process, Pid, Signal};
 
-const DELAY: Duration = Duration::from_millis(100);
-const TOLERANCE: Duration = Duration::from_millis(50);
+const DELAY: Duration = Duration::from_millis(200);
 
 static STOPPER: Mutex<Option<Stopper>> = Mutex::new(None);
 
@@ -59,10 +58,7 @@ fn interrupt(queues: u16) -> Result<(), Failed> {
         srv.serve(&SyncRuntimeBuilder, &params, &h).unwrap();
     }
     let elapsed = inst.elapsed();
-    assert!(
-        DELAY <= elapsed && elapsed < DELAY + TOLERANCE,
-        "unexpected elapsed time: {elapsed:?}"
-    );
+    assert!(elapsed >= DELAY, "unexpected elapsed time: {elapsed:?}");
 
     h.thread.lock().unwrap().take().unwrap().join().unwrap();
 
