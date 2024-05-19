@@ -381,7 +381,7 @@ impl<B: Backend, const LOGICAL_SECTOR_SIZE: u32> Frontend<B, LOGICAL_SECTOR_SIZE
         for (zid, mut zone_chunks) in &all_chunks
             .iter()
             .copied()
-            .group_by(|(global_off, _)| *global_off / zone_size)
+            .chunk_by(|(global_off, _)| *global_off / zone_size)
         {
             ensure!(
                 zid < self.zones.len() as u64,
