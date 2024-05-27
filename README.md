@@ -1,6 +1,6 @@
 # OneDrive as a block device
 
-:warning: This project is in alpha stage.
+:warning: This project is in beta stage.
 
 ## Audience
 
