@@ -13,7 +13,6 @@ use io_uring::types::{Fd, Fixed};
 use io_uring::{cqueue, opcode, squeue, IoUring, SubmissionQueue};
 use rustix::event::{EventfdFlags, PollFlags};
 use rustix::fd::{AsFd, AsRawFd, OwnedFd};
-use rustix::fs::{Gid, Uid};
 use rustix::io::Errno;
 use rustix::mm;
 use rustix::process::Pid;
@@ -623,15 +622,13 @@ impl DeviceInfo {
     }
 
     #[must_use]
-    pub fn owner_uid(&self) -> Uid {
-        // SAFETY: Retrieved from kernel.
-        unsafe { Uid::from_raw(self.0.owner_uid) }
+    pub fn owner_uid(&self) -> u32 {
+        self.0.owner_uid
     }
 
     #[must_use]
-    pub fn owner_gid(&self) -> Gid {
-        // SAFETY: Retrieved from kernel.
-        unsafe { Gid::from_raw(self.0.owner_gid) }
+    pub fn owner_gid(&self) -> u32 {
+        self.0.owner_gid
     }
 }
 
@@ -1661,56 +1658,93 @@ impl Zone {
 
     #[must_use]
     pub fn type_(&self) -> ZoneType {
-        ZoneType::from_repr(self.0.type_).expect("invalid type")
+        ZoneType::try_from(self.0.type_).expect("invalid type")
     }
 
     #[must_use]
     pub fn cond(&self) -> ZoneCond {
-        ZoneCond::from_repr(self.0.cond).expect("invalid cond")
+        ZoneCond::try_from(self.0.cond).expect("invalid cond")
     }
 }
 
+macro_rules! impl_from_repr {
+    ($(
+        #[repr($repr_ty:ident)]
+        $(#[$meta:meta])*
+        $vis:vis enum $name:ident {
+            $(
+                $(#[$field_meta:meta])*
+                $variant:ident = $value:path,
+            )*
+        }
+    )*) => { $(
+        #[repr($repr_ty)]
+        $(#[$meta])*
+        $vis enum $name {
+            $(
+                $(#[$field_meta])*
+                $variant = $value as $repr_ty,
+            )*
+        }
+
+        impl TryFrom<$repr_ty> for $name {
+            type Error = $repr_ty;
+
+            fn try_from(v: $repr_ty) -> Result<Self, Self::Error> {
+                Ok(match v as _ {
+                    $($value => Self::$variant,)*
+                    _ => return Err(v),
+                })
+            }
+        }
+    )* };
+}
+
+impl_from_repr! {
+
+#[repr(u8)]
 /// Type of zones.
 ///
 /// Aka. `enum blk_zone_type`.
 /// See: <https://elixir.bootlin.com/linux/v6.7/source/include/uapi/linux/blkzoned.h#L22>
-#[derive(Debug, Clone, Copy, PartialEq, Eq, strum::FromRepr)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
-#[repr(u8)]
 pub enum ZoneType {
     /// The zone has no write pointer and can be writen randomly. Zone reset has no effect on the
     /// zone.
-    Conventional = sys::BLK_ZONE_TYPE_CONVENTIONAL as u8,
+    Conventional = sys::BLK_ZONE_TYPE_CONVENTIONAL,
     /// The zone must be written sequentially.
-    SeqWriteReq = sys::BLK_ZONE_TYPE_SEQWRITE_REQ as u8,
+    SeqWriteReq = sys::BLK_ZONE_TYPE_SEQWRITE_REQ,
     /// The zone can be written non-sequentially.
-    SeqWritePref = sys::BLK_ZONE_TYPE_SEQWRITE_PREF as u8,
+    SeqWritePref = sys::BLK_ZONE_TYPE_SEQWRITE_PREF,
 }
 
+#[repr(u8)]
 /// Condition/state of a zone in a zoned device.
 ///
 /// Aka. `enum blk_zone_cond`.
 /// See: <https://elixir.bootlin.com/linux/v6.7/source/include/uapi/linux/blkzoned.h#L38>
-#[derive(Debug, Clone, Copy, PartialEq, Eq, strum::FromRepr)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
-#[repr(u8)]
 pub enum ZoneCond {
     /// The zone has no write pointer, it is conventional.
-    NotWp = sys::BLK_ZONE_COND_NOT_WP as u8,
+    NotWp = sys::BLK_ZONE_COND_NOT_WP,
     /// The zone is empty.
-    Empty = sys::BLK_ZONE_COND_EMPTY as u8,
+    Empty = sys::BLK_ZONE_COND_EMPTY,
     /// The zone is open, but not explicitly opened.
-    ImpOpen = sys::BLK_ZONE_COND_IMP_OPEN as u8,
+    ImpOpen = sys::BLK_ZONE_COND_IMP_OPEN,
     /// The zones was explicitly opened by an OPEN ZONE command.
-    ExpOpen = sys::BLK_ZONE_COND_EXP_OPEN as u8,
+    ExpOpen = sys::BLK_ZONE_COND_EXP_OPEN,
     /// The zone was *explicitly* closed after writing.
-    Closed = sys::BLK_ZONE_COND_CLOSED as u8,
+    Closed = sys::BLK_ZONE_COND_CLOSED,
     /// The zone is marked as full, possibly by a zone FINISH ZONE command.
-    Full = sys::BLK_ZONE_COND_FULL as u8,
+    Full = sys::BLK_ZONE_COND_FULL,
     /// The zone is read-only.
-    Readonly = sys::BLK_ZONE_COND_READONLY as u8,
+    Readonly = sys::BLK_ZONE_COND_READONLY,
     /// The zone is offline (sectors cannot be read/written).
-    Offline = sys::BLK_ZONE_COND_OFFLINE as u8,
+    Offline = sys::BLK_ZONE_COND_OFFLINE,
+}
+
 }
 
 trait IntoCResult {

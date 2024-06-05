@@ -1,12 +1,10 @@
 #![allow(clippy::module_name_repetitions)]
 use std::future::Future;
 use std::io;
-use std::marker::PhantomData;
 use std::ops::ControlFlow;
 use std::pin::Pin;
 
 use io_uring::IoUring;
-use rustix::fd::AsRawFd;
 
 pub trait AsyncRuntimeBuilder {
     type Runtime: AsyncRuntime;
@@ -112,11 +110,15 @@ mod sync {
     }
 }
 
+#[cfg(feature = "tokio")]
 pub use tokio_support::Builder as TokioRuntimeBuilder;
 
+#[cfg(feature = "tokio")]
 mod tokio_support {
+    use std::marker::PhantomData;
     use std::ptr::NonNull;
 
+    use rustix::fd::AsRawFd;
     use tokio::io::unix::AsyncFd;
     use tokio::io::Interest;
     use tokio::task::LocalSet;

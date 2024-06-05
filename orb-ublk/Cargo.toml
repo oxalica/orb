@@ -8,20 +8,31 @@ rust-version = "1.76" # result_option_inspect
 [features]
 default = []
 generate-sys = ["dep:bindgen"]
+tokio = ["dep:tokio"]
+
+[[test]]
+name = "basic"
+required-features = ["tokio"]
 
 [[test]]
 name = "interrupt"
 harness = false
 
+[[example]]
+name = "loop"
+required-features = ["tokio"]
+
+[[example]]
+name = "zoned"
+required-features = ["tokio"]
+
 [dependencies]
 bitflags = "2.4.2"
-derive_more = "0.99"
 io-uring = { version = "0.6.3", features = ["io_safety"] }
 log = "0.4.20"
-rustix = { version = "0.38.30", features = ["event", "fs", "mm", "process"] }
+rustix = { version = "0.38.30", features = ["event", "mm", "process"] }
 scopeguard = "1.2.0"
-strum = { version = "0.26", features = ["derive"] }
-tokio = { version = "1.35.1", features = ["net", "rt"] }
+tokio = { version = "1.35.1", features = ["net", "rt"], optional = true }
 
 [build-dependencies]
 bindgen = { version = "0.69.2", optional = true }
