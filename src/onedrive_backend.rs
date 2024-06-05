@@ -782,16 +782,17 @@ impl Backend for Remote {
 
             let range = format!("bytes={read_offset}-");
             // No authentication required.
-            let resp = retry_request(|| {
-                drive
+            let resp = retry_request(|| async {
+                let resp = drive
                     .client
                     .get(url)
                     .header(header::RANGE, range.clone())
                     .send()
-                    .map_err(Into::into)
+                    .await?;
+                resp.error_for_status_ref()?;
+                Ok(resp)
             })
             .await?;
-            resp.error_for_status_ref()?;
             if read_offset != 0 {
                 ensure!(
                     resp.status() == StatusCode::PARTIAL_CONTENT,
