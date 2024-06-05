@@ -59,14 +59,10 @@ rec {
 
         cargoLock.lockFile = ./Cargo.lock;
 
-        buildAndTestSubdir = "orb-ublk";
-        cargoBuildFlags = [ "--example=ublk-chown-unprivileged" ];
-
-        # Tests require ublk_drv.
-        doCheck = false;
+        buildAndTestSubdir = "ublk-chown-unprivileged";
 
         postInstall = ''
-          install -Dm755 -t $out/libexec target/*/release/examples/ublk-chown-unprivileged
+          mv $out/bin $out/libexec
           mkdir -p $out/etc/udev/rules.d
           substitute ./contrib/19-ublk-unprivileged.example.rules $out/etc/udev/rules.d/19-ublk-unprivileged.rules \
             --replace-fail '/usr/libexec/' "$out/libexec/"

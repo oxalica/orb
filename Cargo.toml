@@ -50,7 +50,7 @@ clap_complete = { version = "4", optional = true }
 
 [workspace]
 resolver = "2"
-members = ["orb-ublk"]
+members = ["orb-ublk", "ublk-chown-unprivileged"]
 
 [profile.bench]
 debug = "full"

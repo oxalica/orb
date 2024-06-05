@@ -25,7 +25,7 @@ fn main() -> io::Result<()> {
     let info = ctl.get_device_info(id)?;
     assert_eq!(info.dev_id(), id);
     if info.flags().contains(FeatureFlags::UnprivilegedDev) {
-        rustix::fs::fchown(&f, Some(info.owner_uid()), Some(info.owner_gid()))?;
+        std::os::unix::fs::fchown(&f, Some(info.owner_uid()), Some(info.owner_gid()))?;
     }
     Ok(())
 }

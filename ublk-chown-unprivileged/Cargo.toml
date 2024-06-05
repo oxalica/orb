@@ -1,0 +1,11 @@
+[package]
+name = "ublk-chown-unprivileged"
+version = "0.1.0"
+edition = "2021"
+license = "MIT or Apache-2.0"
+# NB. Sync with CI and README.
+rust-version = "1.76" # orb-ublk
+
+[dependencies]
+orb-ublk = { path = "../orb-ublk" }
+rustix = "0.38"

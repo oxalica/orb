@@ -337,11 +337,13 @@ sudo mount -t btrfs -o noatime,compress=zstd:7 /dev/ublkb<ID> /mnt/my-mount-poin
 
 ## License
 
-The sub-package `orb-ublk` (directory `/orb-ublk` and the whole sub-tree of it)
-is licensed under either of [Apache License, Version
+The sub-package `orb-ublk` and `ublk-chown-unprivileged` (directory
+`/orb-ublk`, `/ublk-chown-unprivileged` and the whole sub-tree of them)
+are licensed under either of [Apache License, Version
 2.0](./orb-ublk/LICENSE-APACHE) or [MIT license](./orb-ublk/LICENSE-MIT) at
 your option.
 
 The main package (all other files in the repository except content of
-`/orb-ublk` directory) is licensed under [GNU General Public License
-v3.0](./LICENSE-GPL-3.0) or (at your option) later versions.
+`/orb-ublk` and/or `/ublk-chown-unprivileged` directory) is licensed under
+[GNU General Public License v3.0](./LICENSE-GPL-3.0) or (at your option) later
+versions.
