@@ -62,6 +62,3 @@ transmute-ptr-to-ptr = "allow"
 missing-panics-doc = "allow"
 cast-lossless = "allow"
 wildcard-imports = "allow"
-
-# WAIT: https://github.com/rust-lang/rust-clippy/issues/12279
-no-effect-underscore-binding = "allow"

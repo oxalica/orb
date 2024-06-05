@@ -71,6 +71,3 @@ too-many-lines = "allow"
 # TODO: Caused by zid and coff are used as u32 and usize interchangably.
 cast-lossless = "allow"
 cast-possible-truncation = "allow"
-
-# WAIT: https://github.com/rust-lang/rust-clippy/issues/12279
-no-effect-underscore-binding = "allow"
