@@ -371,7 +371,15 @@ pub fn init(
                     state.update(&drive, &mut fetcher, &root_dir_id).await?;
                     return Ok(state);
                 }
-                Err(err) if err.status_code() == Some(StatusCode::GONE) => {
+                // The documentation says it would return "410 Gone" when re-synchronization is
+                // required. In practice, this may also return:
+                // `400 Bad Request: (invalidRequest) One of the provided arguments is not acceptable.`
+                Err(err)
+                    if matches!(
+                        err.status_code(),
+                        Some(StatusCode::GONE | StatusCode::BAD_REQUEST)
+                    ) =>
+                {
                     log::info!("delta url gone, re-enumeration is required");
                 }
                 Err(err) => return Err(err.into()),
