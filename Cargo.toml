@@ -67,6 +67,8 @@ missing-panics-doc = "allow"
 # Long sequential tasks (`login::interactive`, `onedrive_backend::init`) where
 # splitting fns can only increase the complexity.
 too-many-lines = "allow"
+# Workaround: https://github.com/rust-lang/rust-clippy/issues/13184
+explicit-iter-loop = "allow"
 
 # TODO: Caused by zid and coff are used as u32 and usize interchangably.
 cast-lossless = "allow"
