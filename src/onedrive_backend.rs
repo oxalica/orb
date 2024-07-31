@@ -12,6 +12,7 @@ use anyhow::{anyhow, bail, ensure, Context, Result};
 use bytes::Bytes;
 use bytesize::ByteSize;
 use futures_util::{Stream, StreamExt, TryFutureExt, TryStreamExt};
+use itertools::Itertools;
 use onedrive_api::option::{CollectionOption, DriveItemPutOption};
 use onedrive_api::resource::DriveItemField;
 use onedrive_api::{
@@ -169,7 +170,7 @@ struct Geometry {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 enum WithVersion<T> {
-    #[serde(rename = "V0")]
+    #[serde(rename = "V1")]
     Inner(T),
 }
 
@@ -177,8 +178,15 @@ enum WithVersion<T> {
 #[serde(deny_unknown_fields)]
 struct ChunksState {
     delta_url: String,
+    root_dir_id: String,
     zones_dir_id: Option<String>,
-    zones: BTreeMap<String, RemoteZone>,
+    items: BTreeMap<String, RemoteItem>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+enum RemoteItem {
+    Zone { zid: u32 },
+    Chunk { zid: u32, coff: u32, size: u64 },
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -197,23 +205,26 @@ impl ChunksState {
         DriveItemField::file,
         DriveItemField::folder,
         DriveItemField::deleted,
+        DriveItemField::root,
     ];
 
     async fn fetch_and_parse(
         drive: &OneDrive,
-        root_dir_id: &str,
+        root_dir_id: String,
         prev_state: Option<Self>,
     ) -> Result<Self> {
-        let do_incremental = match prev_state {
-            None => None,
-            Some(Self {
-                delta_url,
-                zones_dir_id,
-                zones,
-            }) => {
+        let do_incremental = if let Some(Self {
+            delta_url,
+            root_dir_id: prev_root_id,
+            zones_dir_id,
+            items,
+            ..
+        }) = prev_state
+        {
+            if prev_root_id == root_dir_id {
                 log::info!("fetching incremental changes");
                 match drive.track_root_changes_from_delta_url(&delta_url).await {
-                    Ok(fetcher) => Some((fetcher, zones_dir_id, zones)),
+                    Ok(fetcher) => Some((fetcher, zones_dir_id, items)),
                     // The documentation says it would return "410 Gone" when re-synchronization is
                     // required. In practice, this may also return:
                     // `400 Bad Request: (invalidRequest) One of the provided arguments is not acceptable.`
@@ -228,10 +239,15 @@ impl ChunksState {
                     }
                     Err(err) => return Err(err.into()),
                 }
+            } else {
+                log::warn!("remote directory changed, re-enumeration is required");
+                None
             }
+        } else {
+            None
         };
 
-        let (mut fetcher, mut zones_dir_id, mut zones) = if let Some(st) = do_incremental {
+        let (mut fetcher, mut zones_dir_id, mut items) = if let Some(st) = do_incremental {
             st
         } else {
             // Unfortunately, the documentation says only root folder can track changes.
@@ -247,40 +263,51 @@ impl ChunksState {
             (fetcher, None, BTreeMap::new())
         };
 
-        while let Some(items) = fetcher.fetch_next_page(drive).await? {
-            log::info!("fetched {} items", items.len());
-            for mut item in items {
+        while let Some(page_items) = fetcher.fetch_next_page(drive).await? {
+            log::info!("fetched {} items", page_items.len());
+            for mut item in page_items {
                 (|| {
                     let id = item.id.clone().context("missing id")?.0;
-                    let name = item.name.clone().context("missing name")?;
-                    let parent_id = get_parent_id(item.parent_reference.as_deref_mut())
-                        .context("missing parent_reference")?;
                     let is_deleted = item.deleted.is_some();
-                    let hex_off = name.get(1..).and_then(|s| u64::from_str_radix(s, 16).ok());
+
+                    if is_deleted {
+                        // NB. When a folder gets deleted, all items recursively inside generate
+                        // deleted events in a top-down order. Thus we do not need to explicitly
+                        // do recursive remove ourselves.
+                        items.remove(&*id);
+                        if zones_dir_id == Some(id) {
+                            zones_dir_id = None;
+                        }
+                        return Ok(());
+                    }
+
+                    let name = item.name.clone().context("missing name")?;
+                    let Some(parent_id) = get_parent_id(item.parent_reference.as_deref_mut())
+                    else {
+                        // Parent can be missing for root item.
+                        ensure!(item.root.is_some(), "missing parentReference");
+                        return Ok(());
+                    };
+                    let trailing_num = name.get(1..).and_then(|s| u32::from_str_radix(s, 16).ok());
+
                     if parent_id == root_dir_id && item.folder.is_some() && name == "zones" {
-                        zones_dir_id = (!is_deleted).then_some(id);
+                        zones_dir_id = Some(id);
                     } else if Some(&parent_id) == zones_dir_id.as_ref()
                         && item.folder.is_some()
                         && name.starts_with('z')
                     {
-                        if let Some(zid) = hex_off {
-                            if is_deleted {
-                                zones.remove(&id);
-                            } else {
-                                zones.entry(id).or_default().zid = zid;
-                            }
+                        if let Some(zid) = trailing_num {
+                            items.insert(id, RemoteItem::Zone { zid });
                         }
                     } else if name.starts_with('c') && item.file.is_some() {
-                        if let (Some(z), Some(coff)) = (zones.get_mut(&parent_id), hex_off) {
-                            if is_deleted {
-                                z.chunks.remove(&coff);
-                            } else {
-                                let size = item.size.context("missing size")?.try_into()?;
-                                z.chunks.insert(coff, size);
+                        if let Some(coff) = trailing_num {
+                            if let Some(&RemoteItem::Zone { zid }) = items.get(&parent_id) {
+                                let size: u64 = item.size.context("missing size")?.try_into()?;
+                                items.insert(id, RemoteItem::Chunk { zid, coff, size });
                             }
                         }
                     }
-                    anyhow::Ok(())
+                    Ok(())
                 })()
                 .with_context(|| format!("failed to process item: {item:?}"))?;
             }
@@ -292,8 +319,9 @@ impl ChunksState {
             .to_owned();
         Ok(Self {
             delta_url,
+            root_dir_id,
             zones_dir_id,
-            zones,
+            items,
         })
     }
 }
@@ -426,29 +454,43 @@ pub fn init(
 
     let state = rt.block_on(ChunksState::fetch_and_parse(
         &drive,
-        &root_dir_id,
+        root_dir_id,
         prev_state,
     ))?;
     safe_write(&state_file_path, &WithVersion::Inner(&state))
         .context("failed to save chunks state")?;
 
-    let mut chunks = Vec::with_capacity(state.zones.values().map(|z| z.chunks.len()).sum());
-    let zone_cnt = state.zones.len();
-    for (_, zone) in state.zones {
-        let zone_start = geometry
-            .zone_size
-            .checked_mul(zone.zid)
-            .context("zone offset overflow")?;
-        for (coff, size) in zone.chunks {
+    let chunks = {
+        let mut chunks = Vec::with_capacity(state.items.len());
+        for &item in state.items.values() {
+            let RemoteItem::Chunk { zid, coff, size } = item else {
+                continue;
+            };
+            let zone_start = geometry
+                .zone_size
+                .checked_mul(zid.into())
+                .context("zone offset overflow")?;
             let global_off = zone_start
-                .checked_add(coff)
+                .checked_add(coff.into())
                 .context("chunk offset overflow")?;
             chunks.push((global_off, size));
         }
-    }
-    // `ChunksState::zones` are ordered by item ids. We need to sort it by offset.
-    chunks.sort_unstable();
-    log::info!("loaded {} zones, {} chunks", zone_cnt, chunks.len());
+        // `ChunksState::zones` are ordered by item ids. We need to sort it by offset.
+        chunks.sort_unstable();
+
+        let non_empty_zone_cnt = chunks
+            .iter()
+            .chunk_by(|(global_off, _)| *global_off / geometry.zone_size)
+            .into_iter()
+            .count();
+        log::info!(
+            "loaded {} zones ({} non-empty), {} chunks",
+            state.items.len() - chunks.len(),
+            non_empty_zone_cnt,
+            chunks.len(),
+        );
+        chunks
+    };
 
     let drive = Arc::new(AutoReloginOnedrive::new(
         cred,
