@@ -16,7 +16,7 @@ use onedrive_api::option::{CollectionOption, DriveItemPutOption};
 use onedrive_api::resource::DriveItemField;
 use onedrive_api::{
     Auth, ClientCredential, ConflictBehavior, DriveLocation, ItemId, ItemLocation, OneDrive,
-    Permission, Tag, Tenant, TrackChangeFetcher,
+    Permission, Tag, Tenant,
 };
 use parking_lot::Mutex;
 use reqwest::{header, Client, StatusCode};
@@ -164,7 +164,16 @@ struct Geometry {
     zone_size: u64,
 }
 
-#[derive(Debug, Default, Serialize, Deserialize)]
+/// The version of chunks state file. When the saved state file has an older version, it would be
+/// dropped and metadata is re-enumerated (`track_root_changes_from_initial`).
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+enum WithVersion<T> {
+    #[serde(rename = "V0")]
+    Inner(T),
+}
+
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ChunksState {
     delta_url: String,
@@ -190,12 +199,54 @@ impl ChunksState {
         DriveItemField::deleted,
     ];
 
-    async fn update(
-        &mut self,
+    async fn fetch_and_parse(
         drive: &OneDrive,
-        fetcher: &mut TrackChangeFetcher,
         root_dir_id: &str,
-    ) -> Result<()> {
+        prev_state: Option<Self>,
+    ) -> Result<Self> {
+        let do_incremental = match prev_state {
+            None => None,
+            Some(Self {
+                delta_url,
+                zones_dir_id,
+                zones,
+            }) => {
+                log::info!("fetching incremental changes");
+                match drive.track_root_changes_from_delta_url(&delta_url).await {
+                    Ok(fetcher) => Some((fetcher, zones_dir_id, zones)),
+                    // The documentation says it would return "410 Gone" when re-synchronization is
+                    // required. In practice, this may also return:
+                    // `400 Bad Request: (invalidRequest) One of the provided arguments is not acceptable.`
+                    Err(err)
+                        if matches!(
+                            err.status_code(),
+                            Some(StatusCode::GONE | StatusCode::BAD_REQUEST)
+                        ) =>
+                    {
+                        log::info!("delta url gone, re-enumeration is required");
+                        None
+                    }
+                    Err(err) => return Err(err.into()),
+                }
+            }
+        };
+
+        let (mut fetcher, mut zones_dir_id, mut zones) = if let Some(st) = do_incremental {
+            st
+        } else {
+            // Unfortunately, the documentation says only root folder can track changes.
+            // Tracking sub-folders works for me but it is not sure if it is intended.
+            log::info!("enumerating remote files");
+            let fetcher = drive
+                .track_root_changes_from_initial_with_option(
+                    CollectionOption::new()
+                        .select(ChunksState::SELECT_FIELDS)
+                        .page_size(DELTA_PAGE_SIZE),
+                )
+                .await?;
+            (fetcher, None, BTreeMap::new())
+        };
+
         while let Some(items) = fetcher.fetch_next_page(drive).await? {
             log::info!("fetched {} items", items.len());
             for mut item in items {
@@ -207,20 +258,20 @@ impl ChunksState {
                     let is_deleted = item.deleted.is_some();
                     let hex_off = name.get(1..).and_then(|s| u64::from_str_radix(s, 16).ok());
                     if parent_id == root_dir_id && item.folder.is_some() && name == "zones" {
-                        self.zones_dir_id = (!is_deleted).then_some(id);
-                    } else if Some(&parent_id) == self.zones_dir_id.as_ref()
+                        zones_dir_id = (!is_deleted).then_some(id);
+                    } else if Some(&parent_id) == zones_dir_id.as_ref()
                         && item.folder.is_some()
                         && name.starts_with('z')
                     {
                         if let Some(zid) = hex_off {
                             if is_deleted {
-                                self.zones.remove(&id);
+                                zones.remove(&id);
                             } else {
-                                self.zones.entry(id).or_default().zid = zid;
+                                zones.entry(id).or_default().zid = zid;
                             }
                         }
                     } else if name.starts_with('c') && item.file.is_some() {
-                        if let (Some(z), Some(coff)) = (self.zones.get_mut(&parent_id), hex_off) {
+                        if let (Some(z), Some(coff)) = (zones.get_mut(&parent_id), hex_off) {
                             if is_deleted {
                                 z.chunks.remove(&coff);
                             } else {
@@ -234,11 +285,16 @@ impl ChunksState {
                 .with_context(|| format!("failed to process item: {item:?}"))?;
             }
         }
-        fetcher
+
+        let delta_url = fetcher
             .delta_url()
             .context("missing final delta url")?
-            .clone_into(&mut self.delta_url);
-        Ok(())
+            .to_owned();
+        Ok(Self {
+            delta_url,
+            zones_dir_id,
+            zones,
+        })
     }
 }
 
@@ -352,53 +408,29 @@ pub fn init(
 
     // Chunk enumeration.
     let state_file_path = config.state_dir.join(STATE_FILE_NAME);
-    let state = (|| -> Result<Option<ChunksState>> {
+    let prev_state = {
         match fs::read_to_string(&state_file_path) {
-            Ok(content) => Ok(Some(serde_json::from_str(&content)?)),
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(err) => Err(err.into()),
-        }
-    })()
-    .context("failed to read chunks state file")?;
-    let state = rt.block_on(async {
-        if let Some(mut state) = state {
-            log::info!("fetching remote changes");
-            match drive
-                .track_root_changes_from_delta_url(&state.delta_url)
-                .await
-            {
-                Ok(mut fetcher) => {
-                    state.update(&drive, &mut fetcher, &root_dir_id).await?;
-                    return Ok(state);
+            Ok(content) => match serde_json::from_str(&content) {
+                Ok(WithVersion::Inner(st)) => Some(st),
+                Err(err) => {
+                    log::warn!("ignored unparsable chunks state file, assuming program version update: {err}");
+                    None
                 }
-                // The documentation says it would return "410 Gone" when re-synchronization is
-                // required. In practice, this may also return:
-                // `400 Bad Request: (invalidRequest) One of the provided arguments is not acceptable.`
-                Err(err)
-                    if matches!(
-                        err.status_code(),
-                        Some(StatusCode::GONE | StatusCode::BAD_REQUEST)
-                    ) =>
-                {
-                    log::info!("delta url gone, re-enumeration is required");
-                }
-                Err(err) => return Err(err.into()),
+            },
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+            Err(err) => {
+                return Err(anyhow::Error::from(err).context("failed to read chunks state file"))
             }
         }
+    };
 
-        log::info!("enumerating remote files");
-        let mut fetcher = drive
-            .track_root_changes_from_initial_with_option(
-                CollectionOption::new()
-                    .select(ChunksState::SELECT_FIELDS)
-                    .page_size(DELTA_PAGE_SIZE),
-            )
-            .await?;
-        let mut state = ChunksState::default();
-        state.update(&drive, &mut fetcher, &root_dir_id).await?;
-        anyhow::Ok(state)
-    })?;
-    safe_write(&state_file_path, &state).context("failed to save chunks state")?;
+    let state = rt.block_on(ChunksState::fetch_and_parse(
+        &drive,
+        &root_dir_id,
+        prev_state,
+    ))?;
+    safe_write(&state_file_path, &WithVersion::Inner(&state))
+        .context("failed to save chunks state")?;
 
     let mut chunks = Vec::with_capacity(state.zones.values().map(|z| z.chunks.len()).sum());
     let zone_cnt = state.zones.len();
