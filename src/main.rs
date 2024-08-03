@@ -18,6 +18,9 @@ compile_error!("Only Linux is supported because of ublk driver");
 
 mod cli;
 
+/// The environment variable for log level and/or filter.
+const LOG_ENV_VAR: &str = "ORB_LOG";
+
 /// The magic user data for ublk to recognize in `stop` subcommand.
 const ORB_MAGIC: u64 = u64::from_le_bytes(*b"orb\0\0\0\0\0");
 
@@ -26,7 +29,7 @@ const LOGICAL_SECTOR_SIZE: u32 = 4 << 10; // Typical page size.
 type Frontend<B> = orb::service::Frontend<B, LOGICAL_SECTOR_SIZE>;
 
 fn main() -> Result<()> {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+    init_log();
 
     match Cli::parse() {
         Cli::Verify(cmd) => verify_main(&cmd),
@@ -34,6 +37,24 @@ fn main() -> Result<()> {
         Cli::Stop(cmd) => stop_cmd(cmd),
         Cli::Login(cmd) => login_cmd(cmd),
     }
+}
+
+fn init_log() {
+    use tracing::level_filters::LevelFilter;
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::util::SubscriberInitExt;
+
+    let filter = tracing_subscriber::EnvFilter::builder()
+        .with_env_var(LOG_ENV_VAR)
+        .with_default_directive(LevelFilter::INFO.into())
+        .from_env_lossy();
+
+    // TODO: It's better to integrate with systemd-journald via `tracing_journald`, but that would
+    // make all custom fields invisible by plain `journalctl`, which hurt readability a lot.
+    tracing_subscriber::registry()
+        .with(tracing_subscriber::fmt::layer())
+        .with(filter)
+        .init();
 }
 
 #[derive(Debug, Deserialize)]

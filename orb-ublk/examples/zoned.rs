@@ -93,7 +93,7 @@ impl<'de> Deserialize<'de> for ZoneState {
 }
 
 fn main() -> anyhow::Result<()> {
-    env_logger::init();
+    tracing_subscriber::fmt::init();
     let cli = Cli::parse();
 
     let backing_file = File::options()

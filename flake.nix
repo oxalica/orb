@@ -96,7 +96,8 @@ rec {
           buildInputs = [ linuxHeaders openssl ];
           env = {
             RUST_BACKTRACE = "1";
-            RUST_LOG = "debug,orb=trace";
+            ORB_LOG = "orb=debug";
+            RUST_LOG = "orb_ublk=trace";
           };
         };
     });
