@@ -95,7 +95,7 @@ struct LoopDev {
 
 impl BlockDevice for LoopDev {
     fn ready(&self, dev_info: &DeviceInfo, stop: Stopper) -> io::Result<()> {
-        log::info!("device ready on {}", dev_info.dev_id());
+        tracing::info!(dev_id = dev_info.dev_id(), "device ready");
         ctrlc::set_handler(move || stop.stop()).expect("failed to set Ctrl-C hook");
         Ok(())
     }

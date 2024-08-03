@@ -33,6 +33,7 @@ log = "0.4.20"
 rustix = { version = "0.38.30", features = ["event", "mm", "process"] }
 scopeguard = "1.2.0"
 tokio = { version = "1.35.1", features = ["net", "rt"], optional = true }
+tracing = "0.1.40"
 
 [build-dependencies]
 bindgen = { version = "0.69.2", optional = true }
@@ -49,7 +50,7 @@ rustix = { version = "0.38.30", features = ["fs"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1.35.1", features = ["time"] }
-tracing = { version = "0.1.40", features = ["log"] }
+tracing = "0.1.40"
 tracing-subscriber = { version = "0.3.18", features = ["env-filter", "tracing-log"] }
 xshell = "0.2.5"
 

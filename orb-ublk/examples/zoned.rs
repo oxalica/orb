@@ -208,11 +208,7 @@ impl ZonedDev {
 
 impl BlockDevice for ZonedDev {
     fn ready(&self, dev_info: &DeviceInfo, stop: Stopper) -> io::Result<()> {
-        log::info!(
-            "device ready on {}, info: {:?}",
-            dev_info.dev_id(),
-            dev_info,
-        );
+        tracing::info!(dev_id = dev_info.dev_id(), ?dev_info, "device ready");
         ctrlc::set_handler(move || stop.stop()).expect("failed to set Ctrl-C hook");
         Ok(())
     }
@@ -381,6 +377,6 @@ impl BlockDevice for ZonedDev {
 
 #[allow(clippy::needless_pass_by_value)]
 fn convert_err(err: io::Error) -> Errno {
-    log::error!("{err}");
+    tracing::error!(%err);
     Errno::from_io_error(&err).unwrap_or(Errno::IO)
 }
