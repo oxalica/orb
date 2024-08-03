@@ -54,7 +54,7 @@ pub fn interactive(state_dir: &Path, client_id: String) -> Result<()> {
         .context("failed to resolve localhost")?
         .collect::<Vec<_>>();
     ensure!(!localhost_addrs.is_empty(), "no address for localhost");
-    log::debug!("resolved localhost: {localhost_addrs:?}");
+    tracing::debug!(?localhost_addrs);
 
     let (auth, tokens) = rt.block_on(async {
         // Create one listener for each address, but with the same port.
@@ -97,7 +97,7 @@ pub fn interactive(state_dir: &Path, client_id: String) -> Result<()> {
                             .serve_connection(TokioIo::new(stream), service_fn(handler_fn))
                             .await
                         {
-                            log::error!("failed to serve connection: {err}");
+                            tracing::error!(%err, "failed to serve connection");
                         }
                     });
                 }
@@ -110,7 +110,7 @@ pub fn interactive(state_dir: &Path, client_id: String) -> Result<()> {
 
         let auth_url = auth.code_auth_url();
         if let Err(err) = open::that_detached(auth_url.as_str()) {
-            log::error!("failed to open URL in browser: {err}");
+            tracing::error!(%err, "failed to open URL in browser");
         }
         println!(
             "\
@@ -143,7 +143,7 @@ pub fn interactive(state_dir: &Path, client_id: String) -> Result<()> {
     if let Err(err) = std::fs::remove_file(state_path) {
         if err.kind() != io::ErrorKind::NotFound {
             // Not fatal.
-            log::error!("failed to clear states: {err}");
+            tracing::error!(%err, "failed to clear states");
         }
     }
 
