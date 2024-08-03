@@ -149,10 +149,10 @@ impl Credential {
             .take()
             .context("missing new refresh token")?;
         let expire_time = login_time + Duration::from_secs(resp.expires_in_secs);
-        log::info!(
-            "logined and got new tokens valid for {}s (until {})",
-            resp.expires_in_secs,
-            humantime::format_rfc3339_seconds(expire_time),
+        tracing::info!(
+            expire.secs = resp.expires_in_secs,
+            expire.time = %humantime::format_rfc3339_seconds(expire_time),
+            "logined",
         );
         Ok((resp.access_token, expire_time))
     }
@@ -222,7 +222,7 @@ impl ChunksState {
         }) = prev_state
         {
             if prev_root_id == root_dir_id {
-                log::info!("fetching incremental changes");
+                tracing::info!("fetching incremental changes");
                 match drive.track_root_changes_from_delta_url(&delta_url).await {
                     Ok(fetcher) => Some((fetcher, zones_dir_id, items)),
                     // The documentation says it would return "410 Gone" when re-synchronization is
@@ -234,13 +234,13 @@ impl ChunksState {
                             Some(StatusCode::GONE | StatusCode::BAD_REQUEST)
                         ) =>
                     {
-                        log::info!("delta url gone, re-enumeration is required");
+                        tracing::info!("delta url gone, re-enumeration is required");
                         None
                     }
                     Err(err) => return Err(err.into()),
                 }
             } else {
-                log::warn!("remote directory changed, re-enumeration is required");
+                tracing::warn!("remote directory changed, re-enumeration is required");
                 None
             }
         } else {
@@ -252,7 +252,7 @@ impl ChunksState {
         } else {
             // Unfortunately, the documentation says only root folder can track changes.
             // Tracking sub-folders works for me but it is not sure if it is intended.
-            log::info!("enumerating remote files");
+            tracing::info!("enumerating remote files");
             let fetcher = drive
                 .track_root_changes_from_initial_with_option(
                     CollectionOption::new()
@@ -264,7 +264,7 @@ impl ChunksState {
         };
 
         while let Some(page_items) = fetcher.fetch_next_page(drive).await? {
-            log::info!("fetched {} items", page_items.len());
+            tracing::info!("fetched {} items", page_items.len());
             for mut item in page_items {
                 (|| {
                     let id = item.id.clone().context("missing id")?.0;
@@ -361,17 +361,17 @@ pub fn init(
             .context("failed to load user credentials, have you manually setup it?")?;
         match load_credential(&auto_cred_path) {
             Ok(auto_cred) if auto_cred.init_time == user_cred.init_time => {
-                log::info!("user credentials unchanged, use last auto saved tokens");
+                tracing::info!("user credentials unchanged, use last auto saved tokens");
                 auto_cred
             }
             _ => {
-                log::info!("user credentials changed, use user's new tokens");
+                tracing::info!("user credentials changed, use user's new tokens");
                 user_cred
             }
         }
     };
 
-    log::info!("logining");
+    tracing::info!("logging in");
     let (access_token, _) = rt
         .block_on(cred.login(client.clone()))
         .context("failed to login with saved credential")?;
@@ -379,16 +379,16 @@ pub fn init(
     let drive =
         OneDrive::new_with_client(client.clone(), access_token.clone(), DriveLocation::me());
 
-    log::info!("preparing remote directory");
+    tracing::info!("preparing remote directory");
 
     // Acquire the lock before any change.
     let remote_lock = rt
         .block_on(RemoteLock::lock(&drive, &config.remote_dir))
         .context("failed to acquire remote lock")?;
     let remote_lock = scopeguard::guard(remote_lock, |lock| {
-        log::info!("releasing remote lock");
+        tracing::info!("releasing remote lock");
         if let Err(err) = rt.block_on(lock.unlock(&drive)) {
-            log::error!("failed to release remote lock: {err}");
+            tracing::error!(%err, "failed to release remote lock");
         }
     });
 
@@ -416,7 +416,11 @@ pub fn init(
                     "geometry mismatch, remote: {remote_geometry:?}, config: {geometry:?}",
                 );
                 if geometry.dev_size > remote_geometry.dev_size {
-                    log::info!("changing device geometry from {remote_geometry:?} to {geometry:?}");
+                    tracing::info!(
+                        ?remote_geometry,
+                        new_geometry = ?geometry,
+                        "changing remote device geometry"
+                    );
                     drive.upload_small(geometry_file_path, new_data()).await?;
                 }
                 item.parent_reference
@@ -432,7 +436,7 @@ pub fn init(
         get_parent_id(parent.as_deref_mut()).context("missing parent id")
     })?;
 
-    log::info!("root directory id: {root_dir_id}");
+    tracing::info!(%root_dir_id);
 
     // Chunk enumeration.
     let state_file_path = config.state_dir.join(STATE_FILE_NAME);
@@ -441,7 +445,7 @@ pub fn init(
             Ok(content) => match serde_json::from_str(&content) {
                 Ok(WithVersion::Inner(st)) => Some(st),
                 Err(err) => {
-                    log::warn!("ignored unparsable chunks state file, assuming program version update: {err}");
+                    tracing::warn!(%err, "ignored unparsable chunks state file, assuming program version update");
                     None
                 }
             },
@@ -483,11 +487,10 @@ pub fn init(
             .chunk_by(|(global_off, _)| *global_off / geometry.zone_size)
             .into_iter()
             .count();
-        log::info!(
-            "loaded {} zones ({} non-empty), {} chunks",
-            state.items.len() - chunks.len(),
-            non_empty_zone_cnt,
-            chunks.len(),
+        tracing::info!(
+            zones.total = state.items.len() - chunks.len(),
+            zones.non_empty = non_empty_zone_cnt,
+            chunks = chunks.len(),
         );
         chunks
     };
@@ -546,7 +549,7 @@ impl RemoteLockInfo {
         let hostname = match hostname::get() {
             Ok(name) => name.to_string_lossy().into_owned(),
             Err(err) => {
-                log::error!("failed to get hostname: {err}");
+                tracing::error!(%err, "failed to get hostname");
                 "<unknown>".to_owned()
             }
         };
@@ -594,7 +597,7 @@ impl RemoteLock {
                 }
                 Err(upload_err) => {
                     if let Err(err) = sess.delete(drive.client()).await {
-                        log::error!("failed to delete upload session: {err}");
+                        tracing::error!(%err, "failed to delete upload session");
                     }
                     upload_err
                 }
@@ -616,7 +619,7 @@ impl RemoteLock {
         let info = match info {
             Ok(info) => format!("{:?} at {:?}", info.hostname, info.timestamp_str),
             Err(err) => {
-                log::error!("failed to read remote lock info: {err}");
+                tracing::error!(%err, "failed to read remote lock info");
                 "<unknown>".to_owned()
             }
         };
@@ -636,11 +639,14 @@ impl RemoteLock {
         {
             Ok(()) => Ok(()),
             Err(err) if err.status_code() == Some(StatusCode::NOT_FOUND) => {
-                log::warn!("skip deleting remote lock file because it is already gone: {err}");
+                tracing::warn!(%err, "skip deleting remote lock file because it is already gone");
                 Ok(())
             }
             Err(err) if err.status_code() == Some(StatusCode::PRECONDITION_FAILED) => {
-                log::warn!("skip deleting remote lock file since it is not locked by us: {err}");
+                tracing::warn!(
+                    %err,
+                    "skip deleting remote lock file since it is not locked by us",
+                );
                 Ok(())
             }
             Err(err) => Err(err),
@@ -708,11 +714,11 @@ impl AutoReloginOnedrive {
         let mut state = self.state.write().await;
         // If relogin happened between observations, treat it as done.
         if tick == state.tick {
-            log::info!("token expired, relogining");
+            tracing::info!("token expired, re-logging in");
             let (access_token, _) = match state.cred.login(self.client.clone()).await {
                 Ok(resp) => resp,
                 Err(login_err) => {
-                    log::error!("relogin failed: {login_err}");
+                    tracing::error!(err = %login_err, "relogin failed");
                     return Err(req_err.into());
                 }
             };
@@ -726,7 +732,7 @@ impl AutoReloginOnedrive {
             let auto_cred_path = self.state_dir.join(AUTO_CREDENTIAL_FILE_NAME);
             tokio::task::spawn_blocking(move || {
                 if let Err(save_err) = safe_write(&auto_cred_path, &cred) {
-                    log::error!("failed to save new refresh token: {save_err}");
+                    tracing::error!(err = %save_err, "failed to save new refresh token");
                 }
             });
         }
@@ -742,7 +748,7 @@ impl AutoReloginOnedrive {
             .context("failed to load user credentials")?;
         let prev_init_time = self.state.read().await.cred.init_time;
         if user_cred.init_time == prev_init_time {
-            log::info!("user credentials unchanged, do nothing");
+            tracing::info!("user credentials unchanged, do nothing");
             return Ok(());
         }
 
@@ -833,6 +839,8 @@ impl Backend for Remote {
         coff: u32,
         read_offset: u64,
     ) -> impl Stream<Item = Result<Bytes>> + Send + 'static {
+        use tracing_futures::Instrument;
+
         let (cell, accounting) = {
             let mut cache = self.download_url_cache.lock();
             if let Some(cell) = cache.get(&(zid, coff)) {
@@ -848,19 +856,21 @@ impl Backend for Remote {
         };
         accounting.fetch_add(1, Ordering::Relaxed);
 
-        let drive = self.drive.clone();
         let path = self.chunk_path(zid, coff);
+        let span = tracing::info_span!("download_chunk", zid, coff, read_offset, path);
+
+        let drive = self.drive.clone();
         let fut = async move {
             let loc = ItemLocation::from_path(&path).unwrap();
             let url = cell
                 .0
                 .get_or_try_init(|| {
-                    log::debug!("fetching download url of chunk {path}");
+                    tracing::trace!("fetching download url");
                     drive.with(|drive| async move { drive.get_item_download_url(loc).await })
                 })
                 .await?;
 
-            log::debug!("downloading chunk {path} starting at {read_offset}B");
+            tracing::debug!("downloading chunk");
 
             let range = format!("bytes={read_offset}-");
             // No authentication required.
@@ -891,13 +901,15 @@ impl Backend for Remote {
                 .take_while(|ret| ready(!matches!(ret, Err(err) if err.is_body())))
                 .map_err(anyhow::Error::from))
         };
-        fut.try_flatten_stream()
+        fut.try_flatten_stream().instrument(span)
     }
 
+    #[tracing::instrument(skip_all, fields(zid, coff, path = self.chunk_path(zid, coff), data_len = data.len()))]
     async fn upload_chunk(&self, zid: u32, coff: u32, data: Bytes) -> Result<()> {
+        tracing::debug!("uploading chunk");
+
         let path = self.chunk_path(zid, coff);
         let total_len = data.len();
-        log::debug!("uploading chunk {path} with {total_len}B");
         let loc = ItemLocation::from_path(&path).unwrap();
 
         let _item = if total_len <= SESSION_UPLOAD_THRESHOLD {
@@ -956,7 +968,7 @@ impl Backend for Remote {
                     (Err(err), _)
                         if err.status_code() == Some(StatusCode::RANGE_NOT_SATISFIABLE) =>
                     {
-                        log::warn!("upload session for {path} is out of sync, re-syncing");
+                        tracing::warn!("upload session is out of sync, re-syncing");
                         let new_meta = retry_request(|| sess.get_meta(&self.drive.client))
                             .await
                             .context("failed to get out of sync")?;
@@ -974,14 +986,14 @@ impl Backend for Remote {
                         );
                         let prev_offset = mem::replace(&mut offset, expected[0].start);
                         rest = rest.slice((offset - prev_offset) as usize..);
-                        log::info!("upload position for {path} skipped from {prev_offset} to {offset}/{total_len}");
+                        tracing::info!("upload position skipped from {prev_offset} to {offset}");
                         continue;
                     }
                     (Err(err), _) => err.into(),
                 };
                 // No authentication required.
                 if let Err(err) = sess.delete(&self.drive.client).await {
-                    log::error!("failed to delete upload session for {path}: {err}");
+                    tracing::error!(%err, "failed to delete upload session");
                 }
                 return Err(err);
             }
@@ -996,9 +1008,10 @@ impl Backend for Remote {
         Ok(())
     }
 
+    #[tracing::instrument(skip_all, fields(self, path = self.zone_path(zid)))]
     async fn delete_zone(&self, zid: u32) -> Result<()> {
+        tracing::debug!("deleting zone");
         let path = self.zone_path(zid);
-        log::debug!("deleting {path}");
         let path = ItemLocation::from_path(&path).unwrap();
         self.drive
             .with(|drive| async move { drive.delete(path).await })
@@ -1008,9 +1021,10 @@ impl Backend for Remote {
         Ok(())
     }
 
+    #[tracing::instrument(skip_all, fields(path = self.all_zones_dir_path()))]
     async fn delete_all_zones(&self) -> Result<()> {
+        tracing::debug!("deleting all zones");
         let path = self.all_zones_dir_path();
-        log::debug!("deleting all {path}");
         let path = ItemLocation::from_path(&path).unwrap();
         self.drive
             .with(|drive| async move { drive.delete(path).await })
@@ -1099,8 +1113,12 @@ where
                     && retry_num <= SERVER_ERROR_RETRY_CNT =>
             {
                 let delay = err.retry_after().unwrap_or(next_delay);
-                log::warn!(
-                    "retry {retry_num}/{SERVER_ERROR_RETRY_CNT} in {delay:?} on error: {err}",
+                tracing::warn!(
+                    retry.cnt = retry_num,
+                    retry.max = SERVER_ERROR_RETRY_CNT,
+                    retry.delay = ?delay,
+                    %err,
+                    "retrying on error",
                 );
                 retry_num += 1;
                 tokio::time::sleep(delay).await;

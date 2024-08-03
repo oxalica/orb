@@ -18,6 +18,9 @@ compile_error!("Only Linux is supported because of ublk driver");
 
 mod cli;
 
+/// The environment variable for log level and/or filter.
+const LOG_ENV_VAR: &str = "ORB_LOG";
+
 /// The magic user data for ublk to recognize in `stop` subcommand.
 const ORB_MAGIC: u64 = u64::from_le_bytes(*b"orb\0\0\0\0\0");
 
@@ -26,7 +29,7 @@ const LOGICAL_SECTOR_SIZE: u32 = 4 << 10; // Typical page size.
 type Frontend<B> = orb::service::Frontend<B, LOGICAL_SECTOR_SIZE>;
 
 fn main() -> Result<()> {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+    init_log();
 
     match Cli::parse() {
         Cli::Verify(cmd) => verify_main(&cmd),
@@ -34,6 +37,24 @@ fn main() -> Result<()> {
         Cli::Stop(cmd) => stop_cmd(cmd),
         Cli::Login(cmd) => login_cmd(cmd),
     }
+}
+
+fn init_log() {
+    use tracing::level_filters::LevelFilter;
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::util::SubscriberInitExt;
+
+    let filter = tracing_subscriber::EnvFilter::builder()
+        .with_env_var(LOG_ENV_VAR)
+        .with_default_directive(LevelFilter::INFO.into())
+        .from_env_lossy();
+
+    // TODO: It's better to integrate with systemd-journald via `tracing_journald`, but that would
+    // make all custom fields invisible by plain `journalctl`, which hurt readability a lot.
+    tracing_subscriber::registry()
+        .with(tracing_subscriber::fmt::layer())
+        .with(filter)
+        .init();
 }
 
 #[derive(Debug, Deserialize)]
@@ -119,9 +140,9 @@ fn serve_main(cmd: &ServeCmd) -> Result<()> {
             let frontend =
                 Frontend::new(config.device, remote, on_ready).expect("config is validated");
             let (frontend, rt) = &mut *scopeguard::guard((frontend, rt), |(frontend, rt)| {
-                log::info!("releasing remote lock");
+                tracing::info!("releasing remote lock");
                 if let Err(err) = rt.block_on(frontend.into_backend().unlock()) {
-                    log::error!("failed to release remote lock: {err}");
+                    tracing::error!(%err, "failed to release remote lock");
                 }
             });
 
@@ -132,14 +153,14 @@ fn serve_main(cmd: &ServeCmd) -> Result<()> {
 
             serve(&ctl, rt, &config, frontend)?;
 
-            log::info!("flushing buffers before exit");
+            tracing::info!("flushing buffers before exit");
             rt.block_on(orb_ublk::BlockDevice::flush(
                 &*frontend,
                 orb_ublk::IoFlags::empty(),
             ))
             // Error reasons should be reported inside `flush`, the returned error here is
             // always EIO and carrying no information.
-            .inspect_err(|_| log::error!("final flush failed, data may be lost!"))?;
+            .inspect_err(|_| tracing::error!("final flush failed, data may be lost!"))?;
         }
     }
     Ok(())
@@ -161,10 +182,10 @@ fn register_reload_signal(
                     sd_notify::NotifyState::Custom(&format!("MONOTONIC_USEC={ts_usec}")),
                 ],
             );
-            log::info!("signaled to reload");
+            tracing::info!("signaled to reload");
             match drive.reload().await {
-                Ok(()) => log::info!("reloaded successfully"),
-                Err(err) => log::error!("failed to reload credentials: {err}"),
+                Ok(()) => tracing::info!("reloaded successfully"),
+                Err(err) => tracing::error!(%err, "failed to reload credentials"),
             }
             let _ = sd_notify::notify(false, &[sd_notify::NotifyState::Ready]);
         }
@@ -219,7 +240,7 @@ fn on_ready(dev_info: &DeviceInfo, stopper: orb_ublk::Stopper) -> io::Result<()>
             v = sigterm.recv() => v,
         }
         .unwrap();
-        log::info!("signaled to stop");
+        tracing::info!("signaled to stop");
         let _ = sd_notify::notify(false, &[sd_notify::NotifyState::Stopping]);
         stopper.stop();
     });
@@ -232,7 +253,7 @@ fn on_ready(dev_info: &DeviceInfo, stopper: orb_ublk::Stopper) -> io::Result<()>
             use std::time::SystemTime;
 
             while let Some(()) = sigusr1.recv().await {
-                log::warn!("debug dumping states");
+                tracing::warn!("debug dumping states");
                 let ts = SystemTime::now()
                     .duration_since(SystemTime::UNIX_EPOCH)
                     .unwrap_or_default();
@@ -254,9 +275,13 @@ fn on_ready(dev_info: &DeviceInfo, stopper: orb_ublk::Stopper) -> io::Result<()>
                         .open(&path)
                         .and_then(|mut f| f.write_all(debug_out.as_bytes()));
                     match ret {
-                        Ok(()) => log::warn!("debug dump saved at {}", path.display()),
+                        Ok(()) => tracing::warn!(path = %path.display(), "debug dump saved"),
                         Err(err) => {
-                            log::error!("failed to save debug dump to {}: {}", path.display(), err);
+                            tracing::error!(
+                                path = %path.display(),
+                                %err,
+                                "failed to save debug dump",
+                            );
                         }
                     }
                 });
@@ -264,7 +289,7 @@ fn on_ready(dev_info: &DeviceInfo, stopper: orb_ublk::Stopper) -> io::Result<()>
         });
     }
 
-    log::info!("block device ready at /dev/ublkb{}", dev_info.dev_id());
+    tracing::info!("block device ready at /dev/ublkb{}", dev_info.dev_id());
     let _ = sd_notify::notify(false, &[sd_notify::NotifyState::Ready]);
     Ok(())
 }

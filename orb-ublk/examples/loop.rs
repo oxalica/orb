@@ -34,7 +34,7 @@ struct Cli {
 }
 
 fn main() -> anyhow::Result<()> {
-    env_logger::init();
+    tracing_subscriber::fmt::init();
     let cli = Cli::parse();
 
     let file = File::options()
@@ -95,7 +95,7 @@ struct LoopDev {
 
 impl BlockDevice for LoopDev {
     fn ready(&self, dev_info: &DeviceInfo, stop: Stopper) -> io::Result<()> {
-        log::info!("device ready on {}", dev_info.dev_id());
+        tracing::info!(dev_id = dev_info.dev_id(), "device ready");
         ctrlc::set_handler(move || stop.stop()).expect("failed to set Ctrl-C hook");
         Ok(())
     }

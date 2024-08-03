@@ -298,7 +298,7 @@ impl TailChunk {
         // It is not documentated that `BytesMut::freeze` do not allocate. If it does and panics,
         // buffered data would be lost and there is no way to handle that.
         scopeguard::defer_on_unwind! {
-            log::error!("data left inconsistent on panic");
+            tracing::error!("data left inconsistent on panic");
             std::process::abort();
         }
         let buf = match std::mem::replace(self, TailChunk::Buffer(BytesMut::new())) {
@@ -449,26 +449,16 @@ impl<B: Backend, const LOGICAL_SECTOR_SIZE: u32> Frontend<B, LOGICAL_SECTOR_SIZE
             *zone.chunk_ends.get_mut() = chunk_ends;
         }
 
-        let mut ret = Ok(());
         for (zid, coff, len, download_ret) in
             futures_util::future::join_all(download_tail_futs).await
         {
-            match download_ret {
-                Ok(data) => {
-                    assert_eq!(data.len(), len);
-                    *self.zones[zid as usize].tail.get_mut() =
-                        TailChunk::Buffer(BytesMut::from(&data[..]));
-                }
-                Err(err) => {
-                    let err = err.context(format!(
-                        "failed to download tail chunk at zid={zid} tail_coff={coff} len={len}"
-                    ));
-                    log::debug!("{err}");
-                    ret = ret.and(Err(err));
-                }
-            }
+            let data = download_ret.with_context(|| {
+                format!("failed to download tail chunk at zid={zid} tail_coff={coff} len={len}")
+            })?;
+            assert_eq!(data.len(), len);
+            *self.zones[zid as usize].tail.get_mut() = TailChunk::Buffer(BytesMut::from(&data[..]));
         }
-        ret
+        Ok(())
     }
 
     pub fn backend(&self) -> &B {
@@ -504,20 +494,20 @@ impl<B: Backend, const LOGICAL_SECTOR_SIZE: u32> Frontend<B, LOGICAL_SECTOR_SIZE
         &self.zones[zid.0 as usize]
     }
 
-    fn to_zone_id(&self, off: Sector) -> Result<Zid, Errno> {
-        match u32::try_from(off / self.config.zone_secs) {
+    fn to_zone_id(&self, offset: Sector) -> Result<Zid, Errno> {
+        match u32::try_from(offset / self.config.zone_secs) {
             Ok(zid) if (zid as usize) < self.zones.len() => Ok(Zid(zid)),
             _ => {
-                log::error!("invalid offset {off}");
+                tracing::error!(%offset, "invalid offset");
                 Err(Errno::INVAL)
             }
         }
     }
 
-    fn check_zone_and_range(&self, off: Sector, len: usize) -> Result<(Zid, u32), Errno> {
-        let zid = self.to_zone_id(off)?;
+    fn check_zone_and_range(&self, offset: Sector, len: usize) -> Result<(Zid, u32), Errno> {
+        let zid = self.to_zone_id(offset)?;
         (|| {
-            let coff = (off % self.config.zone_secs).bytes() as u32;
+            let coff = (offset % self.config.zone_secs).bytes() as u32;
             let max_len = Ord::min(
                 MAX_READ_SECTORS.bytes(),
                 self.config.zone_secs.bytes() - coff as u64,
@@ -528,7 +518,7 @@ impl<B: Backend, const LOGICAL_SECTOR_SIZE: u32> Frontend<B, LOGICAL_SECTOR_SIZE
             Some((zid, coff))
         })()
         .ok_or_else(|| {
-            log::error!("invalid range: offset={off}, length={len}");
+            tracing::error!(%offset, len, "invalid range");
             Errno::INVAL
         })
     }
@@ -557,10 +547,7 @@ impl<B: Backend, const LOGICAL_SECTOR_SIZE: u32> Frontend<B, LOGICAL_SECTOR_SIZE
             let prev_wp = tail_coff + tail.as_ref().len() as u32;
             if let Some(coff) = coff {
                 if coff != prev_wp {
-                    log::warn!(
-                        "nonsequential write: zid={zid} rel_wp={prev_wp} coff={coff} len={}",
-                        buf.len()
-                    );
+                    tracing::warn!(%zid, prev_wp, coff, len = buf.len(), "nonsequential write");
                     return Err(Errno::IO);
                 }
             }
@@ -617,7 +604,7 @@ impl<B: Backend, const LOGICAL_SECTOR_SIZE: u32> Frontend<B, LOGICAL_SECTOR_SIZE
         let len = data.len();
         self.accounting.chunk_commit.fetch_add(1, Ordering::Relaxed);
         if let Err(err) = self.backend.upload_chunk(zid.0, coff, data).await {
-            log::error!("failed to upload chunk at zid={zid} coff={coff} len={len}: {err}");
+            tracing::error!(%zid, coff, len, %err, "failed to upload chunk");
             // NB. Intentionally keep it in `TailChunk::Uploading` state,
             // poison all following writes.
             return Err(Errno::IO);
@@ -730,7 +717,7 @@ impl<B: Backend, const LOGICAL_SECTOR_SIZE: u32> BlockDevice for Frontend<B, LOG
                 .and_then(|_| stream.state.lock().take())
             else {
                 self.accounting.stream_hup.fetch_add(1, Ordering::Relaxed);
-                log::debug!("stream ended early, retrying");
+                tracing::debug!("stream ended early, retrying");
                 if flags.contains(IoFlags::FailfastDev) {
                     return Err(Errno::AGAIN);
                 }
@@ -750,16 +737,18 @@ impl<B: Backend, const LOGICAL_SECTOR_SIZE: u32> BlockDevice for Frontend<B, LOG
                 Ok(()) => buf.put_slice(&data)?,
                 Err(err) if err.kind() == io::ErrorKind::UnexpectedEof => {
                     self.accounting.stream_hup.fetch_add(1, Ordering::Relaxed);
-                    log::debug!("stream ended early, retrying");
+                    tracing::debug!("stream ended early, retrying");
                     if flags.contains(IoFlags::FailfastDev) {
                         return Err(Errno::AGAIN);
                     }
                     continue;
                 }
                 Err(err) => {
-                    log::error!(
-                        "failed to download chunk at zone={zid} coff={coff}: {err}",
+                    tracing::error!(
+                        %zid,
                         coff = stream.coff,
+                        %err,
+                        "failed to download chunk",
                     );
                     return Err(Errno::IO);
                 }
@@ -929,7 +918,7 @@ impl<B: Backend, const LOGICAL_SECTOR_SIZE: u32> BlockDevice for Frontend<B, LOG
 
         self.accounting.zone_reset.fetch_add(1, Ordering::Relaxed);
         if let Err(err) = self.backend.delete_zone(zid.0).await {
-            log::error!("failed to delete zone {zid}: {err}");
+            tracing::error!(%zid, %err, "failed to delete zone");
             return Err(Errno::IO);
         }
 
@@ -947,7 +936,7 @@ impl<B: Backend, const LOGICAL_SECTOR_SIZE: u32> BlockDevice for Frontend<B, LOG
             .zone_reset_all
             .fetch_add(1, Ordering::Relaxed);
         if let Err(err) = self.backend.delete_all_zones().await {
-            log::error!("failed to delete all zones: {err}");
+            tracing::error!(%err, "failed to delete all zones");
             return Err(Errno::IO);
         }
         for zone in self.zones.iter() {

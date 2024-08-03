@@ -259,7 +259,7 @@ impl ControlDevice {
     }
 
     pub fn delete_device(&self, dev_id: u32) -> io::Result<()> {
-        log::trace!("delete device {dev_id}");
+        tracing::trace!(dev_id, "delete device");
         // SAFETY: Valid uring_cmd.
         unsafe {
             self.execute_ctrl_cmd_opt_cdev(
@@ -297,7 +297,7 @@ impl ControlDevice {
             data: [pid],
             ..Default::default()
         };
-        log::trace!("start device {dev_id} on pid {pid}");
+        tracing::trace!(dev_id, pid, "start device");
 
         let sqe = opcode::UringCmd80::new(Fd(self.fd.as_raw_fd()), sys::UBLK_U_CMD_START_DEV)
             .cmd(cmd_buf.cmd)
@@ -309,7 +309,6 @@ impl ControlDevice {
     }
 
     pub fn stop_device(&self, dev_id: u32) -> io::Result<()> {
-        log::trace!("stop device {dev_id}");
         // SAFETY: Valid uring_cmd.
         unsafe {
             self.execute_ctrl_cmd_opt_cdev(
@@ -330,7 +329,6 @@ impl ControlDevice {
         params: &DeviceParams,
         unprivileged: bool,
     ) -> io::Result<()> {
-        log::trace!("set parameters of device {dev_id} to {params:?}");
         // SAFETY: Valid uring_cmd.
         unsafe {
             self.execute_ctrl_cmd_opt_cdev::<sys::ublk_params>(
@@ -506,12 +504,14 @@ impl DeviceBuilder {
         let dev_info = ctl.create_device(self)?;
         let dev_id = dev_info.dev_id();
 
+        let _span = tracing::info_span!("create_service", dev_id).entered();
+
         // Delete the device if anything goes wrong.
         scopeguard::defer_on_unwind! {
             if let Err(err) = ctl.stop_device(dev_id) {
                 // Ignore errors if already deleted.
                 if err.kind() != io::ErrorKind::NotFound {
-                    log::error!("failed to stop device {dev_id}: {err}");
+                    tracing::error!(dev_id, %err, "failed to stop device");
                 }
             }
         }
@@ -522,7 +522,12 @@ impl DeviceBuilder {
             match File::options().read(true).write(true).open(&path) {
                 Ok(f) => break f,
                 Err(err) if err.kind() == io::ErrorKind::PermissionDenied && retries_left > 0 => {
-                    log::warn!("failed to open {path}, retries left: {retries_left}");
+                    tracing::warn!(
+                        path,
+                        retry.left = retries_left,
+                        retry.delay = ?self.retry_delay,
+                        "failed to open cdev",
+                    );
                     retries_left -= 1;
                     thread::sleep(self.retry_delay);
                 }
@@ -637,8 +642,8 @@ struct IoDescShm(NonNull<[sys::ublksrv_io_desc]>);
 
 impl Drop for IoDescShm {
     fn drop(&mut self) {
-        if let Err(err) = unsafe { mm::munmap(self.0.as_ptr().cast(), self.0.len()) } {
-            log::error!("failed to unmap shared memory: {err}");
+        if let Err(errno) = unsafe { mm::munmap(self.0.as_ptr().cast(), self.0.len()) } {
+            tracing::error!(?errno, "failed to unmap shared memory");
         }
     }
 }
@@ -699,7 +704,7 @@ impl Drop for Service<'_> {
         if let Err(err) = self.ctl.delete_device(dev_id) {
             // Ignore errors if already deleted.
             if !is_device_gone(&err) {
-                log::error!("failed to delete device {dev_id}: {err}");
+                tracing::error!(dev_id, %err, "failed to delete device");
             }
         }
     }
@@ -789,9 +794,11 @@ impl Service<'_> {
     {
         // Sanity check.
         self.check_params(params);
-        let dev_id = self.dev_info().dev_id();
         let nr_queues = self.dev_info().nr_queues();
         assert_ne!(nr_queues, 0);
+
+        let dev_id = self.dev_info().dev_id();
+        let _span = tracing::info_span!("serve", dev_id).entered();
 
         let unprivileged = self
             .dev_info()
@@ -808,7 +815,7 @@ impl Service<'_> {
             if let Err(err) = self.ctl.stop_device(dev_id) {
                 // Ignore errors if already deleted.
                 if !is_device_gone(&err) {
-                    log::error!("failed to stop device {dev_id}: {err}");
+                    tracing::error!(?err, "failed to stop device");
                 }
             }
         });
@@ -830,7 +837,7 @@ impl Service<'_> {
                         .spawn_scoped(s, move || {
                             let mut runtime = runtime_builder.build()?;
                             let mut worker = IoWorker {
-                                thread_id,
+                                thread_idx: thread_id,
                                 cdev,
                                 dev_info: &dev_info,
                                 handler,
@@ -877,7 +884,7 @@ impl Service<'_> {
                     // Early failure in IO workers during starting.
                     // The start request will be canceled and cleaned up by scopeguard.
                     // Error reasons will be collected later.
-                    log::debug!("worker unexpectedly exited during device starting");
+                    tracing::debug!("worker unexpectedly exited during device starting");
                     assert!(cqe.result() >= 0);
                 } else if cqe.result() < 0 {
                     // Start failed.
@@ -885,6 +892,7 @@ impl Service<'_> {
                 } else {
                     // Device started, and `/dev/ublkbX` should appear now.
                     *stop_device_guard = true;
+                    tracing::debug!(dev_info = ?self.dev_info(), "device ready");
                     handler.ready(self.dev_info(), Stopper(Arc::clone(&exit_fd)))?;
 
                     // Wait for `exit_fd`.
@@ -944,6 +952,8 @@ impl Service<'_> {
         assert_eq!(nr_queues, 1, "`serve_local` requires a single queue");
 
         let dev_id = self.dev_info().dev_id();
+        let _span = tracing::info_span!("serve_local", dev_id).entered();
+
         let unprivileged = self
             .dev_info()
             .flags()
@@ -957,7 +967,7 @@ impl Service<'_> {
         let stopper = Stopper(Arc::clone(&exit_fd));
 
         let mut worker = IoWorker {
-            thread_id: 0,
+            thread_idx: 0,
             cdev: self.cdev.as_fd(),
             dev_info: &self.dev_info,
             handler,
@@ -976,7 +986,7 @@ impl Service<'_> {
 
             if let Err(err) = self.ctl.stop_device(self.dev_info.dev_id()) {
                 if !is_device_gone(&err) {
-                    log::error!("failed to stop device {} {}", self.dev_info.dev_id(), err);
+                    tracing::error!(%err, "failed to stop device");
                 }
             }
         }
@@ -1048,7 +1058,7 @@ fn sync_cancel_all<S: squeue::EntryMarker, C: cqueue::EntryMarker>(uring: &IoUri
         .register_sync_cancel(None, io_uring::types::CancelBuilder::any())
     {
         if err.kind() != io::ErrorKind::NotFound {
-            log::error!("failed to cancel inflight ops in io-uring: {}", err);
+            tracing::error!(%err, "failed to cancel inflight ops in io-uring");
             // Trigger bomb.
             return;
         }
@@ -1058,7 +1068,7 @@ fn sync_cancel_all<S: squeue::EntryMarker, C: cqueue::EntryMarker>(uring: &IoUri
 }
 
 struct IoWorker<'a, 'r, B, R> {
-    thread_id: u16,
+    thread_idx: u16,
     cdev: BorrowedFd<'a>,
     dev_info: &'a DeviceInfo,
     handler: &'a B,
@@ -1079,20 +1089,32 @@ impl<'r, B: BlockDevice, R: AsyncRuntime + 'r> IoWorker<'_, 'r, B, R> {
     #[allow(clippy::too_many_lines)]
     #[allow(clippy::items_after_statements)]
     fn run(&mut self) -> io::Result<()> {
+        let _span = {
+            let dev_id = self.dev_info.dev_id();
+            let span = if self.wait_device_start.is_some() {
+                // If we need to `wait_device_start`, this is current-thread serving.
+                // No need to trace worker id.
+                tracing::info_span!(parent: None, "ublk_worker", dev_id)
+            } else {
+                tracing::info_span!(parent: None, "ublk_worker", dev_id, id = self.thread_idx)
+            };
+            span.entered()
+        };
+
         let _reset_io_flusher_guard = self
             .set_io_flusher
             .then(|| -> io::Result<_> {
                 rustix::process::configure_io_flusher_behavior(true)?;
-                log::debug!("set thread as IO_FLUSHER");
+                tracing::debug!("set thread as IO_FLUSHER");
                 Ok(scopeguard::guard((), |()| {
                     if let Err(err) = rustix::process::configure_io_flusher_behavior(false) {
-                        log::error!("failed to reset IO_FLUSHER state: {err}");
+                        tracing::error!(%err, "failed to reset IO_FLUSHER state");
                     }
                 }))
             })
             .transpose()?;
 
-        let shm = IoDescShm::new(self.cdev, self.dev_info, self.thread_id)?;
+        let shm = IoDescShm::new(self.cdev, self.dev_info, self.thread_idx)?;
 
         let user_copy = self.dev_info.flags().contains(FeatureFlags::UserCopy);
         // Must define the buffer before the io-uring, see below in `io_uring`.
@@ -1121,7 +1143,7 @@ impl<'r, B: BlockDevice, R: AsyncRuntime + 'r> IoWorker<'_, 'r, B, R> {
         let refill_sqe =
             |sq: &mut SubmissionQueue<'_>, i: u16, result: Option<i32>, zone_append_lba: u64| {
                 let cmd = sys::ublksrv_io_cmd {
-                    q_id: self.thread_id,
+                    q_id: self.thread_idx,
                     tag: i,
                     result: result.unwrap_or(-1),
                     __bindgen_anon_1: match &io_bufs {
@@ -1169,7 +1191,7 @@ impl<'r, B: BlockDevice, R: AsyncRuntime + 'r> IoWorker<'_, 'r, B, R> {
         }
         io_ring.submit()?;
 
-        log::debug!("IO worker {} initialized", self.thread_id);
+        tracing::debug!("initialized");
 
         self.runtime.drive_uring(&io_ring, |spawner| {
             // SAFETY: This is the only place to modify the CQ.
@@ -1189,6 +1211,8 @@ impl<'r, B: BlockDevice, R: AsyncRuntime + 'r> IoWorker<'_, 'r, B, R> {
                         if cqe.result() < 0 {
                             return Err(io::Error::from_raw_os_error(-cqe.result()));
                         }
+
+                        tracing::debug!(dev_info = ?self.dev_info, "device ready");
                         self.handler.ready(self.dev_info, stopper)?;
 
                         // SAFETY: All SQ writing is done on the same current thread.
@@ -1201,7 +1225,7 @@ impl<'r, B: BlockDevice, R: AsyncRuntime + 'r> IoWorker<'_, 'r, B, R> {
                     }
 
                     // Multi-threaded worker.
-                    log::debug!("IO worker signaled to exit");
+                    tracing::debug!("signaled to exit");
                     return Ok(ControlFlow::Break(()));
                 }
 
@@ -1209,17 +1233,17 @@ impl<'r, B: BlockDevice, R: AsyncRuntime + 'r> IoWorker<'_, 'r, B, R> {
                 if cqe.result() < 0 {
                     let err = io::Error::from_raw_os_error(-cqe.result());
                     if is_device_gone(&err) {
-                        log::warn!("device gone by external forces, stopping: {err}");
+                        tracing::warn!(%err, "device gone by external forces, stopping");
                         return Ok(ControlFlow::Break(()));
                     }
-                    log::error!("failed to fetch ublk events: {err}");
+                    tracing::error!(%err, "failed to fetch ublk events");
                     return Err(err);
                 }
 
                 let tag = cqe.user_data() as u16;
                 let io_ring = &*io_ring;
                 let commit_and_fetch = move |ret: i32, zone_append_lba: u64| {
-                    log::trace!("-> respond {ret} {zone_append_lba}");
+                    tracing::trace!(return = ret, zone_append_lba);
                     // SAFETY: All futures are executed on the same thread, which is guarantee
                     // by no `Send` bound on parameters of `Runtime::{block_on,spawn_local}`.
                     // So there can only be one future running this block at the same time.
@@ -1235,13 +1259,13 @@ impl<'r, B: BlockDevice, R: AsyncRuntime + 'r> IoWorker<'_, 'r, B, R> {
 
                 // NB. These fields may contain garbage for ops without them.
                 // Use `wrapping_` to ignore errors.
-                let off = Sector(iod.start_sector);
+                let offset = Sector(iod.start_sector);
                 // The 2 variants both have type `u32`.
                 let zones = unsafe { iod.__bindgen_anon_1.nr_zones };
                 let len = unsafe { iod.__bindgen_anon_1.nr_sectors as usize }
                     .wrapping_mul(Sector::SIZE as usize);
                 let pwrite_off = u64::from(sys::UBLKSRV_IO_BUF_OFFSET)
-                    + (u64::from(self.thread_id) << sys::UBLK_QID_OFF)
+                    + (u64::from(self.thread_idx) << sys::UBLK_QID_OFF)
                     + (u64::from(tag) << sys::UBLK_TAG_OFF);
                 let get_buf = || {
                     match &io_bufs {
@@ -1261,96 +1285,98 @@ impl<'r, B: BlockDevice, R: AsyncRuntime + 'r> IoWorker<'_, 'r, B, R> {
                 let h = self.handler;
                 // XXX: Is there a better way to handle panicking here?
                 macro_rules! spawn {
-                    ($handler:expr) => {
+                    ([$op_name:literal, $($log_params:tt)*], $handler:expr) => {
+                        use tracing::Instrument;
+                        let span = tracing::info_span!($op_name, $($log_params)*);
                         spawner.spawn(async move {
                             // Always commit.
                             let mut guard =
                                 scopeguard::guard((-Errno::IO.raw_os_error(), 0), |(ret, lba)| {
                                     if std::thread::panicking() {
-                                        log::warn!("handler panicked, returning EIO");
+                                        tracing::warn!("handler panicked, returning EIO");
                                     }
                                     commit_and_fetch(ret, lba)
                                 });
                             let ret = $handler.into_c_result();
                             *guard = ret;
-                        })
+                        }.instrument(span))
                     };
                 }
 
                 match iod.op_flags & 0xFF {
                     sys::UBLK_IO_OP_READ => {
-                        log::trace!("READ offset={off} len={len} flags={flags:?}");
                         let mut buf = ReadBuf(get_buf(), PhantomData);
-                        spawn!(h.read(off, &mut buf, flags).await.map(|()| {
-                            let read = (len - buf.remaining())
-                                .try_into()
-                                .expect("buffer size must not exceed i32");
-                            (read, 0)
-                        }));
+                        spawn!(
+                            ["READ", %offset, %len, ?flags],
+                            h.read(offset, &mut buf, flags).await.map(|()| {
+                                let read = (len - buf.remaining())
+                                    .try_into()
+                                    .expect("buffer size must not exceed i32");
+                                (read, 0)
+                            })
+                        );
                     }
                     sys::UBLK_IO_OP_WRITE => {
-                        log::trace!("WRITE offset={off} len={len} flags={flags:?}");
                         let buf = WriteBuf(get_buf(), PhantomData);
-                        spawn!(h.write(off, buf, flags).await.inspect(|&written| {
-                            assert!(written <= len, "invalid written amount");
-                        }));
+                        spawn!(
+                            ["WRITE", %offset, %len, ?flags],
+                            h.write(offset, buf, flags).await.inspect(|&written| {
+                                assert!(written <= len, "invalid written amount");
+                            })
+                        );
                     }
                     sys::UBLK_IO_OP_FLUSH => {
-                        log::trace!("FLUSH flags={flags:?}");
-                        spawn!(h.flush(flags).await);
+                        spawn!(["FLUSH", ?flags], h.flush(flags).await);
                     }
                     sys::UBLK_IO_OP_DISCARD => {
-                        log::trace!("DISCARD offset={off} len={len} flags={flags:?}");
-                        spawn!(h.discard(off, len, flags).await);
+                        spawn!(["DISCARD", %offset, %len, ?flags], h.discard(offset, len, flags).await);
                     }
                     sys::UBLK_IO_OP_WRITE_ZEROES => {
-                        log::trace!("WRITE_ZEROES offset={off} len={len} flags={flags:?}");
-                        spawn!(h.write_zeroes(off, len, flags).await);
+                        spawn!(["WRITE_ZEROES", %offset, %len, ?flags], h.write_zeroes(offset, len, flags).await);
                     }
                     sys::UBLK_IO_OP_REPORT_ZONES => {
-                        log::trace!("REPORT_ZONES offset={off} zones={zones} flags={flags:?}");
                         let mut buf = ZoneBuf {
                             cdev: self.cdev,
                             off: pwrite_off,
                             remaining_zones: zones,
                             _not_send_invariant: PhantomData,
                         };
-                        spawn!(h.report_zones(off, &mut buf, flags).await.map(|()| {
-                            // NB. Must calculated from the advance of offset, not
-                            // `remaining_zones`. See `ZoneBuf::report` for why.
-                            let written = (buf.off - pwrite_off)
-                                .try_into()
-                                .expect("buffer size must not exceed i32");
-                            (written, 0)
-                        }));
+                        spawn!(
+                            ["REPORT_ZONES", %offset, zones, ?flags],
+                            h.report_zones(offset, &mut buf, flags).await.map(|()| {
+                                // NB. Must calculated from the advance of offset, not
+                                // `remaining_zones`. See `ZoneBuf::report` for why.
+                                let written = (buf.off - pwrite_off)
+                                    .try_into()
+                                    .expect("buffer size must not exceed i32");
+                                (written, 0)
+                            })
+                        );
                     }
                     sys::UBLK_IO_OP_ZONE_APPEND => {
-                        log::trace!("ZONE_APPEND offset={off} len={len} flags={flags:?}");
                         let buf = WriteBuf(get_buf(), PhantomData);
-                        spawn!(h.zone_append(off, buf, flags).await.map(|lba| (0, lba.0)));
+                        spawn!(
+                            ["ZONE_APPEND", %offset, %len, ?flags],
+                            h.zone_append(offset, buf, flags).await.map(|lba| (0, lba.0))
+                        );
                     }
                     sys::UBLK_IO_OP_ZONE_OPEN => {
-                        log::trace!("ZONE_OPEN offset={off} flags={flags:?}");
-                        spawn!(h.zone_open(off, flags).await);
+                        spawn!(["ZONE_OPEN", %offset, ?flags], h.zone_open(offset, flags).await);
                     }
                     sys::UBLK_IO_OP_ZONE_CLOSE => {
-                        log::trace!("ZONE_CLOSE offset={off} flags={flags:?}");
-                        spawn!(h.zone_close(off, flags).await);
+                        spawn!(["ZONE_CLOSE", %offset, ?flags], h.zone_close(offset, flags).await);
                     }
                     sys::UBLK_IO_OP_ZONE_FINISH => {
-                        log::trace!("ZONE_FINISH offset={off} flags={flags:?}");
-                        spawn!(h.zone_finish(off, flags).await);
+                        spawn!(["ZONE_FINISH", %offset, ?flags], h.zone_finish(offset, flags).await);
                     }
                     sys::UBLK_IO_OP_ZONE_RESET => {
-                        log::trace!("ZONE_RESET offset={off} flags={flags:?}");
-                        spawn!(h.zone_reset(off, flags).await);
+                        spawn!(["ZONE_RESET", %offset, ?flags], h.zone_reset(offset, flags).await);
                     }
                     sys::UBLK_IO_OP_ZONE_RESET_ALL => {
-                        log::trace!("ZONE_RESET_ALL flags={flags:?}");
-                        spawn!(h.zone_reset_all(flags).await);
+                        spawn!(["ZONE_RESET_ALL", ?flags], h.zone_reset_all(flags).await);
                     }
                     op => {
-                        log::error!("unsupported op: {op}");
+                        tracing::error!(op, "unsupported ublk op");
                         commit_and_fetch(-Errno::IO.raw_os_error(), 0);
                     }
                 }
@@ -1768,7 +1794,7 @@ impl IntoCResult for usize {
         if let Ok(v) = i32::try_from(self) {
             (v, 0)
         } else {
-            log::warn!("invalid returning value: {self}");
+            tracing::warn!(value = self, "invalid returning value");
             (-Errno::IO.raw_os_error(), 0)
         }
     }

@@ -17,21 +17,19 @@ bytes = "1"
 bytesize = { version = "1", features = ["serde"] }
 clap = { version = "4", features = ["derive"] }
 dirs = "5.0.1"
-env_logger = "0.11"
 futures-util = { version = "0.3", features = ["io"] }
 hostname = "0.4"
 humantime = "2"
 hyper = { version = "1", features = ["http1", "server"] }
 hyper-util = { version = "0.1" }
 itertools = "0.13"
-log = "0.4.21"
 lru = "0.12.3"
 onedrive-api = "0.10.0"
 open = "5.1.2"
 orb-ublk = { path = "./orb-ublk", features = ["tokio"] }
 parking_lot = "0.12"
 reqwest = { version = "0.12", features = ["stream"] }
-rustix = { version = "0.38", features = ["fs", "time"] }
+rustix = { version = "0.38", features = ["fs", "time", "stdio"] }
 scoped-tls = "1"
 scopeguard = "1"
 sd-notify = "0.4.1"
@@ -40,6 +38,9 @@ serde-inline-default = "0.2"
 serde_json = "1.0.114"
 tokio = { version = "1", features = ["macros", "net", "rt", "signal", "sync", "time"] }
 toml = "0.8"
+tracing = { version = "0.1.40", features = ["log"] }
+tracing-futures = { version = "0.2.5", features = ["futures-03"] }
+tracing-subscriber = { version = "0.3.18", features = ["env-filter", "tracing-log"] }
 
 [dev-dependencies]
 rustix = { version = "0.38", features = ["fs"] }
