@@ -1138,6 +1138,7 @@ dependencies = [
  "open",
  "orb-ublk",
  "parking_lot",
+ "rand",
  "reqwest",
  "rustix",
  "scoped-tls",

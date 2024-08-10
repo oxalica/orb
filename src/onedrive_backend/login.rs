@@ -56,6 +56,14 @@ pub fn interactive(state_dir: &Path, client_id: String) -> Result<()> {
     ensure!(!localhost_addrs.is_empty(), "no address for localhost");
     tracing::debug!(?localhost_addrs);
 
+    // Ensure the request is really from redirection from our login page, not by some other
+    // website, which is possible on most browsers though the website cannot get the response.
+    let cors_token = {
+        use rand::{Rng, SeedableRng};
+        let token = rand::rngs::StdRng::from_entropy().gen::<u64>();
+        <Arc<str>>::from(format!("{token:016x}"))
+    };
+
     let (auth, tokens) = rt.block_on(async {
         // Create one listener for each address, but with the same port.
         // This is necessary, or it happens that we are listening in `[::1]` but the browser
@@ -74,16 +82,19 @@ pub fn interactive(state_dir: &Path, client_id: String) -> Result<()> {
 
         let (tx, mut rx) = mpsc::channel(1);
         let auth2 = auth.clone();
+        let cors_token2 = cors_token.clone();
         let handler_fn = move |req| {
-            request_handler(req, auth2.clone(), tx.clone()).map(|(status, msg)| {
-                Ok::<_, std::convert::Infallible>(
-                    Response::builder()
-                        .status(status)
-                        .header(header::CONTENT_TYPE, "text/plain")
-                        .body(msg)
-                        .expect("no invalid headers"),
-                )
-            })
+            request_handler(req, auth2.clone(), cors_token2.clone(), tx.clone()).map(
+                |(status, msg)| {
+                    Ok::<_, std::convert::Infallible>(
+                        Response::builder()
+                            .status(status)
+                            .header(header::CONTENT_TYPE, "text/plain")
+                            .body(msg)
+                            .expect("no invalid headers"),
+                    )
+                },
+            )
         };
 
         let spawn_server = |listener: tokio::net::TcpListener| {
@@ -108,7 +119,14 @@ pub fn interactive(state_dir: &Path, client_id: String) -> Result<()> {
             spawn_server(tokio::net::TcpListener::bind((addr.ip(), port)).await?);
         }
 
-        let auth_url = auth.code_auth_url();
+        // See: https://learn.microsoft.com/en-us/graph/auth-v2-user?view=graph-rest-1.0&tabs=http#parameters
+        let mut auth_url = auth.code_auth_url();
+        auth_url
+            .query_pairs_mut()
+            .append_pair("response_mode", "query")
+            .append_pair("state", &cors_token)
+            .finish();
+
         if let Err(err) = open::that_detached(auth_url.as_str()) {
             tracing::error!(%err, "failed to open URL in browser");
         }
@@ -157,6 +175,7 @@ pub fn interactive(state_dir: &Path, client_id: String) -> Result<()> {
 async fn request_handler(
     req: Request<hyper::body::Incoming>,
     auth: Arc<Auth>,
+    cors_token: Arc<str>,
     tx: mpsc::Sender<TokenResponse>,
 ) -> (StatusCode, String) {
     if req.method() != Method::GET {
@@ -177,6 +196,10 @@ async fn request_handler(
             .query_pairs()
             .find_map(|(k, v)| (k == key).then_some(v))
     };
+
+    if get("state").as_deref() != Some(&*cors_token) {
+        return (StatusCode::BAD_REQUEST, "Invalid CORS token".into());
+    }
 
     let Some(code) = get("code") else {
         return if let Some(err) = get("error") {
