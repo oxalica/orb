@@ -112,7 +112,7 @@ fn verify_main(cmd: &VerifyCmd) -> Result<()> {
 fn serve_main(cmd: &ServeCmd) -> Result<()> {
     // Fail fast.
     let config = load_and_verify_config(&cmd.config_file)?;
-    let ctl = ControlDevice::open()?;
+    let ctl = open_ctl_dev()?;
 
     let mut rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
