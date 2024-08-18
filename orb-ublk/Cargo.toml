@@ -36,7 +36,7 @@ tokio = { version = "1.35.1", features = ["net", "rt"], optional = true }
 tracing = "0.1.40"
 
 [build-dependencies]
-bindgen = { version = "0.69.2", optional = true }
+bindgen = { version = "0.70", optional = true }
 
 [dev-dependencies]
 anyhow = "1"
