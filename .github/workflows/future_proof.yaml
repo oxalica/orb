@@ -10,6 +10,7 @@ permissions:
 
 env:
   RUST_BACKTRACE: full
+  RUSTFLAGS: -Dwarnings
 
 jobs:
   outdated:
@@ -19,8 +20,10 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
       - name: Install cargo-outdated
         uses: dtolnay/install@cargo-outdated
+
       - name: cargo-outdated
         run: |
           rm Cargo.lock # Ignore trivially updatable compatible versions.
@@ -39,14 +42,21 @@ jobs:
           sudo apt-get update
           sudo apt-get install --no-install-recommends --yes "linux-modules-extra-$(uname -r)"
           sudo modprobe ublk_drv
+
       - name: Checkout
         uses: actions/checkout@v4
-      - name: Install Rust stable
-        uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: ${{ matrix.rust }}
+
+      - name: Install Rust ${{ matrix.rust }}
+        run: |
+          rustup update --no-self-update ${{ matrix.rust }}
+          rustup default ${{ matrix.rust }}
+
+      - name: Cache Dependencies
+        uses: Swatinem/rust-cache@v2
+
       - name: Build
         run: cargo build --workspace --all-targets
+
       - name: Test
         run: cargo test --workspace --all-targets -- --include-ignored
         env:
@@ -60,18 +70,22 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
       - name: Install Nix
         uses: cachix/install-nix-action@v26
         with:
           github_access_token: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Flake update
         # https://github.com/actions/checkout/tree/v3.3.0#push-a-commit-using-the-built-in-token
         run: |
           git config user.name github-actions
           git config user.email github-actions@github.com
           nix flake update --commit-lock-file
+
       - name: Flake check
         run: nix flake check --no-update-lock-file --show-trace
+
       - name: Flake build
         run: nix build --no-update-lock-file --show-trace --print-build-logs
 

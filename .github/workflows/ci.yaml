@@ -8,6 +8,8 @@ permissions:
 
 env:
   RUST_BACKTRACE: full
+  RUSTDOCFLAGS: -Dwarnings
+  RUSTFLAGS: -Dwarnings
 
 jobs:
   style:
@@ -17,16 +19,23 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
       - name: Install Rust stable
-        uses: dtolnay/rust-toolchain@stable
-      - name: cargo fmt
-        run: cargo fmt --all -- --check
-      - name: cargo clippy
-        run: cargo clippy --workspace --all-targets -- -Dwarnings
-      - name: cargo doc
+        run: |
+          rustup update --no-self-update stable
+          rustup default stable
+
+      - name: Cache Dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Rustfmt
+        run: cargo fmt -- --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D clippy::dbg_macro -D clippy::todo
+
+      - name: Rustdoc
         run: cargo doc --workspace
-        env:
-          RUSTDOCFLAGS: -Dwarnings
 
   test:
     strategy:
@@ -41,14 +50,21 @@ jobs:
           sudo apt-get update
           sudo apt-get install --no-install-recommends --yes "linux-modules-extra-$(uname -r)"
           sudo modprobe ublk_drv
+
       - name: Checkout
         uses: actions/checkout@v4
-      - name: Install Rust stable
-        uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: ${{ matrix.rust }}
+
+      - name: Install Rust ${{ matrix.rust }}
+        run: |
+          rustup update --no-self-update ${{ matrix.rust }}
+          rustup default ${{ matrix.rust }}
+
+      - name: Cache Dependencies
+        uses: Swatinem/rust-cache@v2
+
       - name: Build
         run: cargo build --workspace --all-targets
+
       - name: Test
         run: cargo test --workspace --all-targets -- --include-ignored
         env:
@@ -61,11 +77,14 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
       - name: Install Nix
         uses: cachix/install-nix-action@v26
         with:
           github_access_token: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Flake check
         run: nix flake check --no-update-lock-file --show-trace
+
       - name: Flake build
         run: nix build --no-update-lock-file --show-trace --print-build-logs
