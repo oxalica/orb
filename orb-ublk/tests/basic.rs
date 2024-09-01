@@ -1,5 +1,5 @@
 use std::fs;
-use std::io::{self, ErrorKind, Read, Write};
+use std::io::{self, ErrorKind};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -408,24 +408,27 @@ fn error(ctl: ControlDevice) {
     }
     impl BlockDevice for Handler {
         fn ready(&self, dev_info: &DeviceInfo, stop: Stopper) -> io::Result<()> {
-            let dev_path = PathBuf::from(format!("{}{}", BDEV_PREFIX, dev_info.dev_id()));
+            let dev_info = *dev_info;
             let tested = self.tested.clone();
+
             std::thread::spawn(move || {
                 scopeguard::defer!(stop.stop());
+                let dev_path = wait_blockdev_ready(&dev_info).unwrap();
 
-                let mut file = retry_on_perm(|| {
-                    fs::OpenOptions::new()
-                        .read(true)
-                        .write(true)
-                        .open(&dev_path)
-                })
-                .unwrap();
+                // NB. Perform I/O in another process to avoid deadlocks.
+                let sh = Shell::new().unwrap();
 
-                let err = file.read(&mut [0u8; 64]).unwrap_err();
-                assert_eq!(err.raw_os_error(), Some(Errno::IO.raw_os_error()));
+                let stderr = cmd!(sh, "dd if={dev_path} of=/dev/null bs=512 count=1")
+                    .ignore_status()
+                    .read_stderr()
+                    .unwrap();
+                assert!(stderr.contains("Input/output error"));
 
-                let err = file.write(&[0u8; 64]).unwrap_err();
-                assert_eq!(err.raw_os_error(), Some(Errno::IO.raw_os_error()));
+                let stderr = cmd!(sh, "dd if=/dev/zero of={dev_path} bs=512 count=1")
+                    .ignore_status()
+                    .read_stderr()
+                    .unwrap();
+                assert!(stderr.contains("Input/output error"));
 
                 tested.store(true, Ordering::Relaxed);
             });
