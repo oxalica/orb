@@ -94,7 +94,7 @@ mod sync {
 
     pub struct Spawner<'env>(RefCell<TaskQueue<'env>>);
 
-    impl<'env> fmt::Debug for Spawner<'env> {
+    impl fmt::Debug for Spawner<'_> {
         fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
             f.debug_struct("Spawner").finish_non_exhaustive()
         }

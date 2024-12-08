@@ -192,7 +192,7 @@ impl<B: fmt::Debug, const LOGICAL_SECTOR_SIZE: u32> fmt::Debug
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         struct Indexed<'a, T>(&'a [T]);
-        impl<'a, T: fmt::Debug> fmt::Debug for Indexed<'a, T> {
+        impl<T: fmt::Debug> fmt::Debug for Indexed<'_, T> {
             fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
                 f.debug_map().entries(self.0.iter().enumerate()).finish()
             }
