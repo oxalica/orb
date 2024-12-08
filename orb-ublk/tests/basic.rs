@@ -290,7 +290,9 @@ fn stop(
 #[rstest]
 #[case::default_local(FeatureFlags::empty(), 1)]
 #[case::default_threaded(FeatureFlags::empty(), 2)]
+#[ignore = "user copy requires privileges"]
 #[case::user_copy_local(FeatureFlags::UserCopy, 1)]
+#[ignore = "user copy requires privileges"]
 #[case::user_copy_threaded(FeatureFlags::UserCopy, 2)]
 fn read_write(ctl: ControlDevice, #[case] flags: FeatureFlags, #[case] queues: u16) {
     const SIZE_SECTORS: Sector = Sector::from_bytes(32 << 10);
@@ -538,7 +540,9 @@ fn handler_panic(ctl: ControlDevice, #[case] queues: u16) {
 #[rstest]
 #[case::default_local(FeatureFlags::empty(), 1)]
 #[case::default_threaded(FeatureFlags::empty(), 2)]
+#[ignore = "user copy requires privileges"]
 #[case::user_copy_local(FeatureFlags::UserCopy, 1)]
+#[ignore = "user copy requires privileges"]
 #[case::user_copy_threaded(FeatureFlags::UserCopy, 2)]
 fn tokio_null(ctl: ControlDevice, #[case] flags: FeatureFlags, #[case] queues: u16) {
     const SIZE_SECTORS: Sector = Sector::from_bytes(4 << 10);
@@ -711,6 +715,7 @@ fn discard(ctl: ControlDevice) {
 }
 
 #[rstest]
+#[ignore = "user copy requires privileges"]
 fn zoned(ctl: ControlDevice) {
     const SIZE_SECTORS: Sector = Sector::from_bytes(4 << 10);
     const ZONE_SECTORS: Sector = Sector::from_bytes(1 << 10);
