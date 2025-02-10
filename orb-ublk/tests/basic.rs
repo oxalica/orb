@@ -44,17 +44,20 @@ fn retry_on_perm<T>(mut f: impl FnMut() -> io::Result<T>) -> io::Result<T> {
 }
 
 #[allow(clippy::needless_pass_by_value)]
+#[track_caller]
 fn test_service<B: BlockDevice + Sync>(
     ctl: &ControlDevice,
-    flags: FeatureFlags,
+    mut flags: FeatureFlags,
     queues: u16,
     params: &DeviceParams,
     rt_builder: impl AsyncRuntimeBuilder + Sync,
     handler: impl FnOnce(Arc<AtomicBool>) -> B,
 ) {
+    if !flags.contains(FeatureFlags::UserCopy) {
+        flags.insert(FeatureFlags::UnprivilegedDev);
+    }
     let mut srv = DeviceBuilder::new()
         .name("ublk-test")
-        .unprivileged()
         .add_flags(flags)
         .queues(queues)
         .queue_depth(QUEUE_DEPTH)
@@ -720,8 +723,8 @@ fn zoned(ctl: ControlDevice) {
     const SIZE_SECTORS: Sector = Sector::from_bytes(4 << 10);
     const ZONE_SECTORS: Sector = Sector::from_bytes(1 << 10);
     const ZONES: u64 = SIZE_SECTORS.0 / ZONE_SECTORS.0;
-    const MAX_OPEN_ZONES: u32 = ZONES as u32;
-    const MAX_ACTIVE_ZONES: u32 = ZONES as u32;
+    const MAX_OPEN_ZONES: u32 = 1;
+    const MAX_ACTIVE_ZONES: u32 = 1;
     const MAX_ZONE_APPEND_SECTORS: Sector = Sector::from_bytes(1 << 10);
 
     if !ctl.get_features().unwrap().contains(FeatureFlags::Zoned) {
