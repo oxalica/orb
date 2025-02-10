@@ -43,7 +43,7 @@ bytesize = "1"
 clap = { version = "4", features = ["derive"] }
 ctrlc = "3"
 libtest-mimic = "0.8"
-rand = "0.8"
+rand = "0.9"
 rstest = "0.24"
 rustix = { version = "0.38", features = ["fs"] }
 serde = { version = "1", features = ["derive"] }

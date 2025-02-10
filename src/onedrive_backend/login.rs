@@ -60,7 +60,7 @@ pub fn interactive(state_dir: &Path, client_id: String) -> Result<()> {
     // website, which is possible on most browsers though the website cannot get the response.
     let cors_token = {
         use rand::{Rng, SeedableRng};
-        let token = rand::rngs::StdRng::from_entropy().gen::<u64>();
+        let token = rand::rngs::StdRng::from_os_rng().random::<u64>();
         <Arc<str>>::from(format!("{token:016x}"))
     };
 

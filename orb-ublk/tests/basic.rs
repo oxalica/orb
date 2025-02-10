@@ -342,7 +342,7 @@ fn read_write(ctl: ControlDevice, #[case] flags: FeatureFlags, #[case] queues: u
                 let mut buf = [0u8; Sector::SIZE as usize];
                 for _ in 0..TEST_WRITE_ROUNDS {
                     // Write a random block at random sector.
-                    let sector_offset = rng.gen_range(0..SIZE_SECTORS.0);
+                    let sector_offset = rng.random_range(0..SIZE_SECTORS.0);
                     rng.fill_bytes(&mut buf);
                     let sector_offset_s = sector_offset.to_string();
                     cmd!(
