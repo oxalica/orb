@@ -14,7 +14,7 @@ completion = ["dep:clap", "dep:clap_complete"]
 [dependencies]
 anyhow = "1"
 bytes = "1"
-bytesize = { version = "1", features = ["serde"] }
+bytesize = { version = "2", features = ["serde"] }
 clap = { version = "4", features = ["derive"] }
 dirs = "6"
 futures-util = { version = "0.3", features = ["io"] }
