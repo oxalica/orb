@@ -2091,13 +2091,15 @@ fn read_all_uninit_at<'a>(
     buf: &'a mut [MaybeUninit<u8>],
     mut offset: u64,
 ) -> Result<&'a mut [u8], Errno> {
-    let mut buf_off = 0usize;
-    while buf_off < buf.len() {
-        match rustix::io::pread_uninit(fd, &mut buf[buf_off..], offset) {
+    let mut rest_buf = &mut *buf;
+    while !rest_buf.is_empty() {
+        match rustix::io::pread(fd, &mut *rest_buf, offset) {
             Ok(([], _)) => return Err(Errno::INVAL),
             Ok((read, _)) => {
-                offset += read.len() as u64;
-                buf_off += read.len();
+                let len = read.len();
+                offset += len as u64;
+                // NB. Using returned rest_buf would cause lifetime errors.
+                rest_buf = &mut rest_buf[len..];
             }
             Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
             Err(err) => return Err(err),

@@ -8,4 +8,4 @@ rust-version = "1.76" # orb-ublk
 
 [dependencies]
 orb-ublk = { path = "../orb-ublk" }
-rustix = "0.38"
+rustix = "1"

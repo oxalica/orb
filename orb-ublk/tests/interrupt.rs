@@ -76,7 +76,7 @@ impl BlockDevice for Handler {
         let pid = self.pid;
         let j = thread::spawn(move || {
             thread::sleep(DELAY);
-            kill_process(pid, Signal::Int).unwrap();
+            kill_process(pid, Signal::INT).unwrap();
         });
         *self.thread.lock().unwrap() = Some(j);
         Ok(())
