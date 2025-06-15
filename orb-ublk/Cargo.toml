@@ -3,7 +3,7 @@ name = "orb-ublk"
 version = "0.1.0"
 edition = "2021"
 license = "MIT or Apache-2.0"
-rust-version = "1.76" # result_option_inspect
+rust-version = "1.82" # Dependencies
 
 [features]
 default = []

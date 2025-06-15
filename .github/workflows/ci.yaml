@@ -40,7 +40,7 @@ jobs:
   test:
     strategy:
       matrix:
-        rust: [stable, '1.76'] # NB. Sync with Cargo.toml.
+        rust: [stable, '1.82'] # NB. Sync with Cargo.toml.
     name: Test ${{ matrix.rust }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
