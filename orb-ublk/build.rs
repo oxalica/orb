@@ -7,6 +7,8 @@ fn main() {
 
 #[cfg(feature = "generate-sys")]
 fn generate(out_path: &str) {
+    use bindgen::callbacks::{ItemInfo, ParseCallbacks};
+
     const HEADER_CONTENT: &str = "
 #include <linux/blkzoned.h>
 #include <linux/ublk_cmd.h>
@@ -34,9 +36,9 @@ MARK_FIX_753(UBLK_U_IO_NEED_GET_DATA)
     #[derive(Debug)]
     struct CustomCallback;
 
-    impl bindgen::callbacks::ParseCallbacks for CustomCallback {
-        fn item_name(&self, original_item_name: &str) -> Option<String> {
-            Some(original_item_name.trim_start_matches("Fix753_").to_owned())
+    impl ParseCallbacks for CustomCallback {
+        fn item_name(&self, original_item: ItemInfo<'_>) -> Option<String> {
+            Some(original_item.name.trim_start_matches("Fix753_").to_owned())
         }
 
         fn add_derives(&self, info: &bindgen::callbacks::DeriveInfo<'_>) -> Vec<String> {
