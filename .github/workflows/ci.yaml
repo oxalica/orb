@@ -66,7 +66,7 @@ jobs:
         run: cargo build --workspace --all-targets
 
       - name: Test
-        run: cargo test --workspace --all-targets -- --include-ignored
+        run: cargo test --workspace --all-targets -- --include-ignored --test-threads=1
         env:
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER: sudo
 

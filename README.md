@@ -2,6 +2,12 @@
 
 :warning: This project is in beta stage.
 
+:warning: It is observed that in-kernel deadlock can occasionally happen in
+`orb-ublk` tests, causing any process calling `sync` stuck in `D` state forever,
+and the only solution is to hard-reset the system (you cannot even gracefully
+shutdown. `kill -9` does not work either). The exact reason is not yet known. It
+is not observed in `orb` production yet.
+
 ## Audience
 
 If you are not sure whether this project fits your need, then it does not. You
