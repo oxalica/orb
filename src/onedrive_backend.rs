@@ -382,10 +382,10 @@ pub fn init(
     tracing::info!("preparing remote directory");
 
     // Acquire the lock before any change.
-    let remote_lock = rt
+    let lock = rt
         .block_on(RemoteLock::lock(&drive, &config.remote_dir))
         .context("failed to acquire remote lock")?;
-    let remote_lock = scopeguard::guard(remote_lock, |lock| {
+    let lock = scopeguard::guard(lock, |lock| {
         tracing::info!("releasing remote lock");
         if let Err(err) = rt.block_on(lock.unlock(&drive)) {
             tracing::error!(%err, "failed to release remote lock");
@@ -504,7 +504,7 @@ pub fn init(
     let remote = Remote::new(
         drive,
         config.clone(),
-        scopeguard::ScopeGuard::into_inner(remote_lock),
+        scopeguard::ScopeGuard::into_inner(lock),
     );
     Ok((remote, chunks))
 }
@@ -728,7 +728,7 @@ impl AutoReloginOnedrive {
             state.access_token = access_token;
             state.tick += 1;
 
-            // Spawn non-delimited task for saveing. No ordering is required for it.
+            // Spawn non-delimited task for saving. No ordering is required for it.
             let auto_cred_path = self.state_dir.join(AUTO_CREDENTIAL_FILE_NAME);
             tokio::task::spawn_blocking(move || {
                 if let Err(save_err) = safe_write(&auto_cred_path, &cred) {
@@ -770,7 +770,7 @@ pub struct Remote {
     config: Config,
     drive: Arc<AutoReloginOnedrive>,
     download_url_cache: Mutex<TimedCache<(u32, u32), CacheCell>>,
-    remote_lock: RemoteLock,
+    lock: RemoteLock,
 
     accounting: Accounting,
 }
@@ -792,13 +792,13 @@ impl fmt::Debug for CacheCell {
 }
 
 impl Remote {
-    fn new(drive: Arc<AutoReloginOnedrive>, config: Config, remote_lock: RemoteLock) -> Self {
+    fn new(drive: Arc<AutoReloginOnedrive>, config: Config, lock: RemoteLock) -> Self {
         assert!(config.remote_dir.starts_with('/') && !config.remote_dir.ends_with('/'));
         Self {
             config,
             drive,
             download_url_cache: Mutex::new(TimedCache::new(URL_CACHE_DURATION)),
-            remote_lock,
+            lock,
             accounting: Accounting::default(),
         }
     }
@@ -810,7 +810,7 @@ impl Remote {
     pub async fn unlock(self) -> Result<()> {
         self.drive
             .with(|drive| {
-                let lock = &self.remote_lock;
+                let lock = &self.lock;
                 async move { lock.unlock(&drive).await }
             })
             .await
@@ -979,7 +979,7 @@ impl Backend for Remote {
                             // Must not revert already uploaded parts.
                             && offset < expected[0].start
                             // Must not end early.
-                            && expected[0].end.map_or(true, |end| end == total_len as u64 - 1),
+                            && expected[0].end.is_none_or(|end| end == total_len as u64 - 1),
                             "unexpected next_expected_ranges for {path}, \
                             previously at {offset}/{total_len}, \
                             got {expected:?}",
@@ -1108,8 +1108,7 @@ where
             // For HTTP 429 (Too many requests) or on `Retry-After` given, always retry.
             // Otherwise, retry all errors except obvious client errors.
             Err(err)
-                if (err.retry_after().is_some()
-                    || err.status_code().map_or(true, should_retry))
+                if (err.retry_after().is_some() || err.status_code().is_none_or(should_retry))
                     && retry_num <= SERVER_ERROR_RETRY_CNT =>
             {
                 let delay = err.retry_after().unwrap_or(next_delay);
