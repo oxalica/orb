@@ -1,5 +1,10 @@
 { self }:
-{ lib, config, pkgs, ... }:
+{
+  lib,
+  config,
+  pkgs,
+  ...
+}:
 let
   inherit (lib)
     literalExpression
@@ -8,7 +13,7 @@ let
     mkIf
     mkOption
     types
-  ;
+    ;
 
   cfg = config.services.orb;
 
@@ -16,12 +21,16 @@ let
 
   lowIdThreshould = 50;
 
-  toml = pkgs.formats.toml {};
-  mkConfigFile = name: config: (toml.generate name config).overrideAttrs (old: {
-    buildCommand = old.buildCommand + ''
-      ${lib.getExe cfg.package} verify -c $out
-    '';
-  });
+  toml = pkgs.formats.toml { };
+  mkConfigFile =
+    name: config:
+    (toml.generate name config).overrideAttrs (old: {
+      buildCommand =
+        old.buildCommand
+        + ''
+          ${lib.getExe cfg.package} verify -c $out
+        '';
+    });
 
   settingsType = types.submodule {
     freeformType = toml.type;
@@ -85,12 +94,13 @@ let
     };
   };
 
-in {
+in
+{
   options.services.orb = {
     enable = mkOption {
       type = lib.types.bool;
       description = "Whether to enable orb network block device service.";
-      default = cfg.instances != {};
+      default = cfg.instances != { };
       defaultText = literalExpression "config.services.orb.instances != {}";
       example = true;
     };
@@ -104,52 +114,56 @@ in {
 
     instances = mkOption {
       description = mdDoc "Set of orb instances.";
-      default = {};
-      type = with types;
-        attrsOf (
-          submodule {
-            options = {
-              settings = mkOption {
-                description = "orb configurations.";
-                type = settingsType;
-                example = {
-                  ublk.id = 50;
-                  device = {
-                    dev_size = "1TiB";
-                    zone_size = "256MiB";
-                    min_chunk_size = "1MiB";
-                    max_chunk_size = "256MiB";
-                    max_concurrent_streams = 16;
-                    max_concurrent_commits = 4;
-                  };
-                  backend.onedrive.remote_dir = "/orb";
+      default = { };
+      type =
+        with types;
+        attrsOf (submodule {
+          options = {
+            settings = mkOption {
+              description = "orb configurations.";
+              type = settingsType;
+              example = {
+                ublk.id = 50;
+                device = {
+                  dev_size = "1TiB";
+                  zone_size = "256MiB";
+                  min_chunk_size = "1MiB";
+                  max_chunk_size = "256MiB";
+                  max_concurrent_streams = 16;
+                  max_concurrent_commits = 4;
                 };
+                backend.onedrive.remote_dir = "/orb";
               };
             };
-          }
-        );
+          };
+        });
     };
   };
 
   config = mkIf cfg.enable {
-    assertions = let
-      groups = lib.groupBy
-        (name: toString (cfg.instances.${name}.settings.ublk.id or null))
-        (lib.attrNames cfg.instances);
-    in lib.mapAttrsToList (id: names: {
-      assertion = lib.length names == 1;
-      message = "orb instances ublk.id collision on ${id}: ${lib.concatStringsSep ", " names}";
-    }) groups;
+    assertions =
+      let
+        groups = lib.groupBy (name: toString (cfg.instances.${name}.settings.ublk.id or null)) (
+          lib.attrNames cfg.instances
+        );
+      in
+      lib.mapAttrsToList (id: names: {
+        assertion = lib.length names == 1;
+        message = "orb instances ublk.id collision on ${id}: ${lib.concatStringsSep ", " names}";
+      }) groups;
 
-    warnings =
-      lib.filter (msg: msg != null)
-        (lib.mapAttrsToList (name: instance:
-          let id = instance.settings.ublk.id; in
-          if id < lowIdThreshould then
-            "orb instance '${name}' uses a low id ${toString id} < ${toString lowIdThreshould} risking collision"
-          else
-            null
-        ) cfg.instances);
+    warnings = lib.filter (msg: msg != null) (
+      lib.mapAttrsToList (
+        name: instance:
+        let
+          id = instance.settings.ublk.id;
+        in
+        if id < lowIdThreshould then
+          "orb instance '${name}' uses a low id ${toString id} < ${toString lowIdThreshould} risking collision"
+        else
+          null
+      ) cfg.instances
+    );
 
     systemd.packages = [ cfg.package ];
     environment.systemPackages = [ cfg.package ];
