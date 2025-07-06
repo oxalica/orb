@@ -23,7 +23,7 @@ humantime = "2"
 hyper = { version = "1", features = ["http1", "server"] }
 hyper-util = "0.1"
 itertools = "0.14"
-lru = "0.14"
+lru = "0.15"
 onedrive-api = "0.10"
 open = "5.1"
 orb-ublk = { path = "./orb-ublk", features = ["tokio"] }
