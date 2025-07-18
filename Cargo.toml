@@ -23,7 +23,7 @@ humantime = "2"
 hyper = { version = "1", features = ["http1", "server"] }
 hyper-util = "0.1"
 itertools = "0.14"
-lru = "0.15"
+lru = "0.16"
 onedrive-api = "0.10"
 open = "5.1"
 orb-ublk = { path = "./orb-ublk", features = ["tokio"] }
@@ -38,7 +38,7 @@ serde = { version = "1", features = ["derive"] }
 serde-inline-default = "0.2"
 serde_json = "1"
 tokio = { version = "1", features = ["macros", "net", "rt", "signal", "sync", "time"] }
-toml = "0.8"
+toml = "0.9"
 tracing = { version = "0.1", features = ["log"] }
 tracing-futures = { version = "0.2", features = ["futures-03"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "tracing-log"] }
