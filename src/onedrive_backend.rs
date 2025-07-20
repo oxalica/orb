@@ -189,13 +189,6 @@ enum RemoteItem {
     Chunk { zid: u32, coff: u32, size: u64 },
 }
 
-#[derive(Debug, Default, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RemoteZone {
-    zid: u64,
-    chunks: BTreeMap<u64, u64>,
-}
-
 impl ChunksState {
     const SELECT_FIELDS: &'static [DriveItemField] = &[
         DriveItemField::id,
