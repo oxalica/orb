@@ -35,7 +35,7 @@ scoped-tls = "1"
 scopeguard = "1"
 sd-notify = "0.4"
 serde = { version = "1", features = ["derive"] }
-serde-inline-default = "0.2"
+serde-inline-default = "1"
 serde_json = "1"
 tokio = { version = "1", features = ["macros", "net", "rt", "signal", "sync", "time"] }
 toml = "0.9"
