@@ -108,7 +108,7 @@ in
     package = mkOption {
       description = mdDoc "The orb package to install and for systemd services";
       type = types.package;
-      default = self.packages.${pkgs.system}.orb;
+      default = self.packages.${pkgs.hostPlatform.system}.orb;
       defaultText = literalMD "orb package from its flake output";
     };
 
